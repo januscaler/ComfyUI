@@ -106,6 +106,7 @@ async def handle_sync_run(request, prompt_queue, output_dir, input_dir):
     reader = await request.multipart()
 
     workflow_data = None
+    params_data: dict[str, str] = {}
     uploaded_files: list[tuple[str, bytes, str]] = []  # (field_name, data, original_filename)
     timeout_val = 300
     response_type = "files"
@@ -118,6 +119,8 @@ async def handle_sync_run(request, prompt_queue, output_dir, input_dir):
             timeout_val = int(await part.text())
         elif field_name == "response_type":
             response_type = (await part.text()).strip().lower()
+        elif field_name == "params":
+            params_data = json.loads(await part.text())
         elif field_name in ("images", "videos", "files"):
             filename = part.filename or "upload"
             data = await part.read()
@@ -154,6 +157,14 @@ async def handle_sync_run(request, prompt_queue, output_dir, input_dir):
 
         if file_mapping:
             prompt = _patch_workflow_inputs(prompt, file_mapping)
+
+        # Apply params — format: {"node_id.input_name": "value"}
+        if params_data:
+            for key, value in params_data.items():
+                parts = key.split(".", 1)
+                if len(parts) == 2 and parts[0] in prompt:
+                    prompt[parts[0]]["inputs"][parts[1]] = str(value)
+                    logging.info(f"[SyncAPI] Param {key} = {value}")
 
         prompt_id = str(uuid.uuid4())
         extra_data = {"create_time": int(time.time() * 1000)}
