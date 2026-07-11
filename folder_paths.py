@@ -444,9 +444,16 @@ def get_full_path_or_raise(folder_name: str, filename: str) -> str:
     Get the full path of a file in a folder, has to be a file
     """
     full_path = get_full_path(folder_name, filename)
-    if full_path is None:
-        raise FileNotFoundError(f"Model in folder '{folder_name}' with filename '{filename}' not found.")
-    return full_path
+    if full_path is not None:
+        return full_path
+
+    from comfy.model_downloader import download_model
+    downloaded, _ = download_model(folder_name, filename)
+    if downloaded is not None and os.path.isfile(downloaded):
+        logging.info(f"Auto-downloaded missing model: {folder_name}/{filename}")
+        return downloaded
+
+    raise FileNotFoundError(f"Model in folder '{folder_name}' with filename '{filename}' not found.")
 
 
 def get_filename_list_(folder_name: str) -> tuple[list[str], dict[str, float], float]:

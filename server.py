@@ -130,6 +130,44 @@ def create_cors_middleware(allowed_origin: str):
     return cors_middleware
 
 
+_auto_dl_inject_script: bytes | None = None
+
+
+def _get_auto_dl_inject() -> bytes:
+    global _auto_dl_inject_script
+    if _auto_dl_inject_script is None:
+        import os as _os
+        script_path = _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "app", "auto_download_inject.js")
+        with open(script_path, "rb") as f:
+            _auto_dl_inject_script = b"<script>" + f.read() + b"</script>"
+    return _auto_dl_inject_script
+
+
+@web.middleware
+async def auto_download_middleware(request: web.Request, handler):
+    response: web.Response = await handler(request)
+    if not isinstance(response, web.Response):
+        return response
+    if response.content_type is None or not response.content_type.startswith("text/html"):
+        return response
+    if not args.auto_download_models:
+        return response
+
+    body = response.body
+    if body is None:
+        return response
+
+    inject_tag = b"</body>"
+    if inject_tag not in body:
+        inject_tag = b"</html>"
+    if inject_tag not in body:
+        return response
+
+    injected = body.replace(inject_tag, _get_auto_dl_inject() + inject_tag, 1)
+    response.body = injected
+    return response
+
+
 def is_loopback(host):
     if host is None:
         return False
@@ -328,7 +366,14 @@ class PromptServer():
 
         @routes.get("/")
         async def get_root(request):
-            response = web.FileResponse(os.path.join(self.web_root, "index.html"))
+            if args.auto_download_models:
+                html_path = os.path.join(self.web_root, "index.html")
+                with open(html_path, "rb") as f:
+                    body = f.read()
+                body = body.replace(b"</body>", _get_auto_dl_inject() + b"</body>", 1)
+                response = web.Response(body=body, content_type="text/html")
+            else:
+                response = web.FileResponse(os.path.join(self.web_root, "index.html"))
             response.headers['Cache-Control'] = 'no-store, must-revalidate'
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
@@ -1099,6 +1144,9 @@ class PromptServer():
 
                 self.node_replace_manager.apply_replacements(prompt)
 
+                from comfy.model_downloader import resolve_prompt_models
+                model_status = resolve_prompt_models(prompt)
+
                 valid = await execution.validate_prompt(prompt_id, prompt, partial_execution_targets)
                 extra_data = {}
                 if "extra_data" in json_data:
@@ -1119,11 +1167,11 @@ class PromptServer():
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
                     extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
                     self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
-                    response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
+                    response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3], "model_downloads": model_status}
                     return web.json_response(response)
                 else:
                     logging.warning("invalid prompt: {}".format(valid[1]))
-                    return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
+                    return web.json_response({"error": valid[1], "node_errors": valid[3], "model_downloads": model_status}, status=400)
             else:
                 error = {
                     "type": "no_prompt",
@@ -1213,6 +1261,8 @@ class PromptServer():
         self.custom_node_manager.add_routes(self.routes, self.app, nodes.LOADED_MODULE_DIRS.items())
         self.subgraph_manager.add_routes(self.routes, nodes.LOADED_MODULE_DIRS.items())
         self.node_replace_manager.add_routes(self.routes)
+        from comfy.model_downloader import add_download_routes
+        add_download_routes(self.routes)
         self.app.add_subapp('/internal', self.internal_routes.get_app())
 
         # Prefix every route with /api for easier matching for delegation.

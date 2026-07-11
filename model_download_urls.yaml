@@ -1,0 +1,33 @@
+# Model Download URLs
+# Maps folder_name/filename -> HuggingFace OR direct URL
+#
+# HuggingFace format: "repo_id@filepath_in_repo"
+#   Example: checkpoints/sd_xl_base_1.0.safetensors: stabilityai/stable-diffusion-xl-base-1.0@sd_xl_base_1.0.safetensors
+#   For subdirectories: some-repo/name@subdir/file.safetensors
+#
+# Direct URL format: starts with http:// or https://
+#   Example: loras/my_lora.safetensors: https://example.com/models/my_lora.safetensors
+#
+# Filename-only keys also work (checked as fallback):
+#   sd_xl_base_1.0.safetensors: stabilityai/stable-diffusion-xl-base-1.0@sd_xl_base_1.0.safetensors
+
+# --- Stable Diffusion XL ---
+# checkpoints/sd_xl_base_1.0.safetensors: stabilityai/stable-diffusion-xl-base-1.0@sd_xl_base_1.0.safetensors
+# checkpoints/sd_xl_refiner_1.0.safetensors: stabilityai/stable-diffusion-xl-refiner-1.0@sd_xl_refiner_1.0.safetensors
+# vae/sdxl_vae.safetensors: madebyollin/sdxl-vae-fp16-fix@diffusion_pytorch_model.safetensors
+
+# --- SD3.5 ---
+# checkpoints/sd3.5_large.safetensors: stabilityai/stable-diffusion-3.5-large@sd3.5_large.safetensors
+# text_encoders/clip_g.safetensors: stabilityai/stable-diffusion-3.5-large@text_encoders/clip_g.safetensors
+# text_encoders/clip_l.safetensors: stabilityai/stable-diffusion-3.5-large@text_encoders/clip_l.safetensors
+# text_encoders/t5xxl_fp16.safetensors: stabilityai/stable-diffusion-3.5-large@text_encoders/t5xxl_fp16.safetensors
+
+# --- Flux.1 ---
+# diffusion_models/flux1-dev.sft: black-forest-labs/FLUX.1-dev@flux1-dev.sft
+# text_encoders/t5xxl_fp16.safetensors: comfyanonymous/flux_text_encoders@t5xxl_fp16.safetensors
+# text_encoders/clip_l.safetensors: comfyanonymous/flux_text_encoders@clip_l.safetensors
+# vae/ae.sft: black-forest-labs/FLUX.1-dev@ae.sft
+
+# Add your model URLs below:
+
+vae_approx/taesd_decoder.safetensors: madebyollin/taesd@taesd_decoder.safetensors

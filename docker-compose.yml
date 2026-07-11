@@ -1,0 +1,31 @@
+services:
+  comfyui:
+    build: .
+    image: comfyui-sync-api:latest
+    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 $${COMFYUI_ARGS:-}"
+    ports:
+      - "8188:8188"
+    volumes:
+      - ./models:/opt/ComfyUI/models
+      - ./input:/opt/ComfyUI/input
+      - ./output:/opt/ComfyUI/output
+      - ./user:/opt/ComfyUI/user
+      - ./api_server/workflows:/opt/ComfyUI/api_server/workflows
+    environment:
+      - DO_NOT_TRACK=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+
+  developer-api:
+    image: comfyui-sync-api:latest
+    depends_on:
+      - comfyui
+    command: uvicorn api_server.developer_api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api_server/workflows:/opt/ComfyUI/api_server/workflows
+    environment:
+      - COMFYUI_BASE_URL=http://comfyui:8188
+      - COMFYUI_WORKFLOW_DIR=/opt/ComfyUI/api_server/workflows
+      - COMFYUI_API_TIMEOUT_SECONDS=900
+      - COMFYUI_API_POLL_INTERVAL_SECONDS=1.0

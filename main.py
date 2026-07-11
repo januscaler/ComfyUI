@@ -211,6 +211,10 @@ def execute_prestartup_script():
 apply_custom_paths()
 init_mime_types()
 
+from comfy.model_downloader import load_registry, set_enabled
+load_registry()
+set_enabled(args.auto_download_models)
+
 if args.enable_manager:
     comfyui_manager.prestartup()
 
