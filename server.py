@@ -1263,6 +1263,22 @@ class PromptServer():
         self.node_replace_manager.add_routes(self.routes)
         from comfy.model_downloader import add_download_routes
         add_download_routes(self.routes)
+
+        from app.openapi import OPENAPI_SPEC, SWAGGER_HTML
+
+        @self.routes.get("/openapi.json")
+        async def get_openapi(request):
+            return web.json_response(OPENAPI_SPEC)
+
+        @self.routes.get("/docs")
+        async def get_docs(request):
+            return web.Response(text=SWAGGER_HTML, content_type="text/html")
+
+        @self.routes.post("/api/sync-run")
+        async def sync_run(request):
+            from comfy.sync_api import handle_sync_run
+            return await handle_sync_run(request, self.prompt_queue, folder_paths.output_directory, folder_paths.input_directory)
+
         self.app.add_subapp('/internal', self.internal_routes.get_app())
 
         # Prefix every route with /api for easier matching for delegation.

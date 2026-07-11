@@ -1,0 +1,190 @@
+- generic [ref=f2e3]:
+  - generic [ref=f2e5]:
+    - generic [ref=f2e9]:
+      - generic [ref=f2e10]:
+        - heading "ComfyUI API 0.27.0 OAS 3.0" [level=1] [ref=f2e11]:
+          - text: ComfyUI API
+          - generic [ref=f2e12]:
+            - generic [ref=f2e13]: 0.27.0
+            - generic [ref=f2e15]: OAS 3.0
+        - link "/openapi.json" [ref=f2e17] [cursor=pointer]:
+          - /url: /openapi.json
+      - paragraph [ref=f2e21]: REST API for ComfyUI — queue prompts, check status, manage models and history.
+    - generic [ref=f2e25]:
+      - text: Servers
+      - combobox [ref=f2e28]:
+        - option / [selected]
+    - textbox "Filter by tag" [ref=f2e32]
+    - generic [ref=f2e37]:
+      - heading [level=3] [ref=f2e38] [cursor=pointer]:
+        - link "default" [ref=f2e39]:
+          - /url: "#/default"
+        - button "Collapse operation" [expanded] [ref=f2e40]
+      - generic [ref=f2e44]:
+        - generic [ref=f2e47] [cursor=pointer]:
+          - button "POST /prompt Queue a prompt" [ref=f2e48]:
+            - generic [ref=f2e49]: POST
+            - generic [ref=f2e50]:
+              - link "/prompt" [ref=f2e52]:
+                - /url: "#/default/post_prompt"
+              - generic [ref=f2e53]: Queue a prompt
+          - generic "Copy to clipboard"
+          - button "post /prompt" [ref=f2e56]
+        - generic [ref=f2e61] [cursor=pointer]:
+          - button "GET /prompt Get queue info" [ref=f2e62]:
+            - generic [ref=f2e63]: GET
+            - generic [ref=f2e64]:
+              - link "/prompt" [ref=f2e66]:
+                - /url: "#/default/get_prompt"
+              - generic [ref=f2e67]: Get queue info
+          - generic "Copy to clipboard"
+          - button "get /prompt" [ref=f2e70]
+        - generic [ref=f2e75] [cursor=pointer]:
+          - button "GET /queue Get full queue" [ref=f2e76]:
+            - generic [ref=f2e77]: GET
+            - generic [ref=f2e78]:
+              - link "/queue" [ref=f2e80]:
+                - /url: "#/default/get_queue"
+              - generic [ref=f2e81]: Get full queue
+          - generic "Copy to clipboard"
+          - button "get /queue" [ref=f2e84]
+        - generic [ref=f2e89] [cursor=pointer]:
+          - button "POST /queue Clear queue" [ref=f2e90]:
+            - generic [ref=f2e91]: POST
+            - generic [ref=f2e92]:
+              - link "/queue" [ref=f2e94]:
+                - /url: "#/default/post_queue"
+              - generic [ref=f2e95]: Clear queue
+          - generic "Copy to clipboard"
+          - button "post /queue" [ref=f2e98]
+        - generic [ref=f2e103] [cursor=pointer]:
+          - button "GET /history Get execution history" [ref=f2e104]:
+            - generic [ref=f2e105]: GET
+            - generic [ref=f2e106]:
+              - link "/history" [ref=f2e108]:
+                - /url: "#/default/get_history"
+              - generic [ref=f2e109]: Get execution history
+          - generic "Copy to clipboard"
+          - button "get /history" [ref=f2e112]
+        - generic [ref=f2e117] [cursor=pointer]:
+          - button "POST /history Clear history" [ref=f2e118]:
+            - generic [ref=f2e119]: POST
+            - generic [ref=f2e120]:
+              - link "/history" [ref=f2e122]:
+                - /url: "#/default/post_history"
+              - generic [ref=f2e123]: Clear history
+          - generic "Copy to clipboard"
+          - button "post /history" [ref=f2e126]
+        - generic [ref=f2e131] [cursor=pointer]:
+          - 'button "GET /history/{prompt_id} Get single history entry" [ref=f2e132]':
+            - generic [ref=f2e133]: GET
+            - generic [ref=f2e134]:
+              - link [ref=f2e136]:
+                - /url: "#/default/get_history__prompt_id_"
+              - generic [ref=f2e138]: Get single history entry
+          - generic "Copy to clipboard"
+          - 'button "get /history/{prompt_id}" [ref=f2e141]'
+        - generic [ref=f2e146] [cursor=pointer]:
+          - button "POST /interrupt Interrupt execution" [ref=f2e147]:
+            - generic [ref=f2e148]: POST
+            - generic [ref=f2e149]:
+              - link "/interrupt" [ref=f2e151]:
+                - /url: "#/default/post_interrupt"
+              - generic [ref=f2e152]: Interrupt execution
+          - generic "Copy to clipboard"
+          - button "post /interrupt" [ref=f2e155]
+        - generic [ref=f2e160] [cursor=pointer]:
+          - button "GET /object_info Get node type schemas" [ref=f2e161]:
+            - generic [ref=f2e162]: GET
+            - generic [ref=f2e163]:
+              - link "/object_info" [ref=f2e165]:
+                - /url: "#/default/get_object_info"
+              - generic [ref=f2e166]: Get node type schemas
+          - generic "Copy to clipboard"
+          - button "get /object_info" [ref=f2e169]
+        - generic [ref=f2e174] [cursor=pointer]:
+          - button "GET /system_stats System info" [ref=f2e175]:
+            - generic [ref=f2e176]: GET
+            - generic [ref=f2e177]:
+              - link "/system_stats" [ref=f2e179]:
+                - /url: "#/default/get_system_stats"
+              - generic [ref=f2e180]: System info
+          - generic "Copy to clipboard"
+          - button "get /system_stats" [ref=f2e183]
+        - generic [ref=f2e188] [cursor=pointer]:
+          - button "GET /models List model folder types" [ref=f2e189]:
+            - generic [ref=f2e190]: GET
+            - generic [ref=f2e191]:
+              - link "/models" [ref=f2e193]:
+                - /url: "#/default/get_models"
+              - generic [ref=f2e194]: List model folder types
+          - generic "Copy to clipboard"
+          - button "get /models" [ref=f2e197]
+        - generic [ref=f2e202] [cursor=pointer]:
+          - 'button "GET /models/{folder} List models in folder" [ref=f2e203]':
+            - generic [ref=f2e204]: GET
+            - generic [ref=f2e205]:
+              - link [ref=f2e207]:
+                - /url: "#/default/get_models__folder_"
+              - generic [ref=f2e209]: List models in folder
+          - generic "Copy to clipboard"
+          - 'button "get /models/{folder}" [ref=f2e212]'
+        - generic [ref=f2e217] [cursor=pointer]:
+          - button "POST /api/download-model Download a model" [ref=f2e218]:
+            - generic [ref=f2e219]: POST
+            - generic [ref=f2e220]:
+              - link [ref=f2e222]:
+                - /url: "#/default/post_api_download_model"
+              - generic [ref=f2e224]: Download a model
+          - generic "Copy to clipboard"
+          - button "post /api/download-model" [ref=f2e227]
+        - generic [ref=f2e232] [cursor=pointer]:
+          - 'button "GET /api/download-status/{key} Check download status" [ref=f2e233]':
+            - generic [ref=f2e234]: GET
+            - generic [ref=f2e235]:
+              - link [ref=f2e237]:
+                - /url: "#/default/get_api_download_status__key_"
+              - generic [ref=f2e239]: Check download status
+          - generic "Copy to clipboard"
+          - 'button "get /api/download-status/{key}" [ref=f2e242]'
+        - generic [ref=f2e247] [cursor=pointer]:
+          - button "GET /embeddings List text embeddings" [ref=f2e248]:
+            - generic [ref=f2e249]: GET
+            - generic [ref=f2e250]:
+              - link "/embeddings" [ref=f2e252]:
+                - /url: "#/default/get_embeddings"
+              - generic [ref=f2e253]: List text embeddings
+          - generic "Copy to clipboard"
+          - button "get /embeddings" [ref=f2e256]
+        - generic [ref=f2e261] [cursor=pointer]:
+          - button "GET /extensions List web extensions" [ref=f2e262]:
+            - generic [ref=f2e263]: GET
+            - generic [ref=f2e264]:
+              - link "/extensions" [ref=f2e266]:
+                - /url: "#/default/get_extensions"
+              - generic [ref=f2e267]: List web extensions
+          - generic "Copy to clipboard"
+          - button "get /extensions" [ref=f2e270]
+        - generic [ref=f2e275] [cursor=pointer]:
+          - button "GET /features Server feature flags" [ref=f2e276]:
+            - generic [ref=f2e277]: GET
+            - generic [ref=f2e278]:
+              - link "/features" [ref=f2e280]:
+                - /url: "#/default/get_features"
+              - generic [ref=f2e281]: Server feature flags
+          - generic "Copy to clipboard"
+          - button "get /features" [ref=f2e284]
+        - generic [ref=f2e289] [cursor=pointer]:
+          - button "GET /ws WebSocket connection" [ref=f2e290]:
+            - generic [ref=f2e291]: GET
+            - generic [ref=f2e292]:
+              - link "/ws" [ref=f2e294]:
+                - /url: "#/default/get_ws"
+              - generic [ref=f2e295]: WebSocket connection
+          - generic "Copy to clipboard"
+          - button "get /ws" [ref=f2e298]
+  - generic:
+    - generic:
+      - generic:
+        - link:
+          - /url: https://validator.swagger.io/validator/debug?url=http%3A%2F%2F0.0.0.0%3A8588%2Fopenapi.json
