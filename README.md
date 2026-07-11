@@ -3,6 +3,12 @@
 # ComfyUI
 **The most powerful and modular AI engine for content creation.**
 
+## RUN
+
+```
+export HF_TOKEN="your_hf_token"
+python3 main.py --preview-method auto --auto-download-models
+```
 
 [![Website][website-shield]][website-url]
 [![Dynamic JSON Badge][discord-shield]][discord-url]
