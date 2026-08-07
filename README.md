@@ -50,6 +50,17 @@ ComfyUI is the AI creation engine for visual professionals who demand control ov
 
 ## Get Started
 
+### Quickstart (uv)
+
+The fastest local setup is the included `start_uv.sh` launcher, which uses [uv](https://docs.astral.sh/uv/) to create the virtualenv and install all dependencies automatically on first run:
+
+```bash
+./start_uv.sh                  # first run: creates .venv, installs requirements.txt, starts on :8188
+./start_uv.sh --port 8588 --disable-auto-launch   # extra args are passed to main.py
+```
+
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (`brew install uv` on macOS). Later runs skip installation and start the server immediately.
+
 ### Local
 
 #### [Desktop Application](https://www.comfy.org/download)
@@ -70,6 +81,31 @@ Supports all operating systems and GPU types (NVIDIA, AMD, Intel, Apple Silicon,
 
 ## Examples
 See what ComfyUI can do with the [newer template workflows](https://comfy.org/workflows) or old [example workflows](https://comfyanonymous.github.io/ComfyUI_examples/).
+
+## Wrapper API
+
+A simplified REST API on top of the regular ComfyUI API (`api_wrapper/`). It hides the node graph and model setup: each workflow has a dedicated synchronous endpoint that returns the final artifact (image, video, audio, 3D asset, ...) directly as a downloadable file. Missing model files for the requested workflow are downloaded automatically on first use (requires starting ComfyUI with `--auto-download-models`; gated models need `HF_TOKEN`).
+
+- `POST /api/wrapper/{workflow}/generate` — multipart form with `prompt` and `image` (optional `negative_prompt`, `seed`, `steps`, `cfg`, `megapixels`, `timeout`, `free_vram`, `quantization`). Runs the workflow to completion and returns the final file as a download (`Content-Disposition: attachment`). By default the request waits as long as the job takes; set `timeout` (5–86400 seconds) if you prefer a cap — the timeout response includes the `job_id` to pick the result up via `/jobs/{job_id}`. `GET /api/wrapper/workflows` lists the available `{workflow}` names (currently `flux2klein9b`).
+- `GET /api/wrapper/jobs/{job_id}` — job status (`pending` / `in_progress` / `completed` / `failed` / `cancelled`) with output image URLs; also useful to pick up a generate call that timed out (the timeout response includes the `job_id`).
+- `GET /api/wrapper/jobs/{job_id}/image` — redirects to the generated image.
+- `POST /api/wrapper/free` — releases the GPU VRAM and RAM used by model execution (unloads all models, empties torch caches). When a job is running/queued the release happens automatically right after that job finishes.
+- `GET /api/wrapper/docs` — Swagger UI for the wrapper API (spec at `/api/wrapper/openapi.json`).
+
+Example:
+
+```bash
+curl -o result.png -X POST http://127.0.0.1:8188/api/wrapper/flux2klein9b/generate \
+  -F "prompt=make it snow" -F "image=@input.png" -F "steps=20"
+```
+
+**Memory:** by default the wrapper releases VRAM and RAM as soon as a job finishes — models are unloaded and caches emptied automatically, so the server stays resource-efficient between requests. Send `free_vram=false` on a generate request to keep models loaded across consecutive jobs (e.g. batch runs).
+
+**Precision:** `quantization=fp8` (default) uses the shipped fp8 checkpoint — on Apple Silicon it loads as bf16 automatically. `quantization=fp4` converts the checkpoint to NVFP4 on first use (~half the file size, best on CUDA: native on Blackwell, emulated on older GPUs and CPU); on MPS the wrapper automatically falls back to fp8 since NVFP4 needs fp8 block scales that MPS cannot handle.
+
+**Interactive docs:** with the server running, open `http://127.0.0.1:8188/api/wrapper/docs` in a browser to browse and try every endpoint (the "Try it out" button works — you can upload an image and generate right from the docs page). The raw OpenAPI spec is at `http://127.0.0.1:8188/api/wrapper/openapi.json` for code generation; swap the port if you started ComfyUI elsewhere.
+
+The first workflow shipped is `flux2klein9b`, a FLUX.2 [klein] 9B image edit: the input image is scaled to a megapixel budget, attached to the conditioning as a reference latent, and sampled with the flux2 custom sampler stack. `ideogram4` is a text-to-image workflow (no input image needed) using the Ideogram 4 dual-model CFG stack — it natively understands rich structured JSON prompts, e.g. `curl -F "prompt=$(cat prompt.json)"` with a JSON prompt describing composition, style and elements; the full example (with bounding boxes per element) is shown in the interactive docs. `minimaxh3` is an omni-modal video workflow with three task endpoints under `/api/wrapper/minimaxh3/{task}`: `text` (text-to-video), `image` (image-to-video, first/last frame uploads) and `reference` (ref2va: up to 9 reference images, 3 videos and 3 audio clips, referenced in the prompt as `<Picture i>` / `<Video k>` / `<Audio j>`); it returns a synchronized audio+video MP4. To add another workflow (e.g. a 3D model generator), add its graph builder to the `WORKFLOWS` registry in `api_wrapper/workflows.py`, a model-setup handler in `api_wrapper/routes.py`, and it immediately gets its own `/api/wrapper/{name}/generate` endpoint — output files (video/audio/3D) are detected automatically by their node output type. All endpoints are also available without the `/api` prefix.
 
 ## Features
 - A visual node graph for building and reusing image, video, audio, 3D, and text workflows without code.

@@ -1274,6 +1274,9 @@ class PromptServer():
         from comfy.model_downloader import add_download_routes
         add_download_routes(self.routes)
 
+        from api_wrapper import register_wrapper_routes
+        register_wrapper_routes(self.routes, self)
+
         from app.openapi import OPENAPI_SPEC, SWAGGER_HTML
 
         @self.routes.get("/openapi.json")

@@ -241,6 +241,12 @@ class AutoencodingEngineLegacy(AutoencodingEngine):
         if self.bn is not None:
             s = torch.sqrt(comfy.model_management.cast_to(self.bn.running_var.view(1, -1, 1, 1), dtype=z.dtype, device=z.device) + self.bn_eps)
             m = comfy.model_management.cast_to(self.bn.running_mean.view(1, -1, 1, 1), dtype=z.dtype, device=z.device)
+            if z.shape[1] != s.shape[1]:
+                raise ValueError(
+                    f"Latent channel mismatch: latent has {z.shape[1]} channels, this VAE expects {s.shape[1]}. "
+                    "The VAE does not match the model's latent format (e.g. a 16-channel SD3-style latent cannot be "
+                    "decoded by the 128-channel flux2 VAE); pick the VAE that ships with the model."
+                )
             z = z * s + m
             z = rearrange(
                 z,

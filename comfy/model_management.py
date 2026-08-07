@@ -795,6 +795,10 @@ class LoadedModel:
         return False
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
+        if self.real_model is None:
+            # Already fully unloaded (unload and list removal are not atomic;
+            # a concurrent unload_all_models may hit this entry first).
+            return True
         if memory_to_free is not None:
             if memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
@@ -817,6 +821,11 @@ class LoadedModel:
             self._patcher_finalizer.detach()
 
     def is_dead(self):
+        if self.real_model is None:
+            # model_unload() already ran but the entry is still in
+            # current_loaded_models (unload and list removal are not atomic and
+            # the finalizer thread can observe the gap). Treat it as dead.
+            return True
         return self.real_model() is not None and self.model is None
 
 
@@ -870,6 +879,9 @@ def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins
     can_unload_sorted = sorted(can_unload)
     for x in can_unload_sorted:
         i = x[-1]
+        if i >= len(current_loaded_models):
+            # Concurrent free_memory already removed this entry.
+            continue
         memory_to_free = 1e32
         if not DISABLE_SMART_MEMORY or device is None:
             memory_to_free = 0 if device is None else memory_required - get_free_memory(device)
@@ -1020,7 +1032,7 @@ def cleanup_models_gc():
     for i in range(len(current_loaded_models)):
         cur = current_loaded_models[i]
         if cur.is_dead():
-            logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__))
+            logging.info("Potential memory leak detected with model {}, doing a full garbage collect, for maximum performance avoid circular references in the model code.".format(cur.real_model().__class__.__name__ if cur.real_model is not None else "unloaded"))
             do_gc = True
             break
 
@@ -1031,7 +1043,7 @@ def cleanup_models_gc():
         for i in range(len(current_loaded_models)):
             cur = current_loaded_models[i]
             if cur.is_dead():
-                logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
+                logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__ if cur.real_model is not None else "unloaded"))
 
 
 def archive_model_dtypes(model):
@@ -1045,7 +1057,8 @@ def archive_model_dtypes(model):
 def cleanup_models():
     to_delete = []
     for i in range(len(current_loaded_models)):
-        if current_loaded_models[i].real_model() is None:
+        cur = current_loaded_models[i]
+        if cur.real_model is None or cur.real_model() is None:
             to_delete = [i] + to_delete
 
     for i in to_delete:
