@@ -1,17 +1,4 @@
-# CUDA inference stack for ComfyUI + the wrapper API.
-#
-# Requirements on the host:
-#   - NVIDIA driver + nvidia-container-toolkit
-#     (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-#   - Docker with Compose v2 (GPU support needs compose >= 2.24)
-#
-# Usage:
-#   docker compose build --build-arg BASE_IMAGE=python:3.12-slim
-#   docker compose up -d
-#
-# Model downloads happen at runtime into ./models (persistent volume), so the
-# image itself never contains model weights; a code change only rebuilds the
-# `comfyui` stage (the `base` stage is reused from the Docker cache).
+
 services:
   comfyui:
     build:
@@ -29,11 +16,12 @@ services:
       - ./temp:/opt/ComfyUI/temp
       - ./user:/opt/ComfyUI/user
       - ./api_server/workflows:/opt/ComfyUI/api_server/workflows
+      - ~/VoxMin/ace-step/huggingface:/root/.cache/huggingface
       # Reuse another project's Hugging Face download cache instead of
       # re-downloading blobs (helps downloads that go through hf_hub_download,
       # i.e. repo@file style URLs; direct https://...resolve/main URLs bypass
       # this cache and land straight in ./models above):
-      #   - ~/VoxMin/ace-step/huggingface:/root/.cache/huggingface
+      - ~/VoxMin/ace-step/huggingface:/root/.cache/huggingface
     environment:
       - DO_NOT_TRACK=1
       - HF_HUB_DISABLE_TELEMETRY=1
