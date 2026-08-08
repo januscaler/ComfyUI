@@ -234,6 +234,33 @@ MINIMAX_H3_MODEL_NAMES = (
 )
 
 
+MINIMAX_H3_QUANT_ORDER = ("nvfp4", "int8", "fp8", "bf16")
+
+
+def minimax_h3_quantization_preference(requested, ref2va, is_present):
+    """Pick the quantization to run, preferring model files already on disk.
+
+    ``requested`` is the user's quantization or None. ``is_present(q)`` reports
+    whether the full model set for ``q`` exists locally. The canonical template
+    ships int8 UNET + nvfp4 CLIP; if the requested set is incomplete but another
+    quantization's set is already downloaded, that set is reused instead of
+    re-downloading (a 66 GB bf16 CLIP download otherwise happens for fp8).
+    Returns (quantization, note_or_None)."""
+    if requested is not None:
+        if requested not in MINIMAX_H3_QUANT_MODELS:
+            raise ValueError(f"Invalid quantization: {requested}")
+        if is_present(requested):
+            return requested, None
+        for alt in MINIMAX_H3_QUANT_ORDER:
+            if alt != requested and is_present(alt):
+                return alt, (f"quantization={requested} is not fully downloaded; "
+                             f"reusing the {alt} models already on disk.")
+    for q in MINIMAX_H3_QUANT_ORDER:
+        if is_present(q):
+            return q, None
+    return requested or "fp8", None
+
+
 def minimax_h3_models(quantization, ref2va=False):
     """The 4 model files a MiniMax H3 task needs for the given quantization."""
     q = MINIMAX_H3_QUANT_MODELS[quantization]

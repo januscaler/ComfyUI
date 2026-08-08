@@ -191,9 +191,10 @@ class TestOpenAPISpec(unittest.TestCase):
         spec = wrapper_openapi.spec_with_workflows(workflows_module.WORKFLOWS)
         for path in ("/api/wrapper/minimaxh3/text/generate",
                      "/api/wrapper/minimaxh3/image/generate",
-                     "/api/wrapper/minimaxh3/reference/generate",
-                     "/api/wrapper/minimaxh3/reference"):
+                     "/api/wrapper/minimaxh3/reference/generate"):
             self.assertIn(path, spec["paths"], f"missing {path}")
+        # the bare /{name}/{task} alias was removed as redundant
+        self.assertNotIn("/api/wrapper/minimaxh3/reference", spec["paths"])
         op = spec["paths"]["/api/wrapper/minimaxh3/reference/generate"]["post"]
         content = op["responses"]["200"]["content"]
         self.assertEqual(list(content)[0], "video/mp4")
@@ -327,6 +328,64 @@ class TestMiniMaxH3Graph(unittest.TestCase):
         graph2 = wrapper_workflows.build_minimax_h3_reference_to_video(prompt="x")
         self.assertEqual(graph2["7"]["class_type"], "BasicGuider")
         self.assertEqual(graph2["6"]["inputs"].get("ref_images"), None)
+
+    def test_decode_nodes_use_the_correct_vae(self):
+        # The joint AV latent is a NestedTensor (video [B,24,T,H,W], audio
+        # [B,32,2,T]). VAEDecode must unbind the video part -> the VIDEO vae,
+        # VAEDecodeAudio the audio part -> the AUDIO vae; swapping them makes
+        # the video VAE's 5D memory estimator crash with "tuple index out of
+        # range" on the 4D audio latent (sd.py estimate_decode_memory).
+        for task_name in ("text", "image"):
+            task = wrapper_workflows.WORKFLOWS["minimaxh3"]["tasks"][task_name]
+            graph = task["build"](
+                prompt="x",
+                **({"first_frame": "wrapper/t1.png"} if task_name == "image" else {}),
+                seed=1, steps=20, width=672, height=384,
+                duration=5.0, scheduler="beta", filename_prefix="wrapper/minimaxh3")
+            vae_loaders = {n["inputs"]["vae_name"]: nid for nid, n in graph.items()
+                           if n["class_type"] == "VAELoader"}
+            decode = {n["class_type"]: n for n in graph.values()}
+            self.assertEqual(decode["VAEDecode"]["inputs"]["vae"][0],
+                             vae_loaders[wrapper_workflows.MINIMAX_H3_VIDEO_VAE])
+            self.assertEqual(decode["VAEDecodeAudio"]["inputs"]["vae"][0],
+                             vae_loaders[wrapper_workflows.MINIMAX_H3_AUDIO_VAE])
+            # both decoders read the same sampler output (the joint AV latent)
+            sampler_out = decode["VAEDecode"]["inputs"]["samples"]
+            self.assertEqual(decode["VAEDecodeAudio"]["inputs"]["samples"], sampler_out)
+
+    def test_quantization_reuses_present_model_sets(self):
+        quants = wrapper_workflows.MINIMAX_H3_QUANT_MODELS
+        present = {"nvfp4": True, "int8": False, "fp8": False, "bf16": False}
+
+        def is_present(q):
+            return present.get(q, False)
+
+        # requested fp8, but only nvfp4 is downloaded -> reuse nvfp4, no download
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            "fp8", ref2va=False, is_present=is_present),
+            ("nvfp4", "quantization=fp8 is not fully downloaded; reusing the nvfp4 models already on disk."))
+        # requested set present -> used as-is
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            "nvfp4", ref2va=False, is_present=is_present), ("nvfp4", None))
+        # nothing requested -> first complete set on disk (template default order)
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            None, ref2va=False, is_present=is_present), ("nvfp4", None))
+        # nothing on disk -> fall back to the requested (or fp8) and download
+        empty = lambda q: False  # noqa: E731
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            "bf16", ref2va=False, is_present=empty), ("bf16", None))
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            None, ref2va=False, is_present=empty), ("fp8", None))
+        with self.assertRaises(ValueError):
+            wrapper_workflows.minimax_h3_quantization_preference("fp16", False, empty)
+        # ref2va sets use their own UNET but the same quant pool; with int8 and
+        # nvfp4 both present the first in canonical order (nvfp4) wins
+        present["int8"] = True
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            "fp8", ref2va=True, is_present=is_present)[0], "nvfp4")
+        present["nvfp4"] = False
+        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
+            "fp8", ref2va=True, is_present=is_present)[0], "int8")
 
     def test_models_and_length_helper(self):
         models = wrapper_workflows.minimax_h3_models("int8", ref2va=True)

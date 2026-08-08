@@ -254,9 +254,6 @@ def spec_with_workflows(workflows):
                 operation = _expanded_operation(template_operation, workflow, task,
                                                 f"{name}_{task_name}")
                 paths[f"/api/wrapper/{name}/{task_name}/generate"] = {"post": operation}
-                alias = copy.deepcopy(operation)
-                alias["operationId"] += "Alias"
-                paths[f"/api/wrapper/{name}/{task_name}"] = {"post": alias}
         else:
             operation = _expanded_operation(template_operation, workflow, workflow, name)
             paths[f"/api/wrapper/{name}/generate"] = {"post": operation}

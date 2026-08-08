@@ -290,12 +290,19 @@ async def _setup_flux2klein9b_txt2img(fields, downloaded):
 
 
 async def _setup_minimax_h3(fields, downloaded, ref2va):
-    """Shared MiniMax H3 setup: validate the sampler params and auto-download
-    the model set for the chosen quantization (fp8 default; int8 matches the
-    canonical template; bf16 full quality)."""
-    quantization = fields.get("quantization", "fp8").lower()
-    if quantization not in ("fp8", "int8", "bf16"):
+    """Shared MiniMax H3 setup: validate the sampler params and pick the model
+    set — reusing quantizations already on disk (int8/nvfp4 are the canonical
+    template defaults) before auto-downloading anything else."""
+    raw_quantization = fields.get("quantization", "").strip().lower() or None
+    if raw_quantization is not None and raw_quantization not in wrapper_workflows.MINIMAX_H3_QUANT_MODELS:
         raise _SetupError("Invalid quantization", "quantization must be one of: fp8, int8, bf16, nvfp4.")
+    try:
+        quantization, note = wrapper_workflows.minimax_h3_quantization_preference(
+            raw_quantization, ref2va,
+            lambda q: all(folder_paths.get_full_path(m["folder"], m["filename"])
+                          for m in wrapper_workflows.minimax_h3_models(q, ref2va=ref2va)))
+    except ValueError as e:
+        raise _SetupError("Invalid quantization", str(e)) from None
     try:
         steps = int(fields.get("steps", 50))
         width = int(fields.get("width", 1344))
@@ -322,10 +329,10 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     _raise_if_missing(await _download_models(
         wrapper_workflows.minimax_h3_models(quantization, ref2va=ref2va), downloaded))
 
-    note = None
     if model_management.get_torch_device().type == "mps":
-        note = ("MiniMax H3 is a very large omni-modal model; on MPS the fp8 weights "
-                "load as bf16 and the run may exceed available memory.")
+        mps_note = ("MiniMax H3 is a very large omni-modal model; on MPS the fp8 weights "
+                    "load as bf16 and the run may exceed available memory.")
+        note = f"{note} {mps_note}".strip() if note else mps_note
     q = wrapper_workflows.MINIMAX_H3_QUANT_MODELS[quantization]
     kwargs = {
         "steps": steps,
@@ -371,21 +378,15 @@ def register_wrapper_routes(routes, prompt_server):
     # resolves the first matching pattern. The flat route must win for
     # /{workflow}/generate, so it is registered first (bottom decorator).
     @routes.post("/wrapper/{workflow}/{task}/generate")
-    @routes.post("/wrapper/{workflow}/{task}")
     @routes.post("/wrapper/{workflow}/generate")
     async def generate(request):
         """Run one workflow (or workflow task) synchronously and return the
-        final file. Task workflows get /wrapper/{name}/{task}/generate plus the
-        bare /wrapper/{name}/{task} alias; flat workflows use
-        /wrapper/{name}/generate."""
+        final file. Task workflows get /wrapper/{name}/{task}/generate; flat
+        workflows use /wrapper/{name}/generate."""
         global _queue_number
 
         workflow_name = request.match_info["workflow"].lower()
         task_name = request.match_info.get("task")
-        if task_name == "generate":
-            # /{workflow}/generate matched the bare {task} alias; treat it as
-            # the flat route for non-task workflows.
-            task_name = None
         workflow = wrapper_workflows.WORKFLOWS.get(workflow_name)
         if workflow is None:
             return _error_response(
