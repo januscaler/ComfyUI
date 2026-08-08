@@ -1,24 +1,60 @@
+# CUDA inference stack for ComfyUI + the wrapper API.
+#
+# Requirements on the host:
+#   - NVIDIA driver + nvidia-container-toolkit
+#     (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+#   - Docker with Compose v2 (GPU support needs compose >= 2.24)
+#
+# Usage:
+#   docker compose build --build-arg BASE_IMAGE=python:3.12-slim
+#   docker compose up -d
+#
+# Model downloads happen at runtime into ./models (persistent volume), so the
+# image itself never contains model weights; a code change only rebuilds the
+# `comfyui` stage (the `base` stage is reused from the Docker cache).
 services:
   comfyui:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: comfyui
     image: comfyui-sync-api:latest
-    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 $${COMFYUI_ARGS:-}"
+    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 --auto-download-models $${COMFYUI_ARGS:-}"
     ports:
       - "8188:8188"
     volumes:
       - ./models:/opt/ComfyUI/models
       - ./input:/opt/ComfyUI/input
       - ./output:/opt/ComfyUI/output
+      - ./temp:/opt/ComfyUI/temp
       - ./user:/opt/ComfyUI/user
       - ./api_server/workflows:/opt/ComfyUI/api_server/workflows
     environment:
       - DO_NOT_TRACK=1
       - HF_HUB_DISABLE_TELEMETRY=1
+      # HF_TOKEN is passed through from the host env or a .env file (required
+      # for gated models, e.g. the FLUX.2 klein 9B fp8 checkpoint).
+      - HF_TOKEN=${HF_TOKEN:-}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8188/system_stats')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   developer-api:
     image: comfyui-sync-api:latest
     depends_on:
-      - comfyui
+      comfyui:
+        condition: service_healthy
     command: uvicorn api_server.developer_api:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
@@ -29,3 +65,4 @@ services:
       - COMFYUI_WORKFLOW_DIR=/opt/ComfyUI/api_server/workflows
       - COMFYUI_API_TIMEOUT_SECONDS=900
       - COMFYUI_API_POLL_INTERVAL_SECONDS=1.0
+    restart: unless-stopped

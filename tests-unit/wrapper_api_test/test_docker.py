@@ -1,0 +1,82 @@
+"""Tests for the CUDA docker setup: compose + Dockerfile + .dockerignore.
+
+These are structural checks (docker itself is not required): the compose YAML
+must parse, request an NVIDIA GPU, build the staged Dockerfile, persist models
+as volumes, and the Dockerfile must order dependency installation before the
+source copy so Docker's cache keeps the base stage until requirements change.
+"""
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+import yaml
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+class TestDockerCompose(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "docker-compose.yml")) as f:
+            cls.compose = yaml.safe_load(f)
+
+    def test_services_present(self):
+        self.assertIn("comfyui", self.compose["services"])
+        self.assertIn("developer-api", self.compose["services"])
+
+    def test_gpu_reservation(self):
+        devices = self.compose["services"]["comfyui"]["deploy"]["resources"]["reservations"]["devices"]
+        self.assertEqual(devices[0]["driver"], "nvidia")
+        self.assertIn("gpu", devices[0]["capabilities"][0])
+
+    def test_build_target_and_command(self):
+        cf = self.compose["services"]["comfyui"]
+        self.assertEqual(cf["build"]["target"], "comfyui")
+        self.assertTrue(cf["command"].endswith("--auto-download-models $${COMFYUI_ARGS:-}\""))
+        self.assertTrue(any(e.startswith("HF_TOKEN") for e in cf["environment"]))
+
+    def test_model_and_state_volumes(self):
+        volumes = self.compose["services"]["comfyui"]["volumes"]
+        for host in ("./models", "./input", "./output", "./temp", "./user", "./api_server/workflows"):
+            self.assertTrue(any(v.startswith(host) for v in volumes), f"volume {host} missing")
+
+    def test_healthcheck_and_ordering(self):
+        cf = self.compose["services"]["comfyui"]
+        self.assertIn("system_stats", cf["healthcheck"]["test"][-1])
+        dep = self.compose["services"]["developer-api"]["depends_on"]["comfyui"]
+        self.assertEqual(dep["condition"], "service_healthy")
+
+
+class TestDockerfile(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "Dockerfile")) as f:
+            cls.dockerfile = f.read()
+
+    def test_stages_and_cache_order(self):
+        self.assertIn("AS base", self.dockerfile)
+        self.assertIn("AS comfyui", self.dockerfile)
+        requirements_copy = self.dockerfile.index("COPY requirements.txt manager_requirements.txt ./")
+        source_copy = self.dockerfile.index("COPY . .")
+        self.assertLess(requirements_copy, source_copy,
+                        "dependency install must come before the source copy to keep the base cached")
+
+    def test_copy_sources_exist(self):
+        for path in ("requirements.txt", "manager_requirements.txt"):
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, path)),
+                            f"{path} referenced by Dockerfile but missing")
+
+
+class TestDockerignore(unittest.TestCase):
+    def test_excludes_weights_and_state(self):
+        with open(os.path.join(ROOT, ".dockerignore")) as f:
+            ignore = f.read()
+        for excluded in (".git", "models/*", "output/*", "*.safetensors"):
+            self.assertIn(excluded, ignore)
+
+
+if __name__ == "__main__":
+    unittest.main()
