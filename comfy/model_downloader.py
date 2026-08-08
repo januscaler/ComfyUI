@@ -66,6 +66,11 @@ def _download_huggingface_file(repo_and_path: str, dest: str, progress_key: str 
 
         downloaded = hf_hub_download(repo_id=repo_id, filename=filepath, **kwargs)
         _copy_to_dest(downloaded, dest)
+        if os.path.getsize(downloaded) != os.path.getsize(dest):
+            os.remove(dest)
+            raise OSError(
+                f"Copy to {dest} truncated: got {os.path.getsize(dest)} bytes, "
+                f"expected {os.path.getsize(downloaded)}; check free disk space.")
 
         logging.info(f"[ModelDownloader] Downloaded to: {dest}")
         return True
@@ -126,19 +131,31 @@ def _download_huggingface_resolve_url(url: str, dest: str, progress_key: str | N
 
         filepath = path_segments[1]
 
-        if progress_key:
-            try:
-                meta = get_hf_file_metadata(url)
-                if meta.size:
-                    _download_progress[progress_key] = (0, meta.size)
-            except Exception:
-                pass
+        # The expected byte size is needed both for progress reporting and for
+        # verifying the download was not truncated (an interrupted connection
+        # otherwise silently corrupts the model file).
+        meta = None
+        try:
+            meta = get_hf_file_metadata(url)
+        except Exception:
+            pass
+        if progress_key and meta is not None and meta.size:
+            _download_progress[progress_key] = (0, meta.size)
 
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         logging.info(f"[ModelDownloader] Downloading from HuggingFace: {repo_id}  file: {filepath}")
 
         downloaded = hf_hub_download(repo_id=repo_id, filename=filepath)
+        if meta is not None and meta.size is not None and os.path.getsize(downloaded) != meta.size:
+            raise OSError(
+                f"Cached file size mismatch for {filepath}: got {os.path.getsize(downloaded)} bytes, "
+                f"expected {meta.size}; the Hugging Face cache entry is corrupt.")
         _copy_to_dest(downloaded, dest)
+        if meta is not None and meta.size is not None and os.path.getsize(dest) != meta.size:
+            os.remove(dest)
+            raise OSError(
+                f"Copy to {dest} truncated: got {os.path.getsize(dest)} bytes, expected {meta.size}; "
+                "check free disk space.")
 
         logging.info(f"[ModelDownloader] Downloaded to: {dest}")
         return True

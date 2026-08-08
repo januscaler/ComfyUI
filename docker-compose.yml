@@ -6,28 +6,34 @@ services:
       dockerfile: Dockerfile
       target: comfyui
     image: comfyui-sync-api:latest
-    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 --auto-download-models $${COMFYUI_ARGS:-}"
+    # VRAM/offload tuning for GPUs with limited VRAM (e.g. MiniMax H3 on a 32 GB
+    # card): DynamicVRAM (default on NVIDIA) keeps inactive weights in RAM and
+    # streams only active layers to the GPU; --vram-headroom leaves that much
+    # VRAM free for other apps, --async-offload overlaps weight transfers with
+    # compute. Override per machine via .env: VRAM_HEADROOM_GB / ASYNC_OFFLOAD_STREAMS.
+    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --async-offload $${ASYNC_OFFLOAD_STREAMS:-2} $${COMFYUI_ARGS:-}"
     ports:
       - "8188:8188"
     volumes:
-      - ./models:/opt/ComfyUI/models
+      # Model weights live outside the image. Default ./models; point at a
+      # shared project dir to reuse one model store between projects, e.g.
+      #   MODELS_DIR=~/VoxMin/ace-step/models   (in .env)
+      # (use a dedicated model dir, not the huggingface cache dir).
+      - ${MODELS_DIR:-./models}:/opt/ComfyUI/models
       - ./input:/opt/ComfyUI/input
       - ./output:/opt/ComfyUI/output
       - ./temp:/opt/ComfyUI/temp
       - ./user:/opt/ComfyUI/user
       - ./api_server/workflows:/opt/ComfyUI/api_server/workflows
-      # Reuse another project's Hugging Face download cache instead of
-      # re-downloading blobs (helps downloads that go through hf_hub_download,
-      # i.e. repo@file style URLs; direct https://...resolve/main URLs bypass
-      # this cache and land straight in ./models above):
       - ~/VoxMin/ace-step/huggingface:/root/.cache/huggingface
-      # Triton JIT kernel cache: compiled once per GPU architecture, then
-      # reused across restarts and rebuilds (the C compiler in the image is
-      # only needed for that first compile).
       - ./.triton:/root/.triton
     environment:
       - DO_NOT_TRACK=1
       - HF_HUB_DISABLE_TELEMETRY=1
+      # VRAM tuning for the comfyui command above (defaults: 2 GB headroom,
+      # 2 async offload streams).
+      - VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}
+      - ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-2}
       # HF_TOKEN is passed through from the host env or a .env file (required
       # for gated models, e.g. the FLUX.2 klein 9B fp8 checkpoint).
       - HF_TOKEN=${HF_TOKEN:-}

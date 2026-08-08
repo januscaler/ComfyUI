@@ -295,7 +295,7 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     canonical template; bf16 full quality)."""
     quantization = fields.get("quantization", "fp8").lower()
     if quantization not in ("fp8", "int8", "bf16"):
-        raise _SetupError("Invalid quantization", "quantization must be one of: fp8, int8, bf16.")
+        raise _SetupError("Invalid quantization", "quantization must be one of: fp8, int8, bf16, nvfp4.")
     try:
         steps = int(fields.get("steps", 50))
         width = int(fields.get("width", 1344))
@@ -504,21 +504,42 @@ def register_wrapper_routes(routes, prompt_server):
             return _error_response("Workflow validation failed", str(valid[1]))
 
         extra_data = {"create_time": int(time.time() * 1000)}
-        _queue_number += 1
-        prompt_queue.put((_queue_number, prompt_id, graph, extra_data, valid[2], {}))
 
-        # Default: free VRAM as soon as this job finishes. The worker consumes
-        # these flags after the next prompt completes and unloads all models
-        # plus empty caches. Set free_vram=false to keep models loaded between
-        # consecutive jobs (e.g. batch runs).
-        if fields.get("free_vram", "true").lower() in ("1", "true", "yes", "on"):
-            prompt_queue.set_flag("unload_models", True)
-            prompt_queue.set_flag("free_memory", True)
+        # Per-request VRAM management: auto lets ComfyUI's dynamic VRAM decide
+        # (it streams weights to/from RAM so models larger than the GPU don't
+        # OOM); low/normal/high force the legacy vram state for this job and
+        # restore the previous state once the job finishes.
+        vram_state_map = {"low": model_management.VRAMState.LOW_VRAM,
+                          "normal": model_management.VRAMState.NORMAL_VRAM,
+                          "high": model_management.VRAMState.HIGH_VRAM}
+        previous_vram_state = None
+        vram_requested = fields.get("vram", "auto").lower()
+        if vram_requested != "auto":
+            if vram_requested not in vram_state_map:
+                return _error_response("Invalid vram", "vram must be one of: auto, low, normal, high.")
+            previous_vram_state = model_management.vram_state
+            model_management.vram_state = vram_state_map[vram_requested]
 
-        # Synchronous wait: block this request until the job finishes. By
-        # default there is no deadline; an explicit timeout field caps the wait
-        # (the returned job_id can then be polled via /jobs/{job_id}).
-        history_entry = await _wait_for_prompt(prompt_queue, prompt_id, timeout)
+        try:
+            _queue_number += 1
+            prompt_queue.put((_queue_number, prompt_id, graph, extra_data, valid[2], {}))
+
+            # Default: free VRAM as soon as this job finishes. The worker consumes
+            # these flags after the next prompt completes and unloads all models
+            # plus empty caches. Set free_vram=false to keep models loaded between
+            # consecutive jobs (e.g. batch runs).
+            if fields.get("free_vram", "true").lower() in ("1", "true", "yes", "on"):
+                prompt_queue.set_flag("unload_models", True)
+                prompt_queue.set_flag("free_memory", True)
+
+            # Synchronous wait: block this request until the job finishes. By
+            # default there is no deadline; an explicit timeout field caps the wait
+            # (the returned job_id can then be polled via /jobs/{job_id}).
+            history_entry = await _wait_for_prompt(prompt_queue, prompt_id, timeout)
+        finally:
+            if previous_vram_state is not None:
+                model_management.vram_state = previous_vram_state
+
         if history_entry is None:
             if timeout is None:
                 message = "The job was removed from the queue before finishing."

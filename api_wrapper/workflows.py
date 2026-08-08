@@ -213,6 +213,7 @@ MINIMAX_H3_REF2VA_UNET_INT8 = "minimax_h3_ref2va_pruned_int8_convrot.safetensors
 MINIMAX_H3_REF2VA_UNET_BF16 = "minimax_h3_ref2va_pruned_bf16.safetensors"
 MINIMAX_H3_CLIP = "qwen3vl_32b_minimax_h3_bf16.safetensors"
 MINIMAX_H3_CLIP_INT8 = "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+MINIMAX_H3_CLIP_NVFP4 = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 MINIMAX_H3_VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 MINIMAX_H3_AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 MINIMAX_H3_BASE_URL = "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main"
@@ -220,11 +221,15 @@ MINIMAX_H3_QUANT_MODELS = {
     "fp8": {"unet": MINIMAX_H3_UNET_FP8, "ref2va": MINIMAX_H3_REF2VA_UNET_FP8, "clip": MINIMAX_H3_CLIP},
     "int8": {"unet": MINIMAX_H3_UNET_INT8, "ref2va": MINIMAX_H3_REF2VA_UNET_INT8, "clip": MINIMAX_H3_CLIP_INT8},
     "bf16": {"unet": MINIMAX_H3_UNET_BF16, "ref2va": MINIMAX_H3_REF2VA_UNET_BF16, "clip": MINIMAX_H3_CLIP},
+    # No nvfp4 UNET variant exists; nvfp4 is a CLIP-only option. On Blackwell
+    # (sm_120) the CLIP runs natively as fp4 — 16 GB vs 34 GB (int8) / 66 GB
+    # (bf16) — which is what lets a 32 GB GPU fit the whole pipeline.
+    "nvfp4": {"unet": MINIMAX_H3_UNET_FP8, "ref2va": MINIMAX_H3_REF2VA_UNET_FP8, "clip": MINIMAX_H3_CLIP_NVFP4},
 }
 MINIMAX_H3_MODEL_NAMES = (
     MINIMAX_H3_UNET_FP8, MINIMAX_H3_UNET_INT8, MINIMAX_H3_UNET_BF16,
     MINIMAX_H3_REF2VA_UNET_FP8, MINIMAX_H3_REF2VA_UNET_INT8, MINIMAX_H3_REF2VA_UNET_BF16,
-    MINIMAX_H3_CLIP, MINIMAX_H3_CLIP_INT8,
+    MINIMAX_H3_CLIP, MINIMAX_H3_CLIP_INT8, MINIMAX_H3_CLIP_NVFP4,
     MINIMAX_H3_VIDEO_VAE, MINIMAX_H3_AUDIO_VAE,
 )
 
@@ -445,7 +450,7 @@ WORKFLOWS = {
                 "uses": ["prompt", "seed"],
                 "form": ["prompt", "seed", "steps", "width", "height", "duration", "scheduler"],
                 "extra_form_properties": MINIMAX_H3_FORM_EXTRA,
-                "quantization_options": ["fp8", "int8", "bf16"],
+                "quantization_options": ["fp8", "int8", "bf16", "nvfp4"],
                 "build": build_minimax_h3_text_to_video,
             },
             "image": {
@@ -457,7 +462,7 @@ WORKFLOWS = {
                 "uses": ["prompt", "seed"],
                 "form": ["prompt", "image", "last_frame", "seed", "steps", "width", "height", "duration", "scheduler"],
                 "extra_form_properties": MINIMAX_H3_FORM_EXTRA,
-                "quantization_options": ["fp8", "int8", "bf16"],
+                "quantization_options": ["fp8", "int8", "bf16", "nvfp4"],
                 "build": build_minimax_h3_image_to_video,
             },
             "reference": {
@@ -469,7 +474,7 @@ WORKFLOWS = {
                 "uses": ["prompt", "seed"],
                 "form": ["prompt", "seed", "steps", "width", "height", "duration", "scheduler", "ref_image_size"],
                 "extra_form_properties": MINIMAX_H3_REF_FORM_EXTRA,
-                "quantization_options": ["fp8", "int8", "bf16"],
+                "quantization_options": ["fp8", "int8", "bf16", "nvfp4"],
                 "example_prompt": (
                     "Show <Picture 1> skateboarding down a sunlit street, the camera follows "
                     "from the side, <Audio 1> with the sound of wheels rolling on asphalt, "

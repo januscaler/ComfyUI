@@ -139,6 +139,21 @@ class TestOpenAPISpec(unittest.TestCase):
         generate = paths["/api/wrapper/{workflow}/generate"]["post"]
         self.assertEqual(generate["requestBody"]["content"]["multipart/form-data"]["schema"]["required"],
                          ["prompt", "image"])
+        form = generate["requestBody"]["content"]["multipart/form-data"]["schema"]["properties"]
+        self.assertIn("vram", form)
+        self.assertEqual(form["vram"]["enum"], ["auto", "low", "normal", "high"])
+
+    def test_minimax_nvfp4_in_expanded_spec(self):
+        from api_wrapper import workflows as workflows_module
+        spec = wrapper_openapi.spec_with_workflows(workflows_module.WORKFLOWS)
+        minimax = spec["paths"]["/api/wrapper/minimaxh3/text/generate"]["post"]
+        quantization = minimax["requestBody"]["content"]["multipart/form-data"]["schema"]["properties"]["quantization"]
+        self.assertEqual(quantization["enum"], ["fp8", "int8", "bf16", "nvfp4"])
+        # the vram field survives per-workflow filtering for every workflow
+        for path in ("/api/wrapper/flux2klein9b/generate", "/api/wrapper/ideogram4/generate",
+                     "/api/wrapper/minimaxh3/image/generate"):
+            props = spec["paths"][path]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]["properties"]
+            self.assertIn("vram", props)
 
     def test_spec_expands_to_concrete_workflow_paths(self):
         from api_wrapper import workflows as workflows_module
@@ -187,7 +202,7 @@ class TestOpenAPISpec(unittest.TestCase):
         for prop in ("ref_images", "ref_videos", "ref_audios", "ref_image_size", "duration"):
             self.assertIn(prop, schema["properties"])
         self.assertNotIn("image", schema["properties"])
-        self.assertEqual(schema["properties"]["quantization"]["enum"], ["fp8", "int8", "bf16"])
+        self.assertEqual(schema["properties"]["quantization"]["enum"], ["fp8", "int8", "bf16", "nvfp4"])
         # the image task requires an image upload and returns video
         op = spec["paths"]["/api/wrapper/minimaxh3/image/generate"]["post"]
         schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
@@ -323,6 +338,19 @@ class TestMiniMaxH3Graph(unittest.TestCase):
                           wrapper_workflows.MINIMAX_H3_AUDIO_VAE])
         self.assertEqual(wrapper_workflows.minimax_h3_length(5.0), 120)
         self.assertEqual(wrapper_workflows.minimax_h3_length(0.1), 5)  # min 5
+
+    def test_nvfp4_quantization_uses_nvfp4_clip_with_fp8_unet(self):
+        # No nvfp4 UNET exists; nvfp4 is a CLIP-only option that drops the text
+        # encoder from 66 GB (bf16) / 34 GB (int8) to 16 GB, letting the whole
+        # pipeline fit on a 32 GB GPU.
+        for ref2va in (False, True):
+            models = wrapper_workflows.minimax_h3_models("nvfp4", ref2va=ref2va)
+            unet = wrapper_workflows.MINIMAX_H3_REF2VA_UNET_FP8 if ref2va else wrapper_workflows.MINIMAX_H3_UNET_FP8
+            self.assertEqual(models[0]["filename"], unet)
+            self.assertIn(wrapper_workflows.MINIMAX_H3_CLIP_NVFP4, [m["filename"] for m in models])
+            self.assertNotIn(wrapper_workflows.MINIMAX_H3_CLIP, [m["filename"] for m in models])
+        self.assertTrue(all(
+            q in wrapper_workflows.MINIMAX_H3_QUANT_MODELS for q in ("fp8", "int8", "bf16", "nvfp4")))
 
 
 class TestIdeogram4Graph(unittest.TestCase):

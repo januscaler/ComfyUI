@@ -35,13 +35,24 @@ class TestDockerCompose(unittest.TestCase):
     def test_build_target_and_command(self):
         cf = self.compose["services"]["comfyui"]
         self.assertEqual(cf["build"]["target"], "comfyui")
-        self.assertTrue(cf["command"].endswith("--auto-download-models $${COMFYUI_ARGS:-}\""))
+        command = cf["command"]
+        self.assertTrue(command.endswith("--auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --async-offload $${ASYNC_OFFLOAD_STREAMS:-2} $${COMFYUI_ARGS:-}\""),
+                        f"unexpected command: {command}")
         self.assertTrue(any(e.startswith("HF_TOKEN") for e in cf["environment"]))
+        self.assertIn("VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}", cf["environment"])
+        self.assertIn("ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-2}", cf["environment"])
 
     def test_model_and_state_volumes(self):
         volumes = self.compose["services"]["comfyui"]["volumes"]
-        for host in ("./models", "./input", "./output", "./temp", "./user", "./api_server/workflows", "./.triton"):
+        for host in ("./input", "./output", "./temp", "./user", "./api_server/workflows", "./.triton"):
             self.assertTrue(any(v.startswith(host) for v in volumes), f"volume {host} missing")
+        self.assertTrue(any("/opt/ComfyUI/models" in v for v in volumes), "models mount missing")
+
+    def test_models_dir_is_configurable(self):
+        volumes = self.compose["services"]["comfyui"]["volumes"]
+        models_mount = next(v for v in volumes if "/opt/ComfyUI/models" in v)
+        self.assertTrue(models_mount.startswith("${MODELS_DIR:-./models}"),
+                        "models mount must default to ./models and be overridable via MODELS_DIR")
 
     def test_healthcheck_and_ordering(self):
         cf = self.compose["services"]["comfyui"]

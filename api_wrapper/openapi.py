@@ -40,6 +40,7 @@ WRAPPER_OPENAPI_SPEC = {
                                     "timeout": {"type": "integer", "minimum": 0, "maximum": 86400, "default": 0, "description": "Seconds to wait before returning 504. 0 (default) waits until the workflow finishes, however long that takes; the timeout response includes the job_id to poll via /jobs/{job_id}."},
                                     "free_vram": {"type": "boolean", "default": True, "description": "Release VRAM and RAM as soon as this job finishes (set to false to keep models loaded between jobs, e.g. batch runs)."},
                                     "quantization": {"type": "string", "enum": ["fp8", "fp4"], "default": "fp8", "description": "Weight precision. fp8 uses the shipped fp8 checkpoint (loaded as bf16 on MPS). fp4 converts the checkpoint to NVFP4 (~half the size) for CUDA/CPU; on MPS it automatically falls back to fp8."},
+                                    "vram": {"type": "string", "enum": ["auto", "low", "normal", "high"], "default": "auto", "description": "VRAM management for this job: auto (default) lets ComfyUI's dynamic VRAM decide, streaming model weights to/from RAM so a model larger than the GPU never OOMs. low/normal/high force the legacy vram state for this job (advisory while dynamic VRAM is active)."},
                                 },
                             }
                         }
@@ -206,7 +207,7 @@ def _expanded_operation(template_operation, workflow, task, operation_suffix):
     schema = operation["requestBody"]["content"]["multipart/form-data"]["schema"]
     form = task.get("form")
     if form:
-        universal = ("timeout", "free_vram", "quantization")
+        universal = ("timeout", "free_vram", "quantization", "vram")
         schema["properties"] = {k: v for k, v in schema["properties"].items()
                                 if k in form or k in universal}
         schema["properties"].update(task.get("extra_form_properties") or {})
