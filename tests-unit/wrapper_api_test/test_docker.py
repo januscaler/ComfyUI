@@ -36,11 +36,14 @@ class TestDockerCompose(unittest.TestCase):
         cf = self.compose["services"]["comfyui"]
         self.assertEqual(cf["build"]["target"], "comfyui")
         command = cf["command"]
-        self.assertTrue(command.endswith("--auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --async-offload $${ASYNC_OFFLOAD_STREAMS:-2} --cache-ram $${CACHE_RAM_GB:-4 16} $${COMFYUI_ARGS:-}\""),
-                        f"unexpected command: {command}")
+        self.assertIn("--auto-download-models", command)
+        self.assertIn("--vram-headroom $${VRAM_HEADROOM_GB:-2}", command)
+        self.assertIn("--cache-ram $${CACHE_RAM_GB:-4 16}", command)
+        self.assertIn("--disable-async-offload", command)  # async offload default-off
+        self.assertIn("$${COMFYUI_ARGS:-}", command)
         self.assertTrue(any(e.startswith("HF_TOKEN") for e in cf["environment"]))
         self.assertIn("VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}", cf["environment"])
-        self.assertIn("ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-2}", cf["environment"])
+        self.assertIn("ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-0}", cf["environment"])
         self.assertIn("CACHE_RAM_GB=${CACHE_RAM_GB:-4 16}", cf["environment"])
 
     def test_model_and_state_volumes(self):

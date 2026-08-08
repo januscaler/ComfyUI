@@ -353,39 +353,48 @@ class TestMiniMaxH3Graph(unittest.TestCase):
             sampler_out = decode["VAEDecode"]["inputs"]["samples"]
             self.assertEqual(decode["VAEDecodeAudio"]["inputs"]["samples"], sampler_out)
 
-    def test_quantization_reuses_present_model_sets(self):
-        quants = wrapper_workflows.MINIMAX_H3_QUANT_MODELS
-        present = {"nvfp4": True, "int8": False, "fp8": False, "bf16": False}
+    def test_model_pick_prefers_smallest_present_clip(self):
+        w = wrapper_workflows
+        disk = set()
 
-        def is_present(q):
-            return present.get(q, False)
+        def is_present(folder, filename):
+            return filename in disk
 
-        # requested fp8, but only nvfp4 is downloaded -> reuse nvfp4, no download
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            "fp8", ref2va=False, is_present=is_present),
-            ("nvfp4", "quantization=fp8 is not fully downloaded; reusing the nvfp4 models already on disk."))
-        # requested set present -> used as-is
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            "nvfp4", ref2va=False, is_present=is_present), ("nvfp4", None))
-        # nothing requested -> first complete set on disk (template default order)
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            None, ref2va=False, is_present=is_present), ("nvfp4", None))
-        # nothing on disk -> fall back to the requested (or fp8) and download
-        empty = lambda q: False  # noqa: E731
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            "bf16", ref2va=False, is_present=empty), ("bf16", None))
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            None, ref2va=False, is_present=empty), ("fp8", None))
+        # nvfp4 CLIP on disk -> never touches bf16 even though fp8 is requested
+        disk = {w.MINIMAX_H3_UNET_FP8, w.MINIMAX_H3_CLIP_NVFP4}
+        unet, clip, note = w.minimax_h3_model_pick("fp8", ref2va=False, is_present=is_present)
+        self.assertEqual(unet, w.MINIMAX_H3_UNET_FP8)
+        self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
+        self.assertIn("instead of the quantization's default", note)
+
+        # bf16 CLIP is the only encoder present (old downloads) -> used, no note
+        disk = {w.MINIMAX_H3_UNET_FP8, w.MINIMAX_H3_CLIP}
+        unet, clip, note = w.minimax_h3_model_pick("fp8", ref2va=False, is_present=is_present)
+        self.assertEqual(clip, w.MINIMAX_H3_CLIP)
+        self.assertIsNone(note)
+
+        # requested UNET missing -> first present variant (fp8) used with note
+        disk = {w.MINIMAX_H3_REF2VA_UNET_FP8, w.MINIMAX_H3_CLIP_NVFP4}
+        unet, clip, note = w.minimax_h3_model_pick("bf16", ref2va=True, is_present=is_present)
+        self.assertEqual(unet, w.MINIMAX_H3_REF2VA_UNET_FP8)
+        self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
+        self.assertIn("not on disk", note)
+
+        # nothing on disk -> requested (or fp8) UNET + nvfp4 CLIP are downloaded
+        disk = set()
+        unet, clip, note = w.minimax_h3_model_pick("bf16", ref2va=False, is_present=is_present)
+        self.assertEqual(unet, w.MINIMAX_H3_UNET_BF16)
+        self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
+        unet, clip, _ = w.minimax_h3_model_pick(None, ref2va=False, is_present=is_present)
+        self.assertEqual(unet, w.MINIMAX_H3_UNET_FP8)
+        self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
         with self.assertRaises(ValueError):
-            wrapper_workflows.minimax_h3_quantization_preference("fp16", False, empty)
-        # ref2va sets use their own UNET but the same quant pool; with int8 and
-        # nvfp4 both present the first in canonical order (nvfp4) wins
-        present["int8"] = True
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            "fp8", ref2va=True, is_present=is_present)[0], "nvfp4")
-        present["nvfp4"] = False
-        self.assertEqual(wrapper_workflows.minimax_h3_quantization_preference(
-            "fp8", ref2va=True, is_present=is_present)[0], "int8")
+            w.minimax_h3_model_pick("fp16", False, is_present)
+
+        # models() honors explicit overrides for the download list
+        models = w.minimax_h3_models("fp8", ref2va=True, unet_name="x.safetensors", clip_name="y.safetensors")
+        self.assertEqual(models[0]["filename"], "x.safetensors")
+        self.assertEqual(models[1]["filename"], "y.safetensors")
 
     def test_models_and_length_helper(self):
         models = wrapper_workflows.minimax_h3_models("int8", ref2va=True)

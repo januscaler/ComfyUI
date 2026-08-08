@@ -297,10 +297,9 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     if raw_quantization is not None and raw_quantization not in wrapper_workflows.MINIMAX_H3_QUANT_MODELS:
         raise _SetupError("Invalid quantization", "quantization must be one of: fp8, int8, bf16, nvfp4.")
     try:
-        quantization, note = wrapper_workflows.minimax_h3_quantization_preference(
+        unet_name, clip_name, note = wrapper_workflows.minimax_h3_model_pick(
             raw_quantization, ref2va,
-            lambda q: all(folder_paths.get_full_path(m["folder"], m["filename"])
-                          for m in wrapper_workflows.minimax_h3_models(q, ref2va=ref2va)))
+            lambda folder, filename: folder_paths.get_full_path(folder, filename) is not None)
     except ValueError as e:
         raise _SetupError("Invalid quantization", str(e)) from None
     try:
@@ -327,21 +326,21 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
         raise _SetupError("Invalid ref_image_size", "ref_image_size must be 'match' or 'max'.")
 
     _raise_if_missing(await _download_models(
-        wrapper_workflows.minimax_h3_models(quantization, ref2va=ref2va), downloaded))
+        wrapper_workflows.minimax_h3_models("fp8", ref2va,
+                                            unet_name=unet_name, clip_name=clip_name), downloaded))
 
     if model_management.get_torch_device().type == "mps":
         mps_note = ("MiniMax H3 is a very large omni-modal model; on MPS the fp8 weights "
                     "load as bf16 and the run may exceed available memory.")
         note = f"{note} {mps_note}".strip() if note else mps_note
-    q = wrapper_workflows.MINIMAX_H3_QUANT_MODELS[quantization]
     kwargs = {
         "steps": steps,
         "width": width,
         "height": height,
         "duration": duration,
         "scheduler": scheduler,
-        "unet_name": q["ref2va"] if ref2va else q["unet"],
-        "clip_name": q["clip"],
+        "unet_name": unet_name,
+        "clip_name": clip_name,
     }
     if ref2va:
         # Only the reference builder consumes this; the text/image builders

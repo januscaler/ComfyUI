@@ -235,42 +235,67 @@ MINIMAX_H3_MODEL_NAMES = (
 
 
 MINIMAX_H3_QUANT_ORDER = ("nvfp4", "int8", "fp8", "bf16")
+# Smallest CLIP first; bf16 (66 GB) is only ever used when it is the only
+# encoder present. nvfp4 (16 GB) is the canonical template default.
+MINIMAX_H3_CLIP_ORDER = (MINIMAX_H3_CLIP_NVFP4, MINIMAX_H3_CLIP_INT8, MINIMAX_H3_CLIP)
 
 
-def minimax_h3_quantization_preference(requested, ref2va, is_present):
-    """Pick the quantization to run, preferring model files already on disk.
+def minimax_h3_model_pick(requested, ref2va, is_present):
+    """Pick (unet_name, clip_name, note) for a MiniMax H3 job.
 
-    ``requested`` is the user's quantization or None. ``is_present(q)`` reports
-    whether the full model set for ``q`` exists locally. The canonical template
-    ships int8 UNET + nvfp4 CLIP; if the requested set is incomplete but another
-    quantization's set is already downloaded, that set is reused instead of
-    re-downloading (a 66 GB bf16 CLIP download otherwise happens for fp8).
-    Returns (quantization, note_or_None)."""
-    if requested is not None:
-        if requested not in MINIMAX_H3_QUANT_MODELS:
-            raise ValueError(f"Invalid quantization: {requested}")
-        if is_present(requested):
-            return requested, None
-        for alt in MINIMAX_H3_QUANT_ORDER:
-            if alt != requested and is_present(alt):
-                return alt, (f"quantization={requested} is not fully downloaded; "
-                             f"reusing the {alt} models already on disk.")
-    for q in MINIMAX_H3_QUANT_ORDER:
-        if is_present(q):
-            return q, None
-    return requested or "fp8", None
+    The CLIP is chosen independently of the UNET quantization: the smallest
+    encoder already on disk wins (nvfp4 16 GB -> int8 34 GB -> bf16 66 GB),
+    so a previously-downloaded bf16 encoder is never preferred over a smaller
+    one. The UNET follows the requested quantization when that file exists,
+    otherwise the first present variant (nvfp4/int8/fp8 UNETs are ~20 GB;
+    bf16 is ~40 GB). ``is_present(folder, filename)`` reports local files."""
+    if requested is not None and requested not in MINIMAX_H3_QUANT_MODELS:
+        raise ValueError(f"Invalid quantization: {requested}")
+    q = requested or "fp8"
+    quants = MINIMAX_H3_QUANT_MODELS
+    unet_key = "ref2va" if ref2va else "unet"
+
+    notes = []
+    unet_order = [q] + [x for x in MINIMAX_H3_QUANT_ORDER if x != q]
+    unet_quant, unet = None, None
+    for qq in unet_order:
+        cand = quants[qq][unet_key]
+        if is_present("diffusion_models", cand):
+            unet_quant, unet = qq, cand
+            break
+    if unet is None:
+        unet_quant, unet = q, quants[q][unet_key]
+    if unet_quant != q:
+        notes.append(f"quantization={q} UNET is not on disk; using the {unet_quant} UNET already present.")
+
+    clip = None
+    for cand in MINIMAX_H3_CLIP_ORDER:
+        if is_present("text_encoders", cand):
+            clip = cand
+            break
+    if clip is None:
+        clip = MINIMAX_H3_CLIP_NVFP4
+    if clip != quants[q]["clip"]:
+        notes.append("using the smallest text encoder already on disk instead of the "
+                     f"quantization's default ({quants[q]['clip']}).")
+
+    return unet, clip, " ".join(notes) or None
 
 
-def minimax_h3_models(quantization, ref2va=False):
-    """The 4 model files a MiniMax H3 task needs for the given quantization."""
+def minimax_h3_models(quantization, ref2va=False, unet_name=None, clip_name=None):
+    """The 4 model files a MiniMax H3 task needs for the given quantization.
+
+    ``unet_name``/``clip_name`` override the quantization defaults when the
+    wrapper picked a different (already-downloaded) variant."""
     q = MINIMAX_H3_QUANT_MODELS[quantization]
-    unet = q["ref2va"] if ref2va else q["unet"]
-    files = [unet, q["clip"], MINIMAX_H3_VIDEO_VAE, MINIMAX_H3_AUDIO_VAE]
+    unet = unet_name or (q["ref2va"] if ref2va else q["unet"])
+    clip = clip_name or q["clip"]
+    files = [unet, clip, MINIMAX_H3_VIDEO_VAE, MINIMAX_H3_AUDIO_VAE]
     return [
         {"folder": "diffusion_models", "filename": unet,
          "url": f"{MINIMAX_H3_BASE_URL}/diffusion_models/{unet}"},
-        {"folder": "text_encoders", "filename": q["clip"],
-         "url": f"{MINIMAX_H3_BASE_URL}/text_encoders/{q['clip']}"},
+        {"folder": "text_encoders", "filename": clip,
+         "url": f"{MINIMAX_H3_BASE_URL}/text_encoders/{clip}"},
         {"folder": "vae", "filename": MINIMAX_H3_VIDEO_VAE,
          "url": f"{MINIMAX_H3_BASE_URL}/vae/{MINIMAX_H3_VIDEO_VAE}"},
         {"folder": "vae", "filename": MINIMAX_H3_AUDIO_VAE,
