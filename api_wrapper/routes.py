@@ -363,9 +363,12 @@ def register_wrapper_routes(routes, prompt_server):
     """Attach the wrapper handlers to a PromptServer route table."""
     prompt_queue = prompt_server.prompt_queue
 
-    @routes.post("/wrapper/{workflow}/generate")
+    # Registration order matters: decorators apply bottom-up, and aiohttp
+    # resolves the first matching pattern. The flat route must win for
+    # /{workflow}/generate, so it is registered first (bottom decorator).
     @routes.post("/wrapper/{workflow}/{task}/generate")
     @routes.post("/wrapper/{workflow}/{task}")
+    @routes.post("/wrapper/{workflow}/generate")
     async def generate(request):
         """Run one workflow (or workflow task) synchronously and return the
         final file. Task workflows get /wrapper/{name}/{task}/generate plus the
@@ -375,6 +378,10 @@ def register_wrapper_routes(routes, prompt_server):
 
         workflow_name = request.match_info["workflow"].lower()
         task_name = request.match_info.get("task")
+        if task_name == "generate":
+            # /{workflow}/generate matched the bare {task} alias; treat it as
+            # the flat route for non-task workflows.
+            task_name = None
         workflow = wrapper_workflows.WORKFLOWS.get(workflow_name)
         if workflow is None:
             return _error_response(
