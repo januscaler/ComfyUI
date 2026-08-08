@@ -6,6 +6,7 @@ import time
 import unittest
 
 from api_wrapper import routes as wrapper_routes
+from api_wrapper import workflows as wrapper_workflows
 
 
 class TestCollectOutputFiles(unittest.TestCase):
@@ -141,6 +142,55 @@ class TestWaitForPrompt(unittest.IsolatedAsyncioTestCase):
         # job still running after the cap -> None (timed out)
         self.assertIsNone(entry)
         self.assertGreaterEqual(time.time() - start, 0.2)
+
+
+class TestMiniMaxSetupContract(unittest.TestCase):
+    """The per-task setups must return exactly the kwargs their builder
+    accepts (a mismatch crashed the text task with an unexpected
+    'ref_image_size' argument), and own their own defaults (steps default 50,
+    not the shared handler default 20)."""
+
+    def setUp(self):
+        self._download_models = wrapper_routes._download_models
+        self._raise_if_missing = wrapper_routes._raise_if_missing
+        self._get_torch_device = wrapper_routes.model_management.get_torch_device
+        import types
+
+        async def no_download(*args, **kwargs):
+            return []
+
+        wrapper_routes._download_models = no_download
+        wrapper_routes._raise_if_missing = lambda missing: None
+        wrapper_routes.model_management.get_torch_device = lambda: types.SimpleNamespace(type="cpu")
+
+    def tearDown(self):
+        wrapper_routes._download_models = self._download_models
+        wrapper_routes._raise_if_missing = self._raise_if_missing
+        wrapper_routes.model_management.get_torch_device = self._get_torch_device
+
+    def test_text_setup_kwargs_build(self):
+        kwargs, _ = asyncio.run(wrapper_routes._setup_minimax_h3_text({}, []))
+        self.assertNotIn("ref_image_size", kwargs)
+        self.assertEqual(kwargs["steps"], 50)  # setup default, not the handler's 20
+        graph = wrapper_workflows.build_minimax_h3_text_to_video(prompt="x", **kwargs)
+        self.assertIn("1", graph)
+
+    def test_image_setup_kwargs_build(self):
+        kwargs, _ = asyncio.run(wrapper_routes._setup_minimax_h3_image({}, []))
+        self.assertNotIn("ref_image_size", kwargs)
+        kwargs["first_frame"] = "wrapper/a.png"
+        graph = wrapper_workflows.build_minimax_h3_image_to_video(prompt="x", **kwargs)
+        self.assertIn("1", graph)
+
+    def test_reference_setup_kwargs_build(self):
+        kwargs, _ = asyncio.run(wrapper_routes._setup_minimax_h3_reference({}, []))
+        self.assertEqual(kwargs["ref_image_size"], "match")
+        graph = wrapper_workflows.build_minimax_h3_reference_to_video(prompt="x", **kwargs)
+        self.assertIn("1", graph)
+
+    def test_steps_field_forwarded(self):
+        kwargs, _ = asyncio.run(wrapper_routes._setup_minimax_h3_text({"steps": "20"}, []))
+        self.assertEqual(kwargs["steps"], 20)
 
 
 if __name__ == "__main__":

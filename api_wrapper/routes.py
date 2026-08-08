@@ -327,16 +327,20 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
         note = ("MiniMax H3 is a very large omni-modal model; on MPS the fp8 weights "
                 "load as bf16 and the run may exceed available memory.")
     q = wrapper_workflows.MINIMAX_H3_QUANT_MODELS[quantization]
-    return {
+    kwargs = {
         "steps": steps,
         "width": width,
         "height": height,
         "duration": duration,
         "scheduler": scheduler,
-        "ref_image_size": ref_image_size,
         "unet_name": q["ref2va"] if ref2va else q["unet"],
         "clip_name": q["clip"],
-    }, note
+    }
+    if ref2va:
+        # Only the reference builder consumes this; the text/image builders
+        # would reject it as an unexpected keyword argument.
+        kwargs["ref_image_size"] = ref_image_size
+    return kwargs, note
 
 
 async def _setup_minimax_h3_text(fields, downloaded):
