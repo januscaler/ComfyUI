@@ -10,8 +10,12 @@ services:
     # card): DynamicVRAM (default on NVIDIA) keeps inactive weights in RAM and
     # streams only active layers to the GPU; --vram-headroom leaves that much
     # VRAM free for other apps, --async-offload overlaps weight transfers with
-    # compute. Override per machine via .env: VRAM_HEADROOM_GB / ASYNC_OFFLOAD_STREAMS.
-    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --async-offload $${ASYNC_OFFLOAD_STREAMS:-2} $${COMFYUI_ARGS:-}"
+    # compute. --cache-ram caps how much RAM cached/staged models may use before
+    # they are evicted (active threshold, pin threshold) — essential on boxes
+    # with little RAM: MiniMax H3 stages ~40 GB of weights (CLIP + UNET + VAE),
+    # so a 32 GB box OOM-kills (exit 137) without this cap. Override per machine
+    # via .env: VRAM_HEADROOM_GB / ASYNC_OFFLOAD_STREAMS / CACHE_RAM_GB.
+    command: sh -c "python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --async-offload $${ASYNC_OFFLOAD_STREAMS:-2} --cache-ram $${CACHE_RAM_GB:-4 16} $${COMFYUI_ARGS:-}"
     ports:
       - "8188:8188"
     volumes:
@@ -31,9 +35,10 @@ services:
       - DO_NOT_TRACK=1
       - HF_HUB_DISABLE_TELEMETRY=1
       # VRAM tuning for the comfyui command above (defaults: 2 GB headroom,
-      # 2 async offload streams).
+      # 2 async offload streams, RAM cache capped at 4 GB active / 16 GB pinned).
       - VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}
       - ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-2}
+      - CACHE_RAM_GB=${CACHE_RAM_GB:-4 16}
       # HF_TOKEN is passed through from the host env or a .env file (required
       # for gated models, e.g. the FLUX.2 klein 9B fp8 checkpoint).
       - HF_TOKEN=${HF_TOKEN:-}
