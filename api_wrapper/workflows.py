@@ -389,28 +389,43 @@ def build_minimax_h3_image_to_video(*, prompt, seed=0, steps=50, width=1344, hei
                                      cond_inputs, loader_nodes, next_id, filename_prefix)
 
 
+def _ref_list(refs):
+    """Accept a single ref filename (max=1 uploads arrive as a string) or a
+    list/tuple of them."""
+    if isinstance(refs, str):
+        return (refs,)
+    return refs or ()
+
+
 def build_minimax_h3_reference_to_video(*, prompt, seed=0, steps=50, width=1344, height=768,
                                         duration=5.0, scheduler="beta", ref_image_size="match",
                                         filename_prefix="wrapper/minimaxh3_ref2va",
-                                        ref_images=(), ref_videos=(), ref_audios=(),
+                                        ref_images=(), ref_videos=(), ref_video_audios=(),
+                                        ref_audios=(),
                                         unet_name=MINIMAX_H3_REF2VA_UNET_FP8,
                                         clip_name=MINIMAX_H3_CLIP):
     """MiniMax H3 reference-to-video (ref2va): reference images/videos/audio +
     prompt -> joint audio+video MP4. The prompt refers to references by tag
-    (<Picture i> / <Video k> / <Audio j>) in the order they were provided."""
+    (<Picture i> / <Video k> / <Audio j>) in the order they were provided.
+    Parity with the official ref2va workflow: up to 3 images, 1 reference video
+    (with its optional soundtrack), and 2 standalone audio refs."""
     length = minimax_h3_length(duration)
     ref_inputs = {}
     loader_nodes = {}
     next_id = 7
-    for i, ref in enumerate(ref_images):
+    for i, ref in enumerate(_ref_list(ref_images)):
         ref_inputs.setdefault("ref_images", {})[f"ref_image_{i}"] = [str(next_id), 0]
         loader_nodes[str(next_id)] = {"class_type": "LoadImage", "inputs": {"image": ref}}
         next_id += 1
-    for i, ref in enumerate(ref_videos):
+    for i, ref in enumerate(_ref_list(ref_videos)):
         ref_inputs.setdefault("ref_videos", {})[f"ref_video_{i}"] = [str(next_id), 0]
         loader_nodes[str(next_id)] = {"class_type": "LoadVideo", "inputs": {"file": ref}}
         next_id += 1
-    for i, ref in enumerate(ref_audios):
+    for i, ref in enumerate(_ref_list(ref_video_audios)):
+        ref_inputs.setdefault("ref_video_audios", {})[f"ref_video_audio_{i}"] = [str(next_id), 0]
+        loader_nodes[str(next_id)] = {"class_type": "LoadAudio", "inputs": {"audio": ref}}
+        next_id += 1
+    for i, ref in enumerate(_ref_list(ref_audios)):
         ref_inputs.setdefault("ref_audios", {})[f"ref_audio_{i}"] = [str(next_id), 0]
         loader_nodes[str(next_id)] = {"class_type": "LoadAudio", "inputs": {"audio": ref}}
         next_id += 1
@@ -520,9 +535,10 @@ WORKFLOWS = {
             "reference": {
                 "title": "Reference to video (ref2va)",
                 "requires_image": False,
-                "uploads": {"ref_images": {"ext": "image", "max": 9},
-                             "ref_videos": {"ext": "video", "max": 3},
-                             "ref_audios": {"ext": "audio", "max": 3}},
+                "uploads": {"ref_images": {"ext": "image", "max": 3},
+                             "ref_videos": {"ext": "video", "max": 1},
+                             "ref_video_audios": {"ext": "audio", "max": 1},
+                             "ref_audios": {"ext": "audio", "max": 2}},
                 "uses": ["prompt", "seed"],
                 "form": ["prompt", "seed", "steps", "width", "height", "duration", "scheduler", "ref_image_size"],
                 "extra_form_properties": MINIMAX_H3_REF_FORM_EXTRA,

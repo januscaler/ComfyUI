@@ -116,7 +116,10 @@ class TestWorkflowRegistry(unittest.TestCase):
         self.assertEqual(sorted(entry["tasks"]), ["image", "reference", "text"])
         self.assertEqual(entry["output_type"], "video")
         self.assertIn("uploads", entry["tasks"]["reference"])
-        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_images"]["max"], 9)
+        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_images"]["max"], 3)
+        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_videos"]["max"], 1)
+        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_video_audios"]["max"], 1)
+        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_audios"]["max"], 2)
 
     def test_klein_txt2img_registered(self):
         from api_wrapper import workflows as workflows_module
@@ -200,7 +203,7 @@ class TestOpenAPISpec(unittest.TestCase):
         self.assertEqual(list(content)[0], "video/mp4")
         schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
         self.assertEqual(schema["required"], ["prompt"])
-        for prop in ("ref_images", "ref_videos", "ref_audios", "ref_image_size", "duration"):
+        for prop in ("ref_images", "ref_videos", "ref_video_audios", "ref_audios", "ref_image_size", "duration"):
             self.assertIn(prop, schema["properties"])
         self.assertNotIn("image", schema["properties"])
         self.assertEqual(schema["properties"]["quantization"]["enum"], ["fp8", "int8", "bf16", "nvfp4"])
@@ -314,16 +317,26 @@ class TestMiniMaxH3Graph(unittest.TestCase):
     def test_reference_to_video_wires_refs(self):
         graph = wrapper_workflows.build_minimax_h3_reference_to_video(
             prompt="<Picture 1> <Video 1> <Audio 1>", ref_image_size="max",
-            ref_images=["wrapper/i1.png", "wrapper/i2.png"],
-            ref_videos=["wrapper/v1.mp4"], ref_audios=["wrapper/a1.wav"])
+            ref_images=["wrapper/i1.png", "wrapper/i2.png", "wrapper/i3.png"],
+            ref_videos=["wrapper/v1.mp4"], ref_video_audios=["wrapper/v1.wav"],
+            ref_audios=["wrapper/a1.wav", "wrapper/a2.wav"])
         self.assertEqual(graph["6"]["class_type"], "MiniMaxH3ReferenceToVideo")
         self.assertEqual(graph["6"]["inputs"]["ref_image_size"], "max")
-        self.assertEqual(graph["6"]["inputs"]["ref_images"], {"ref_image_0": ["7", 0], "ref_image_1": ["8", 0]})
-        self.assertEqual(graph["6"]["inputs"]["ref_videos"], {"ref_video_0": ["9", 0]})
-        self.assertEqual(graph["6"]["inputs"]["ref_audios"], {"ref_audio_0": ["10", 0]})
+        self.assertEqual(graph["6"]["inputs"]["ref_images"],
+                         {"ref_image_0": ["7", 0], "ref_image_1": ["8", 0], "ref_image_2": ["9", 0]})
+        self.assertEqual(graph["6"]["inputs"]["ref_videos"], {"ref_video_0": ["10", 0]})
+        self.assertEqual(graph["6"]["inputs"]["ref_video_audios"], {"ref_video_audio_0": ["11", 0]})
+        self.assertEqual(graph["6"]["inputs"]["ref_audios"],
+                         {"ref_audio_0": ["12", 0], "ref_audio_1": ["13", 0]})
         self.assertEqual(graph["7"]["class_type"], "LoadImage")
-        self.assertEqual(graph["9"]["class_type"], "LoadVideo")
-        self.assertEqual(graph["10"]["class_type"], "LoadAudio")
+        self.assertEqual(graph["10"]["class_type"], "LoadVideo")
+        self.assertEqual(graph["11"]["class_type"], "LoadAudio")  # video soundtrack
+        self.assertEqual(graph["12"]["class_type"], "LoadAudio")
+        # single-ref uploads (max=1) arrive as a bare filename string
+        graph3 = wrapper_workflows.build_minimax_h3_reference_to_video(
+            prompt="x", ref_videos="wrapper/v1.mp4", ref_video_audios="wrapper/v1.wav")
+        self.assertEqual(graph3["6"]["inputs"]["ref_videos"], {"ref_video_0": ["7", 0]})
+        self.assertEqual(graph3["6"]["inputs"]["ref_video_audios"], {"ref_video_audio_0": ["8", 0]})
         # no refs -> no loader nodes, tail starts at 7
         graph2 = wrapper_workflows.build_minimax_h3_reference_to_video(prompt="x")
         self.assertEqual(graph2["7"]["class_type"], "BasicGuider")
