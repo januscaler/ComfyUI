@@ -21,9 +21,12 @@ WORKDIR /opt/ComfyUI
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ffmpeg \
+        gcc \
+        g++ \
         git \
         libglib2.0-0 \
         libgl1 \
+        make \
         tini && \
     rm -rf /var/lib/apt/lists/*
 

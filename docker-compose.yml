@@ -16,12 +16,15 @@ services:
       - ./temp:/opt/ComfyUI/temp
       - ./user:/opt/ComfyUI/user
       - ./api_server/workflows:/opt/ComfyUI/api_server/workflows
-      - ~/VoxMin/ace-step/huggingface:/root/.cache/huggingface
       # Reuse another project's Hugging Face download cache instead of
       # re-downloading blobs (helps downloads that go through hf_hub_download,
       # i.e. repo@file style URLs; direct https://...resolve/main URLs bypass
       # this cache and land straight in ./models above):
       - ~/VoxMin/ace-step/huggingface:/root/.cache/huggingface
+      # Triton JIT kernel cache: compiled once per GPU architecture, then
+      # reused across restarts and rebuilds (the C compiler in the image is
+      # only needed for that first compile).
+      - ./.triton:/root/.triton
     environment:
       - DO_NOT_TRACK=1
       - HF_HUB_DISABLE_TELEMETRY=1

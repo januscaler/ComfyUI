@@ -40,7 +40,7 @@ class TestDockerCompose(unittest.TestCase):
 
     def test_model_and_state_volumes(self):
         volumes = self.compose["services"]["comfyui"]["volumes"]
-        for host in ("./models", "./input", "./output", "./temp", "./user", "./api_server/workflows"):
+        for host in ("./models", "./input", "./output", "./temp", "./user", "./api_server/workflows", "./.triton"):
             self.assertTrue(any(v.startswith(host) for v in volumes), f"volume {host} missing")
 
     def test_healthcheck_and_ordering(self):
@@ -63,6 +63,13 @@ class TestDockerfile(unittest.TestCase):
         source_copy = self.dockerfile.index("COPY . .")
         self.assertLess(requirements_copy, source_copy,
                         "dependency install must come before the source copy to keep the base cached")
+
+    def test_c_compiler_installed(self):
+        # Triton JIT-compiles kernels at runtime (e.g. the flux2 text encoder's
+        # RoPE path) and needs a C compiler inside the container.
+        apt = self.dockerfile[self.dockerfile.index("apt-get install"):self.dockerfile.index("rm -rf /var/lib/apt/lists")]
+        for tool in ("gcc", "g++", "make"):
+            self.assertIn(tool, apt, f"{tool} must be installed for Triton JIT")
 
     def test_copy_sources_exist(self):
         for path in ("requirements.txt", "manager_requirements.txt"):

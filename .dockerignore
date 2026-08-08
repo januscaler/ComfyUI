@@ -19,3 +19,6 @@ models/*
 *.safetensors
 *.gguf
 *.bin
+
+# Triton JIT kernel cache (mounted at runtime via docker-compose)
+/.triton
