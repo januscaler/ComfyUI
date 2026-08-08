@@ -9,15 +9,16 @@ services:
     # VRAM/offload tuning for GPUs with limited VRAM (e.g. MiniMax H3 on a 32 GB
     # card): DynamicVRAM (default on NVIDIA) keeps inactive weights in RAM and
     # streams only active layers to the GPU; --vram-headroom leaves that much
-    # VRAM free for other apps. --cache-ram caps how much RAM cached/staged
-    # models may use before they are evicted (active threshold, pin threshold) —
-    # essential on boxes with little RAM: MiniMax H3 stages ~26 GB of weights
-    # (UNET + VAEs) plus the CLIP, so a 32 GB box OOM-kills (exit 137) at decode
-    # without this cap. Async weight offloading is OFF by default (set
+    # VRAM free for other apps. Async weight offloading is OFF by default (set
     # ASYNC_OFFLOAD_STREAMS>0 in .env to enable): its pinned host buffers
-    # compete with staged models on RAM-tight boxes. Override per machine via
-    # .env: VRAM_HEADROOM_GB / ASYNC_OFFLOAD_STREAMS / CACHE_RAM_GB.
-    command: sh -c 'if [ "$${ASYNC_OFFLOAD_STREAMS:-0}" -gt 0 ] 2>/dev/null; then OFFLOAD="--async-offload $${ASYNC_OFFLOAD_STREAMS}"; else OFFLOAD="--disable-async-offload"; fi; exec python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --cache-ram $${CACHE_RAM_GB:-4 16} $OFFLOAD $${COMFYUI_ARGS:-}'
+    # compete with staged models on RAM-tight boxes.
+    #
+    # IMPORTANT: MiniMax H3 stages ~26 GB of weights in RAM (UNET + VAEs) plus
+    # the CLIP (~15 GB) while running. A 32 GB RAM box OOM-kills (exit 137) at
+    # decode without swap — add host swap (e.g. 64 GB) or more RAM, and on
+    # swap-backed boxes optionally pass --disable-pinned-memory via COMFYUI_ARGS
+    # so staged weights are pageable and can spill to swap instead of OOM.
+    command: sh -c 'if [ "$${ASYNC_OFFLOAD_STREAMS:-0}" -gt 0 ] 2>/dev/null; then OFFLOAD="--async-offload $${ASYNC_OFFLOAD_STREAMS}"; else OFFLOAD="--disable-async-offload"; fi; exec python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} $OFFLOAD $${COMFYUI_ARGS:-}'
     ports:
       - "8188:8188"
     volumes:
@@ -37,10 +38,10 @@ services:
       - DO_NOT_TRACK=1
       - HF_HUB_DISABLE_TELEMETRY=1
       # VRAM tuning for the comfyui command above (defaults: 2 GB headroom,
-      # RAM cache capped at 4 GB active / 16 GB pinned, async offload OFF).
+      # async offload OFF — pinned host buffers compete with staged weights
+      # on RAM-tight boxes).
       - VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}
       - ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-0}
-      - CACHE_RAM_GB=${CACHE_RAM_GB:-4 16}
       # HF_TOKEN is passed through from the host env or a .env file (required
       # for gated models, e.g. the FLUX.2 klein 9B fp8 checkpoint).
       - HF_TOKEN=${HF_TOKEN:-}

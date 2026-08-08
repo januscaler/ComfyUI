@@ -38,13 +38,11 @@ class TestDockerCompose(unittest.TestCase):
         command = cf["command"]
         self.assertIn("--auto-download-models", command)
         self.assertIn("--vram-headroom $${VRAM_HEADROOM_GB:-2}", command)
-        self.assertIn("--cache-ram $${CACHE_RAM_GB:-4 16}", command)
         self.assertIn("--disable-async-offload", command)  # async offload default-off
         self.assertIn("$${COMFYUI_ARGS:-}", command)
         self.assertTrue(any(e.startswith("HF_TOKEN") for e in cf["environment"]))
         self.assertIn("VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}", cf["environment"])
         self.assertIn("ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-0}", cf["environment"])
-        self.assertIn("CACHE_RAM_GB=${CACHE_RAM_GB:-4 16}", cf["environment"])
 
     def test_model_and_state_volumes(self):
         volumes = self.compose["services"]["comfyui"]["volumes"]
