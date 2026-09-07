@@ -80,6 +80,10 @@ WRAPPER_OPENAPI_SPEC = {
                         "description": "The workflow ran but failed (execution error) or produced no output file.",
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}},
                     },
+                    "502": {
+                        "description": "The prompt-rewriting model could not be reached, timed out, or returned nothing usable. Retry, or send 'raw_prompt' to skip the rewrite.",
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}},
+                    },
                     "504": {
                         "description": "The workflow did not finish within the timeout; poll /api/wrapper/jobs/{job_id} with the returned id.",
                         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TimeoutResponse"}}},
@@ -159,6 +163,18 @@ WRAPPER_OPENAPI_SPEC = {
                     },
                 },
             },
+            "PromptPreview": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The rewritten prompt, ready to send back as 'raw_prompt'."},
+                    "model": {"type": "string", "description": "The model that wrote it (after 'auto' resolution)."},
+                    "mode": {"type": "string", "enum": ["T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA"], "description": "H3 input mode inferred from which assets were attached."},
+                    "width": {"type": "integer"},
+                    "height": {"type": "integer"},
+                    "frames": {"type": "integer", "description": "Frame count the prompt's timing was written against."},
+                    "duration": {"type": "number", "description": "Seconds at 24 fps for that frame count."},
+                },
+            },
             "TimeoutResponse": {
                 "type": "object",
                 "properties": {
@@ -236,9 +252,25 @@ def _expanded_operation(template_operation, workflow, task, operation_suffix):
                 schema["properties"][up_name] = {
                     "type": "string", "format": "binary",
                     "description": f"Upload ({up_spec['ext']}; up to {up_spec['max']})."}
-        schema["required"] = ["prompt"] + (["image"] if task.get("requires_image") else [])
+        # With a rewriter, either field satisfies the request, so neither can be
+        # marked required on its own; the handler enforces "one of".
+        schema["required"] = ([] if task.get("prompt_rewrite") else ["prompt"]) + (
+            ["image"] if task.get("requires_image") else [])
         if task.get("quantization_options"):
             schema["properties"]["quantization"]["enum"] = task["quantization_options"]
+    if task.get("prompt_rewrite") and "prompt" in schema["properties"]:
+        schema["properties"]["prompt"] = dict(
+            schema["properties"]["prompt"],
+            description="Plain description of the video you want, in your own words -- e.g. "
+                        "\"two wrestlers in a gym, one chokeslams the other onto a crash mat, "
+                        "heavy metal soundtrack\". It is rewritten into a full MiniMax H3 prompt "
+                        "(alignment instruction, timed shots, overall_soundscape, "
+                        "non_diegetic_music) by a Xiaomi MiMo model following MiniMax's own "
+                        "H3 prompt-writing guide, using this request's real mode, duration, "
+                        "canvas and reference labels. Requires MIMO_API_KEY on the server. "
+                        "Send 'raw_prompt' instead if you already have an H3 prompt and want to "
+                        "skip the rewrite; exactly one of the two is required. Preview the "
+                        "rewrite without generating a video via the /prompt endpoint.")
     if workflow.get("example_prompt"):
         prompt_prop = schema["properties"]["prompt"]
         prompt_prop["description"] = (
@@ -246,15 +278,66 @@ def _expanded_operation(template_operation, workflow, task, operation_suffix):
             f"structured JSON prompts; example:\n\n```json\n{workflow['example_prompt']}\n```"
         )
     if task.get("example_prompt"):
-        schema["properties"]["prompt"]["description"] = (
-            f"{schema['properties']['prompt']['description']} Example:\n\n{task['example_prompt']}"
-        )
+        # The example is written in the workflow's native prompt format, so on a
+        # rewriting task it belongs on raw_prompt -- 'prompt' takes plain intent.
+        target = "raw_prompt" if task.get("prompt_rewrite") and "raw_prompt" in schema["properties"] \
+            else "prompt"
+        schema["properties"][target] = dict(
+            schema["properties"][target],
+            description=f"{schema['properties'][target]['description']} Example:"
+                        f"\n\n{task['example_prompt']}")
     media_type = OUTPUT_MEDIA_TYPES.get(workflow.get("output_type"), "image/png")
     operation["responses"]["200"]["content"] = {
         media_type: {"schema": {"type": "string", "format": "binary"}},
         "application/octet-stream": {"schema": {"type": "string", "format": "binary"}},
     }
     return operation
+
+
+def _prompt_preview_operation(workflow_name, task_name, task):
+    """The /prompt operation: rewrite only, no generation."""
+    extra = task.get("extra_form_properties") or {}
+    properties = {
+        "prompt": {"type": "string", "description": "Plain description of the video you want, in your own words. Rewritten into the workflow's native prompt format and returned as JSON."},
+        "llm_image": extra.get("llm_image", {"type": "string", "format": "binary"}),
+        "llm_model": extra.get("llm_model", {"type": "string"}),
+        "width": extra.get("width", {"type": "integer"}),
+        "height": extra.get("height", {"type": "integer"}),
+        "duration": extra.get("duration", {"type": "number"}),
+    }
+    for upload_name, upload_spec in (task.get("uploads") or {}).items():
+        if upload_name not in properties:
+            properties[upload_name] = {
+                "type": "string", "format": "binary",
+                "description": f"Optional ({upload_spec['ext']}). Only its presence and count matter "
+                               "here: they tell the rewriter which mode and reference labels the real "
+                               "generation will use."}
+    return {
+        "summary": f"Preview the rewritten prompt for {workflow_name}/{task_name}",
+        "description": "Runs only the LLM prompt rewrite and returns the result as JSON -- no GPU "
+                       "work, no model downloads, no video. Iterating on a prompt through "
+                       "/generate costs a full render, so use this to get the wording right, then "
+                       "send the result back to /generate as 'raw_prompt' to render it verbatim. "
+                       "Uploads behave the same as on /generate: whichever image you attach gives "
+                       "the model visual context, and the presence of first/last frames or "
+                       "reference assets selects the H3 input mode. Requires MIMO_API_KEY.",
+        "operationId": "previewPrompt" + "".join(
+            part.capitalize() for part in f"{workflow_name}_{task_name}".replace("-", "_").split("_")),
+        "requestBody": {
+            "required": True,
+            "content": {"multipart/form-data": {"schema": {
+                "type": "object", "required": ["prompt"], "properties": properties}}},
+        },
+        "responses": {
+            "200": {
+                "description": "The rewritten prompt and the parameters it was written against.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PromptPreview"}}},
+            },
+            "400": {"description": "Missing prompt, invalid parameter, over-budget canvas/length, or the rewriter is not configured (MIMO_API_KEY unset).", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+            "404": {"description": "This workflow task does not support prompt rewriting.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+            "502": {"description": "The prompt-rewriting model could not be reached, timed out, or returned nothing usable.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+        },
+    }
 
 
 def spec_with_workflows(workflows):
@@ -268,6 +351,10 @@ def spec_with_workflows(workflows):
     template = paths.pop("/api/wrapper/{workflow}/generate")
     template_operation = template["post"]
     for name, workflow in workflows.items():
+        for task_name, task in (workflow.get("tasks") or {}).items():
+            if task.get("prompt_rewrite"):
+                paths[f"/api/wrapper/{name}/{task_name}/prompt"] = {
+                    "post": _prompt_preview_operation(name, task_name, task)}
         tasks = workflow.get("tasks")
         if tasks:
             for task_name, task in tasks.items():

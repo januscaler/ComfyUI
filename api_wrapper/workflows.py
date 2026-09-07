@@ -7,6 +7,8 @@ graphs (as accepted by POST /prompt) and declares the models a workflow needs.
 
 import os
 
+from api_wrapper.prompt_rewriter import MODEL_OPTIONS as MINIMAX_H3_LLM_MODELS
+
 # Models required by the FLUX.2 [klein] 9B image edit workflow, with the exact
 # files expected by the loaders in the graph below. The URLs match the
 # Comfy-Org/BFL repos the shipped blueprints point at.
@@ -559,6 +561,37 @@ def build_minimax_h3_reference_to_video(*, prompt, seed=0, steps=MINIMAX_H3_DEFA
                             next_id, filename_prefix)
     return {**head, **loader_nodes, **tail}
 
+# The H3 prompt format (alignment instruction + timed shots +
+# overall_soundscape + non_diegetic_music, or six labelled sections in
+# reference mode) is a lot to hand-write, so `prompt` takes plain intent and an
+# LLM turns it into the real thing using MiniMax's own authoring guide. See
+# api_wrapper/prompt_rewriter.py. `raw_prompt` is the escape hatch for callers
+# that already have an H3 prompt.
+MINIMAX_H3_PROMPT_FORM_EXTRA = {
+    "raw_prompt": {"type": "string",
+                   "description": "A ready-made MiniMax H3 prompt, used exactly as given. Supplying "
+                                  "this skips the LLM rewrite entirely -- nothing is sent to MiMo and "
+                                  "no API key is needed. Use it to reproduce an earlier generation "
+                                  "verbatim, or when you have written the H3 structure yourself. "
+                                  "If both 'prompt' and 'raw_prompt' are sent, 'raw_prompt' wins."},
+    "llm_image": {"type": "string", "format": "binary",
+                  "description": "Optional image given to the prompt-writing model as visual context, "
+                                 "so the H3 prompt it writes describes what is actually in your "
+                                 "footage (subjects, clothing, setting, lighting, framing) instead of "
+                                 "guessing from the text. Purely an input to the rewrite -- it is not "
+                                 "a keyframe and never reaches H3 itself. When omitted, the task's own "
+                                 "first image is used instead (the 'image' first frame, or "
+                                 "'ref_images' #1), so image- and reference-driven generations get "
+                                 "visual grounding for free. Ignored when 'raw_prompt' is set."},
+    "llm_model": {"type": "string", "enum": list(MINIMAX_H3_LLM_MODELS), "default": "auto",
+                  "description": "Which Xiaomi MiMo model writes the H3 prompt. 'auto' (default) uses "
+                                 "mimo-v2.5 when an image is attached, since that is the omnimodal "
+                                 "build, and mimo-v2.5-pro otherwise for its stronger reasoning. Pick "
+                                 "one explicitly to override; note that mimo-v2.5-pro is reported to "
+                                 "be text-only, so an image sent with it may be ignored. Requires "
+                                 "MIMO_API_KEY on the server."},
+}
+
 MINIMAX_H3_FORM_EXTRA = {
     "width": {"type": "integer", "minimum": 32, "maximum": 8192, "default": MINIMAX_H3_DEFAULT_WIDTH,
               "description": "Output width, rounded up to a multiple of 32. Width*height is capped at "
@@ -599,6 +632,7 @@ MINIMAX_H3_FORM_EXTRA = {
                                     "fit this box. The text encoder is picked independently: the "
                                     "smallest one already on disk wins, which on Blackwell is the "
                                     "nvfp4_awq build (~16 GB vs 27 GB int8 / 52 GB bf16)."},
+    **MINIMAX_H3_PROMPT_FORM_EXTRA,
 }
 MINIMAX_H3_REF_FORM_EXTRA = {
     **MINIMAX_H3_FORM_EXTRA,
@@ -665,8 +699,13 @@ WORKFLOWS = {
             "text": {
                 "title": "Text to video",
                 "requires_image": False,
+                "uploads": {"llm_image": {"ext": "image", "max": 1}},
+                # llm_image feeds the prompt rewriter only; None keeps the
+                # generic handler from passing it to the graph builder.
+                "upload_params": {"llm_image": None},
+                "prompt_rewrite": True,
                 "uses": ["prompt", "seed"],
-                "form": ["prompt", "seed", "steps", "width", "height", "duration", "scheduler"],
+                "form": ["prompt", "raw_prompt", "llm_image", "llm_model", "seed", "steps", "width", "height", "duration", "scheduler"],
                 "extra_form_properties": MINIMAX_H3_FORM_EXTRA,
                 "quantization_options": ["fp8", "int8", "bf16", "nvfp4"],
                 "build": build_minimax_h3_text_to_video,
@@ -675,10 +714,12 @@ WORKFLOWS = {
                 "title": "Image to video",
                 "requires_image": True,
                 "uploads": {"image": {"ext": "image", "max": 1},
-                             "last_frame": {"ext": "image", "max": 1}},
-                "upload_params": {"image": "first_frame"},
+                             "last_frame": {"ext": "image", "max": 1},
+                             "llm_image": {"ext": "image", "max": 1}},
+                "upload_params": {"image": "first_frame", "llm_image": None},
+                "prompt_rewrite": True,
                 "uses": ["prompt", "seed"],
-                "form": ["prompt", "image", "last_frame", "seed", "steps", "width", "height", "duration", "scheduler"],
+                "form": ["prompt", "raw_prompt", "image", "last_frame", "llm_image", "llm_model", "seed", "steps", "width", "height", "duration", "scheduler"],
                 "extra_form_properties": MINIMAX_H3_FORM_EXTRA,
                 "quantization_options": ["fp8", "int8", "bf16", "nvfp4"],
                 "build": build_minimax_h3_image_to_video,
@@ -689,9 +730,12 @@ WORKFLOWS = {
                 "uploads": {"ref_images": {"ext": "image", "max": 3},
                              "ref_videos": {"ext": "video", "max": 1},
                              "ref_video_audios": {"ext": "audio", "max": 1},
-                             "ref_audios": {"ext": "audio", "max": 2}},
+                             "ref_audios": {"ext": "audio", "max": 2},
+                             "llm_image": {"ext": "image", "max": 1}},
+                "upload_params": {"llm_image": None},
+                "prompt_rewrite": True,
                 "uses": ["prompt", "seed"],
-                "form": ["prompt", "seed", "steps", "width", "height", "duration", "scheduler", "ref_image_size"],
+                "form": ["prompt", "raw_prompt", "llm_image", "llm_model", "seed", "steps", "width", "height", "duration", "scheduler", "ref_image_size"],
                 "extra_form_properties": MINIMAX_H3_REF_FORM_EXTRA,
                 "quantization_options": ["fp8", "int8", "bf16", "nvfp4"],
                 "example_prompt": (

@@ -202,15 +202,18 @@ class TestOpenAPISpec(unittest.TestCase):
         content = op["responses"]["200"]["content"]
         self.assertEqual(list(content)[0], "video/mp4")
         schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
-        self.assertEqual(schema["required"], ["prompt"])
-        for prop in ("ref_images", "ref_videos", "ref_video_audios", "ref_audios", "ref_image_size", "duration"):
+        # prompt/raw_prompt are one-of on a rewriting task, so neither is required
+        self.assertEqual(schema["required"], [])
+        for prop in ("prompt", "raw_prompt", "llm_image", "llm_model",
+                     "ref_images", "ref_videos", "ref_video_audios", "ref_audios",
+                     "ref_image_size", "duration"):
             self.assertIn(prop, schema["properties"])
         self.assertNotIn("image", schema["properties"])
         self.assertEqual(schema["properties"]["quantization"]["enum"], ["fp8", "int8", "bf16", "nvfp4"])
         # the image task requires an image upload and returns video
         op = spec["paths"]["/api/wrapper/minimaxh3/image/generate"]["post"]
         schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
-        self.assertEqual(schema["required"], ["prompt", "image"])
+        self.assertEqual(schema["required"], ["image"])
         self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
 
     def test_generate_response_is_an_image(self):

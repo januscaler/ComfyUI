@@ -56,6 +56,13 @@ services:
       # the largest values measured to complete on 32 GB of RAM.
       - COMFY_MINIMAX_H3_MAX_FRAMES=${MINIMAX_H3_MAX_FRAMES:-124}
       - COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES=${MINIMAX_H3_MAX_PIXEL_FRAMES:-91422720}
+      # Xiaomi MiMo, used by the H3 endpoints to rewrite a plain-language
+      # 'prompt' into a real H3 prompt. Unset only disables the rewrite:
+      # 'raw_prompt' still works and needs no key. See .env.example.
+      - MIMO_API_KEY=${MIMO_API_KEY:-}
+      - MIMO_BASE_URL=${MIMO_BASE_URL:-https://api.xiaomimimo.com/v1}
+      - MIMO_MODEL=${MIMO_MODEL:-auto}
+      - MIMO_THINKING=${MIMO_THINKING:-disabled}
       # HF_TOKEN is passed through from the host env or a .env file (required
       # for gated models, e.g. the FLUX.2 klein 9B fp8 checkpoint).
       - HF_TOKEN=${HF_TOKEN:-}

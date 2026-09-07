@@ -5,6 +5,8 @@ the core API and get the same /api-prefixed aliases. Every workflow gets a
 dedicated synchronous endpoint that returns the final artifact (image, video,
 audio, 3D asset, ...) as a downloadable file:
 - POST   /wrapper/{workflow}/generate    (also /api/wrapper/{workflow}/generate)
+- POST   /wrapper/{workflow}/{task}/generate
+- POST   /wrapper/{workflow}/{task}/prompt   (LLM prompt rewrite only, no render)
 - GET    /wrapper/workflows
 - GET    /wrapper/jobs/{job_id}          (also /api/wrapper/jobs/{job_id})
 - GET    /wrapper/jobs/{job_id}/image
@@ -28,6 +30,7 @@ import folder_paths
 from comfy import model_downloader, model_management
 from comfy_execution import jobs as comfy_jobs
 
+from api_wrapper import prompt_rewriter
 from api_wrapper import workflows as wrapper_workflows
 from api_wrapper.openapi import WRAPPER_SWAGGER_HTML, spec_with_workflows
 from api_wrapper.quantize import convert_fp8_to_nvfp4, fp4_filename
@@ -156,6 +159,92 @@ def _resolution_headers(build_kwargs, note):
     if note:
         headers["X-Wrapper-Note"] = _header_value(note)
     return headers
+
+
+async def _read_body(request):
+    """Parse a request into (fields, uploads).
+
+    multipart is the form Swagger and any request with a file upload uses, but
+    a text-only call is far more naturally written as `curl -d` or a JSON POST,
+    so those are accepted too. ``uploads`` maps a field name to a list of
+    (filename, bytes); it is always empty for the non-multipart forms.
+    """
+    content_type = request.headers.get("Content-Type", "")
+    fields, uploads = {}, {}
+    if content_type.startswith("multipart/form-data"):
+        reader = await request.multipart()
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            data = await part.read()
+            if part.filename:
+                uploads.setdefault(part.name, []).append((part.filename, data))
+            else:
+                fields[part.name] = data.decode("utf-8", "replace").strip()
+    elif content_type.startswith("application/json"):
+        try:
+            payload = await request.json()
+        except ValueError as e:
+            raise ValueError(f"Request body is not valid JSON: {e}") from e
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object of form fields.")
+        fields = {k: ("" if v is None else str(v).strip()) for k, v in payload.items()}
+    elif content_type.startswith("application/x-www-form-urlencoded"):
+        fields = {k: v.strip() for k, v in (await request.post()).items()}
+    return fields, uploads
+
+
+def _append_note(note, extra):
+    """Join advisory notes into the single line the response header carries."""
+    return f"{note} {extra}".strip() if note else extra
+
+
+def _input_path(ref):
+    """Absolute path of a saved upload ref ('wrapper/<uuid>.png')."""
+    return os.path.join(folder_paths.get_input_directory(), *ref.split("/"))
+
+
+async def _rewrite_prompt(task_name, fields, build_kwargs, upload_refs):
+    """Turn the caller's plain-language ``prompt`` into a real H3 prompt.
+
+    Runs only for tasks that declare ``prompt_rewrite`` and only when the
+    caller did not supply ``raw_prompt``. The rewriter needs the job it is
+    writing for -- mode, duration, canvas, which reference labels exist -- so
+    this runs after the setup has resolved those, with build_kwargs already
+    populated. Returns (prompt, note)."""
+    intent = build_kwargs["prompt"]
+    context_ref = None
+    for name in ("llm_image", "image", "ref_images"):
+        refs = upload_refs.get(name)
+        if refs:
+            context_ref = refs[0]
+            break
+
+    frames = wrapper_workflows.minimax_h3_align_frames(
+        wrapper_workflows.minimax_h3_length(build_kwargs["duration"]))
+    mode = prompt_rewriter.detect_mode(
+        task_name,
+        has_first_frame=bool(build_kwargs.get("first_frame")),
+        has_last_frame=bool(build_kwargs.get("last_frame")))
+    reference_counts = {
+        "images": len(upload_refs.get("ref_images", [])),
+        "videos": len(upload_refs.get("ref_videos", [])),
+        # A reference video's soundtrack gets its own <Audio j> label.
+        "audios": len(upload_refs.get("ref_video_audios", [])) + len(upload_refs.get("ref_audios", [])),
+    }
+
+    prompt, model_used = await prompt_rewriter.rewrite(
+        intent=intent, mode=mode,
+        duration=frames / wrapper_workflows.MINIMAX_H3_FPS, frames=frames,
+        width=build_kwargs["width"], height=build_kwargs["height"],
+        reference_counts=reference_counts,
+        image=prompt_rewriter.data_url_from_path(_input_path(context_ref)) if context_ref else None,
+        model=fields.get("llm_model"))
+    note = f"prompt rewritten for {mode} by {model_used}"
+    if context_ref and not upload_refs.get("llm_image"):
+        note += " using the uploaded image as visual context"
+    return prompt, note
 
 
 def _error_response(message, details="", missing=None, status=400):
@@ -343,7 +432,7 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     # than letting the model run out of distribution.
     width, height, canvas_note = wrapper_workflows.minimax_h3_fit_canvas(width, height)
     if canvas_note:
-        note = f"{note} {canvas_note}".strip() if note else canvas_note
+        note = _append_note(note, canvas_note)
     # Sanity range first: this also rejects nan/inf, which would otherwise blow
     # up in the frame-count arithmetic below. The real (much tighter) limit is
     # the budget check.
@@ -375,9 +464,8 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     _raise_if_missing(await _download_models(models, downloaded))
 
     if model_management.get_torch_device().type == "mps":
-        mps_note = ("MiniMax H3 is a very large omni-modal model; on MPS the fp8 weights "
-                    "load as bf16 and the run may exceed available memory.")
-        note = f"{note} {mps_note}".strip() if note else mps_note
+        note = _append_note(note, "MiniMax H3 is a very large omni-modal model; on MPS the fp8 "
+                                  "weights load as bf16 and the run may exceed available memory.")
     kwargs = {
         "steps": steps,
         "width": width,
@@ -448,24 +536,22 @@ def register_wrapper_routes(routes, prompt_server):
         elif task_name is not None:
             return _error_response("Unknown task", f"Workflow {workflow_name} has no task variants.")
 
-        reader = None
-        if request.headers.get("Content-Type", "").startswith("multipart/form-data"):
-            reader = await request.multipart()
-        fields = {}
-        uploads = {}
-        while reader is not None:
-            part = await reader.next()
-            if part is None:
-                break
-            data = await part.read()
-            if part.filename:
-                uploads.setdefault(part.name, []).append((part.filename, data))
-            else:
-                fields[part.name] = data.decode("utf-8", "replace").strip()
+        try:
+            fields, uploads = await _read_body(request)
+        except ValueError as e:
+            return _error_response("Invalid request body", str(e))
 
-        prompt = fields.get("prompt", "")
+        # 'prompt' is plain intent that a workflow with prompt_rewrite turns
+        # into its native prompt format; 'raw_prompt' is that format already
+        # written out and bypasses the rewrite.
+        raw_prompt = fields.get("raw_prompt", "").strip()
+        prompt = raw_prompt or fields.get("prompt", "")
         if not prompt:
-            return _error_response("No prompt provided", "The 'prompt' form field is required.")
+            required = ("The 'prompt' form field is required."
+                        if not task.get("prompt_rewrite") else
+                        "Send 'prompt' (plain description of the video you want, rewritten into an "
+                        "H3 prompt by the LLM) or 'raw_prompt' (a ready-made H3 prompt).")
+            return _error_response("No prompt provided", required)
         if task.get("requires_image") and not uploads.get("image"):
             return _error_response("No image provided", "The 'image' form field with the input image is required.")
 
@@ -538,8 +624,21 @@ def register_wrapper_routes(routes, prompt_server):
         upload_params = task.get("upload_params", {})
         for name, refs in upload_refs.items():
             param = upload_params.get(name, name)
+            if param is None:
+                continue  # consumed by the wrapper (e.g. llm_image), not the graph
             build_kwargs[param] = refs if upload_spec[name]["max"] != 1 else refs[0]
         build_kwargs["filename_prefix"] = f"wrapper/{workflow_name}"
+
+        if task.get("prompt_rewrite"):
+            if raw_prompt:
+                note = _append_note(note, "raw_prompt used verbatim; no LLM rewrite")
+            else:
+                try:
+                    build_kwargs["prompt"], rewrite_note = await _rewrite_prompt(
+                        task_name, fields, build_kwargs, upload_refs)
+                except prompt_rewriter.RewriteError as e:
+                    return _error_response(e.message, e.details, status=e.status)
+                note = _append_note(note, rewrite_note)
 
         prompt_id = str(uuid.uuid4())
         graph = task["build"](**build_kwargs)
@@ -627,6 +726,95 @@ def register_wrapper_routes(routes, prompt_server):
         # already on disk) and any advisory note is the headers.
         headers.update(_resolution_headers(build_kwargs, note))
         return web.FileResponse(first, headers=headers)
+
+    @routes.post("/wrapper/{workflow}/{task}/prompt")
+    async def preview_prompt(request):
+        """Run only the prompt rewrite and return the H3 prompt as JSON.
+
+        Iterating on a prompt through /generate costs a full video render, so
+        this exposes the rewrite on its own: same form fields, no GPU work, no
+        model downloads. Feed the result back as 'raw_prompt' once it reads the
+        way you want."""
+        workflow_name = request.match_info["workflow"].lower()
+        task_name = request.match_info["task"]
+        workflow = wrapper_workflows.WORKFLOWS.get(workflow_name) or {}
+        task = (workflow.get("tasks") or {}).get(task_name)
+        if task is None or not task.get("prompt_rewrite"):
+            return _error_response(
+                "Unknown prompt endpoint",
+                "Prompt rewriting is only available on workflow tasks that declare it, "
+                "e.g. /api/wrapper/minimaxh3/{text,image,reference}/prompt.", status=404)
+
+        try:
+            fields, uploads = await _read_body(request)
+        except ValueError as e:
+            return _error_response("Invalid request body", str(e))
+
+        intent = fields.get("prompt", "").strip()
+        if not intent:
+            return _error_response("No prompt provided", "The 'prompt' form field is required.")
+
+        # Resolve the canvas/length the same way a real job would, so the
+        # rewrite is written against the video that would actually be made --
+        # but without the model setup, which would download checkpoints.
+        try:
+            width = int(fields.get("width", wrapper_workflows.MINIMAX_H3_DEFAULT_WIDTH))
+            height = int(fields.get("height", wrapper_workflows.MINIMAX_H3_DEFAULT_HEIGHT))
+            duration = float(fields.get("duration", wrapper_workflows.MINIMAX_H3_MAX_DURATION))
+        except ValueError:
+            return _error_response("Invalid parameter value", "width/height/duration must be numbers.")
+        if not 32 <= width <= 8192 or not 32 <= height <= 8192 or not 0 < duration <= 3600:
+            return _error_response("Invalid size or duration",
+                                   "width/height must be 32-8192 and duration 0-3600 seconds.")
+        width, height, _ = wrapper_workflows.minimax_h3_fit_canvas(width, height)
+        frames = wrapper_workflows.minimax_h3_align_frames(
+            wrapper_workflows.minimax_h3_length(duration))
+        over_budget = wrapper_workflows.minimax_h3_check_budget(width, height, frames)
+        if over_budget:
+            return _error_response("Request exceeds this host's safe MiniMax H3 budget", over_budget)
+
+        image = None
+        for name in ("llm_image", "image", "ref_images"):
+            if uploads.get(name):
+                filename, data = uploads[name][0]
+                ext = os.path.splitext(filename or "")[1].lower()
+                if ext not in ALLOWED_IMAGE_EXTENSIONS:
+                    return _error_response("Unsupported file format",
+                                           f"'{name}' must be one of: {sorted(ALLOWED_IMAGE_EXTENSIONS)}")
+                try:
+                    image = prompt_rewriter.data_url_from_bytes(data, filename)
+                except prompt_rewriter.RewriteError as e:
+                    return _error_response(e.message, e.details, status=e.status)
+                break
+
+        mode = prompt_rewriter.detect_mode(
+            task_name,
+            has_first_frame=bool(uploads.get("image")),
+            has_last_frame=bool(uploads.get("last_frame")))
+        try:
+            prompt, model_used = await prompt_rewriter.rewrite(
+                intent=intent, mode=mode,
+                duration=frames / wrapper_workflows.MINIMAX_H3_FPS, frames=frames,
+                width=width, height=height,
+                reference_counts={
+                    "images": len(uploads.get("ref_images", [])),
+                    "videos": len(uploads.get("ref_videos", [])),
+                    "audios": len(uploads.get("ref_video_audios", []))
+                              + len(uploads.get("ref_audios", [])),
+                },
+                image=image, model=fields.get("llm_model"))
+        except prompt_rewriter.RewriteError as e:
+            return _error_response(e.message, e.details, status=e.status)
+
+        return web.json_response({
+            "prompt": prompt,
+            "model": model_used,
+            "mode": mode,
+            "width": width,
+            "height": height,
+            "frames": frames,
+            "duration": round(frames / wrapper_workflows.MINIMAX_H3_FPS, 2),
+        })
 
     @routes.get("/wrapper/workflows")
     async def list_workflows(request):

@@ -197,5 +197,82 @@ class TestMiniMaxSetupContract(unittest.TestCase):
         self.assertEqual(kwargs["steps"], 20)
 
 
+class TestPromptRewriteHook(unittest.TestCase):
+    """The glue between an incoming request and the rewriter: which mode it
+    reports, which labels it declares, and which upload it uses for visual
+    context."""
+
+    def setUp(self):
+        from api_wrapper import prompt_rewriter
+
+        self.calls = []
+        self._rewrite = prompt_rewriter.rewrite
+        self._data_url = prompt_rewriter.data_url_from_path
+
+        async def fake_rewrite(**kwargs):
+            self.calls.append(kwargs)
+            return "REWRITTEN", "mimo-v2.5-pro"
+
+        prompt_rewriter.rewrite = fake_rewrite
+        prompt_rewriter.data_url_from_path = lambda path: f"data:image/png;base64,#{path}"
+
+    def tearDown(self):
+        from api_wrapper import prompt_rewriter
+
+        prompt_rewriter.rewrite = self._rewrite
+        prompt_rewriter.data_url_from_path = self._data_url
+
+    def _run(self, task_name, build_kwargs, upload_refs, fields=None):
+        base = {"prompt": "a wrestler chokeslams another", "duration": 5.0,
+                "width": 864, "height": 480}
+        base.update(build_kwargs)
+        return asyncio.run(wrapper_routes._rewrite_prompt(
+            task_name, fields or {}, base, upload_refs))
+
+    def test_image_task_reports_i2va_and_grounds_on_the_first_frame(self):
+        prompt, note = self._run("image", {"first_frame": "wrapper/a.png"},
+                                 {"image": ["wrapper/a.png"]})
+        self.assertEqual(prompt, "REWRITTEN")
+        call = self.calls[0]
+        self.assertEqual(call["mode"], "I2VA")
+        self.assertEqual(call["frames"], 124)  # 5.0s snapped to the H3 grid
+        self.assertAlmostEqual(call["duration"], 124 / 24, places=2)
+        # no llm_image, so the keyframe itself is the visual context
+        self.assertIn("wrapper/a.png", call["image"])
+        self.assertIn("visual context", note)
+
+    def test_llm_image_wins_over_the_keyframe(self):
+        self._run("image", {"first_frame": "wrapper/a.png", "last_frame": "wrapper/b.png"},
+                  {"image": ["wrapper/a.png"], "last_frame": ["wrapper/b.png"],
+                   "llm_image": ["wrapper/ctx.png"]})
+        call = self.calls[0]
+        self.assertEqual(call["mode"], "FL2VA")  # both keyframes present
+        self.assertIn("wrapper/ctx.png", call["image"])
+
+    def test_text_task_without_uploads_sends_no_image(self):
+        _, note = self._run("text", {}, {})
+        call = self.calls[0]
+        self.assertEqual(call["mode"], "T2VA")
+        self.assertIsNone(call["image"])
+        self.assertNotIn("visual context", note)
+
+    def test_reference_counts_include_the_video_soundtrack_label(self):
+        self._run("reference", {}, {
+            "ref_images": ["wrapper/1.png", "wrapper/2.png"],
+            "ref_videos": ["wrapper/v.mp4"],
+            "ref_video_audios": ["wrapper/va.wav"],
+            "ref_audios": ["wrapper/a1.wav", "wrapper/a2.wav"],
+        })
+        call = self.calls[0]
+        self.assertEqual(call["mode"], "Ref2VA")
+        # a reference video's soundtrack gets its own <Audio j>, so 1 + 2 = 3
+        self.assertEqual(call["reference_counts"], {"images": 2, "videos": 1, "audios": 3})
+        self.assertIn("wrapper/1.png", call["image"])
+
+    def test_llm_model_field_is_forwarded(self):
+        self._run("text", {}, {}, fields={"llm_model": "mimo-v2.5"})
+        self.assertEqual(self.calls[0]["model"], "mimo-v2.5")
+
+
 if __name__ == "__main__":
     unittest.main()
