@@ -147,8 +147,8 @@ class TestWaitForPrompt(unittest.IsolatedAsyncioTestCase):
 class TestMiniMaxSetupContract(unittest.TestCase):
     """The per-task setups must return exactly the kwargs their builder
     accepts (a mismatch crashed the text task with an unexpected
-    'ref_image_size' argument), and own their own defaults (steps default 50,
-    not the shared handler default 20)."""
+    'ref_image_size' argument), and own their own defaults (H3's canvas/length
+    defaults, not the shared handler's)."""
 
     def setUp(self):
         self._download_models = wrapper_routes._download_models
@@ -171,7 +171,11 @@ class TestMiniMaxSetupContract(unittest.TestCase):
     def test_text_setup_kwargs_build(self):
         kwargs, _ = asyncio.run(wrapper_routes._setup_minimax_h3_text({}, []))
         self.assertNotIn("ref_image_size", kwargs)
-        self.assertEqual(kwargs["steps"], 50)  # setup default, not the handler's 20
+        self.assertEqual(kwargs["steps"], wrapper_workflows.MINIMAX_H3_DEFAULT_STEPS)
+        self.assertEqual(kwargs["width"], wrapper_workflows.MINIMAX_H3_DEFAULT_WIDTH)
+        self.assertEqual(kwargs["height"], wrapper_workflows.MINIMAX_H3_DEFAULT_HEIGHT)
+        self.assertEqual(kwargs["unet_name"], wrapper_workflows.MINIMAX_H3_UNET_INT8)
+        self.assertEqual(kwargs["clip_name"], wrapper_workflows.MINIMAX_H3_CLIP_NVFP4)
         graph = wrapper_workflows.build_minimax_h3_text_to_video(prompt="x", **kwargs)
         self.assertIn("1", graph)
 

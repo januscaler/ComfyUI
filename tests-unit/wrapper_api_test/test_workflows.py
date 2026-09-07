@@ -290,7 +290,7 @@ class TestMiniMaxH3Graph(unittest.TestCase):
                 if isinstance(value, list):
                     self.assertIn(value[0], ids)
         self.assertEqual(graph["1"]["class_type"], "UNETLoader")
-        self.assertEqual(graph["1"]["inputs"]["unet_name"], wrapper_workflows.MINIMAX_H3_UNET_FP8)
+        self.assertEqual(graph["1"]["inputs"]["unet_name"], wrapper_workflows.MINIMAX_H3_UNET_INT8)
         self.assertEqual(graph["3"]["inputs"]["type"], "minimax")
         self.assertEqual(graph["6"]["class_type"], "MiniMaxH3ImageToVideo")
         self.assertEqual(graph["6"]["inputs"]["length"], 120)  # 5s * 24fps
@@ -373,18 +373,20 @@ class TestMiniMaxH3Graph(unittest.TestCase):
         def is_present(folder, filename):
             return filename in disk
 
-        # nvfp4 CLIP on disk -> never touches bf16 even though fp8 is requested
+        # nvfp4 CLIP on disk -> never touches bf16 even though fp8 is requested,
+        # and the preferred encoder needs no note
         disk = {w.MINIMAX_H3_UNET_FP8, w.MINIMAX_H3_CLIP_NVFP4}
         unet, clip, note = w.minimax_h3_model_pick("fp8", ref2va=False, is_present=is_present)
         self.assertEqual(unet, w.MINIMAX_H3_UNET_FP8)
         self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
-        self.assertIn("instead of the quantization's default", note)
+        self.assertIsNone(note)
 
-        # bf16 CLIP is the only encoder present (old downloads) -> used, no note
+        # bf16 CLIP is the only encoder present (old downloads) -> used, and the
+        # note calls out that the smaller preferred encoder is missing
         disk = {w.MINIMAX_H3_UNET_FP8, w.MINIMAX_H3_CLIP}
         unet, clip, note = w.minimax_h3_model_pick("fp8", ref2va=False, is_present=is_present)
         self.assertEqual(clip, w.MINIMAX_H3_CLIP)
-        self.assertIsNone(note)
+        self.assertIn(w.MINIMAX_H3_CLIP_NVFP4, note)
 
         # requested UNET missing -> first present variant (fp8) used with note
         disk = {w.MINIMAX_H3_REF2VA_UNET_FP8, w.MINIMAX_H3_CLIP_NVFP4}
@@ -398,8 +400,9 @@ class TestMiniMaxH3Graph(unittest.TestCase):
         unet, clip, note = w.minimax_h3_model_pick("bf16", ref2va=False, is_present=is_present)
         self.assertEqual(unet, w.MINIMAX_H3_UNET_BF16)
         self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
+        # no explicit quantization -> the templates' int8_convrot + nvfp4 pair
         unet, clip, _ = w.minimax_h3_model_pick(None, ref2va=False, is_present=is_present)
-        self.assertEqual(unet, w.MINIMAX_H3_UNET_FP8)
+        self.assertEqual(unet, w.MINIMAX_H3_UNET_INT8)
         self.assertEqual(clip, w.MINIMAX_H3_CLIP_NVFP4)
         with self.assertRaises(ValueError):
             w.minimax_h3_model_pick("fp16", False, is_present)
@@ -432,6 +435,51 @@ class TestMiniMaxH3Graph(unittest.TestCase):
             self.assertNotIn(wrapper_workflows.MINIMAX_H3_CLIP, [m["filename"] for m in models])
         self.assertTrue(all(
             q in wrapper_workflows.MINIMAX_H3_QUANT_MODELS for q in ("fp8", "int8", "bf16", "nvfp4")))
+
+    def test_fit_canvas_rounds_up_and_caps_area(self):
+        w = wrapper_workflows
+        # already on the grid and inside the cap -> untouched, nothing to report
+        self.assertEqual(w.minimax_h3_fit_canvas(1344, 768), (1344, 768, None))
+        # off-grid rounds up, never below what was asked for
+        self.assertEqual(w.minimax_h3_fit_canvas(720, 720)[:2], (736, 736))
+        # over the native canvas -> scaled down, aspect kept, note explains it
+        for width, height in ((1920, 1080), (3840, 2160), (1080, 1920), (4000, 1000)):
+            fitted_w, fitted_h, note = w.minimax_h3_fit_canvas(width, height)
+            self.assertEqual((fitted_w % 32, fitted_h % 32), (0, 0))
+            self.assertLessEqual(fitted_w * fitted_h, w.MINIMAX_H3_MAX_PIXELS)
+            self.assertIn("native canvas", note)
+            self.assertAlmostEqual(fitted_w / fitted_h, width / height, delta=0.15)
+
+    def test_budget_matches_measured_envelope(self):
+        """The guard has to agree with what the reference box actually did:
+        letting an over-budget job through OOM-kills the whole server."""
+        w = wrapper_workflows
+        frames = lambda seconds: w.minimax_h3_align_frames(w.minimax_h3_length(seconds))
+        self.assertEqual(frames(5), 124)  # 5s snaps up to the 17k+5 grid
+
+        for width, height, seconds in ((864, 480, 5), (1152, 640, 5), (736, 736, 5)):
+            self.assertIsNone(w.minimax_h3_check_budget(width, height, frames(seconds)),
+                              f"{width}x{height} {seconds}s completed on the reference box")
+        for width, height, seconds in ((1344, 768, 5), (960, 544, 10), (1344, 768, 8),
+                                       (1344, 768, 10)):
+            self.assertIsNotNone(w.minimax_h3_check_budget(width, height, frames(seconds)),
+                                 f"{width}x{height} {seconds}s OOM-killed the reference box")
+
+        # the form defaults must be inside the budget, or every default request 400s
+        self.assertIsNone(w.minimax_h3_check_budget(
+            w.MINIMAX_H3_DEFAULT_WIDTH, w.MINIMAX_H3_DEFAULT_HEIGHT, w.MINIMAX_H3_MAX_FRAMES))
+        # and the advertised maximum duration must not itself be over the cap
+        self.assertLessEqual(frames(w.MINIMAX_H3_MAX_DURATION), w.MINIMAX_H3_MAX_FRAMES)
+
+    def test_over_length_is_rejected_at_any_resolution(self):
+        """Frame count is the hard limit -- shrinking the canvas must not buy
+        back a longer clip, because the video VAE does not tile temporally."""
+        w = wrapper_workflows
+        too_many = w.MINIMAX_H3_MAX_FRAMES + 17
+        for width, height in ((1344, 768), (864, 480), (64, 64)):
+            note = w.minimax_h3_check_budget(width, height, too_many)
+            self.assertIsNotNone(note)
+            self.assertIn("frames", note)
 
 
 class TestIdeogram4Graph(unittest.TestCase):
@@ -605,9 +653,9 @@ class TestGraphValidation(unittest.TestCase):
         # satisfy the graph validation without downloading the real models.
         placeholder_paths = []
         for folder, name in (
-            ("diffusion_models", wrapper_workflows.MINIMAX_H3_UNET_FP8),
-            ("diffusion_models", wrapper_workflows.MINIMAX_H3_REF2VA_UNET_FP8),
-            ("text_encoders", wrapper_workflows.MINIMAX_H3_CLIP),
+            ("diffusion_models", wrapper_workflows.MINIMAX_H3_UNET_INT8),
+            ("diffusion_models", wrapper_workflows.MINIMAX_H3_REF2VA_UNET_INT8),
+            ("text_encoders", wrapper_workflows.MINIMAX_H3_CLIP_NVFP4),
             ("vae", wrapper_workflows.MINIMAX_H3_VIDEO_VAE),
             ("vae", wrapper_workflows.MINIMAX_H3_AUDIO_VAE),
         ):

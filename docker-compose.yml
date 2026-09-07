@@ -13,12 +13,17 @@ services:
     # ASYNC_OFFLOAD_STREAMS>0 in .env to enable): its pinned host buffers
     # compete with staged models on RAM-tight boxes.
     #
-    # IMPORTANT: MiniMax H3 stages ~26 GB of weights in RAM (UNET + VAEs) plus
-    # the CLIP (~15 GB) while running. A 32 GB RAM box OOM-kills (exit 137) at
-    # decode without swap — add host swap (e.g. 64 GB) or more RAM, and on
-    # swap-backed boxes optionally pass --disable-pinned-memory via COMFYUI_ARGS
-    # so staged weights are pageable and can spill to swap instead of OOM.
-    command: sh -c 'if [ "$${ASYNC_OFFLOAD_STREAMS:-0}" -gt 0 ] 2>/dev/null; then OFFLOAD="--async-offload $${ASYNC_OFFLOAD_STREAMS}"; else OFFLOAD="--disable-async-offload"; fi; exec python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} $OFFLOAD $${COMFYUI_ARGS:-}'
+    # IMPORTANT: MiniMax H3's four checkpoints total ~43 GB (21 GB UNET +
+    # 16 GB text encoder + 5.8 GB VAEs), which does not fit in 32 GB of RAM.
+    # Measured on an RTX 5090 / 32 GB RAM box, every H3 job peaks at 29-31 GB
+    # of host RAM and a 124-frame clip is the longest that survives; anything
+    # longer is OOM-killed (exit 137) mid-run, taking the whole server with it.
+    # FAST_DISK=1 (the default here) is what buys that margin back: it streams
+    # weights straight from the mmap'd safetensors instead of pinning them in
+    # host RAM, so the kernel can evict page cache under pressure rather than
+    # killing the process. Turn it off only on a box with enough RAM to hold
+    # every checkpoint at once. Host swap (see .env.example) helps too.
+    command: sh -c 'if [ "$${ASYNC_OFFLOAD_STREAMS:-0}" -gt 0 ] 2>/dev/null; then OFFLOAD="--async-offload $${ASYNC_OFFLOAD_STREAMS}"; else OFFLOAD="--disable-async-offload"; fi; if [ "$${FAST_DISK:-1}" = "1" ]; then DISK="--fast-disk"; else DISK=""; fi; exec python main.py --listen 0.0.0.0 --port 8188 --auto-download-models --vram-headroom $${VRAM_HEADROOM_GB:-2} --cache-ram $${CACHE_RAM_GB:-2 8} $$OFFLOAD $$DISK $${COMFYUI_ARGS:-}'
     ports:
       - "8188:8188"
     volumes:
@@ -42,6 +47,15 @@ services:
       # on RAM-tight boxes).
       - VRAM_HEADROOM_GB=${VRAM_HEADROOM_GB:-2}
       - ASYNC_OFFLOAD_STREAMS=${ASYNC_OFFLOAD_STREAMS:-0}
+      - CACHE_RAM_GB=${CACHE_RAM_GB:-2 8}
+      - FAST_DISK=${FAST_DISK:-1}
+      # Hard caps on MiniMax H3 jobs, enforced by the wrapper API before a job
+      # is queued: over-budget requests get a 400 instead of OOM-killing the
+      # server. Frame count bites hardest (the video VAE tiles spatially but
+      # not temporally); canvas*frames is the secondary limit. The defaults are
+      # the largest values measured to complete on 32 GB of RAM.
+      - COMFY_MINIMAX_H3_MAX_FRAMES=${MINIMAX_H3_MAX_FRAMES:-124}
+      - COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES=${MINIMAX_H3_MAX_PIXEL_FRAMES:-91422720}
       # HF_TOKEN is passed through from the host env or a .env file (required
       # for gated models, e.g. the FLUX.2 klein 9B fp8 checkpoint).
       - HF_TOKEN=${HF_TOKEN:-}

@@ -5,6 +5,8 @@ and the graph structure is easy to audit. It builds ComfyUI API-format prompt
 graphs (as accepted by POST /prompt) and declares the models a workflow needs.
 """
 
+import os
+
 # Models required by the FLUX.2 [klein] 9B image edit workflow, with the exact
 # files expected by the loaders in the graph below. The URLs match the
 # Comfy-Org/BFL repos the shipped blueprints point at.
@@ -205,6 +207,12 @@ def build_flux2_klein_9b_text2img(*, prompt, negative_prompt="", seed=0,
 # canonical template choice; fp8_scaled loads everywhere (bf16 fallback on
 # MPS); bf16 is the full-quality option.
 MINIMAX_H3_FPS = 24
+# The official ComfyUI templates (video_minimax_h3_{t2v,i2v,r2v}) all ship the
+# int8_convrot UNET + nvfp4_awq encoder + fp16 video VAE + fp32 audio VAE, so
+# that quadruple is what the wrapper reproduces by default. int8 and fp8 UNETs
+# are the same size on disk (~21 GB); int8_convrot is the one the templates and
+# the model card were validated against.
+MINIMAX_H3_DEFAULT_QUANT = "int8"
 MINIMAX_H3_UNET_FP8 = "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
 MINIMAX_H3_UNET_INT8 = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 MINIMAX_H3_UNET_BF16 = "minimax_h3_fl2va_pruned_bf16.safetensors"
@@ -251,7 +259,7 @@ def minimax_h3_model_pick(requested, ref2va, is_present):
     bf16 is ~40 GB). ``is_present(folder, filename)`` reports local files."""
     if requested is not None and requested not in MINIMAX_H3_QUANT_MODELS:
         raise ValueError(f"Invalid quantization: {requested}")
-    q = requested or "fp8"
+    q = requested or MINIMAX_H3_DEFAULT_QUANT
     quants = MINIMAX_H3_QUANT_MODELS
     unet_key = "ref2va" if ref2va else "unet"
 
@@ -266,7 +274,7 @@ def minimax_h3_model_pick(requested, ref2va, is_present):
     if unet is None:
         unet_quant, unet = q, quants[q][unet_key]
     if unet_quant != q:
-        notes.append(f"quantization={q} UNET is not on disk; using the {unet_quant} UNET already present.")
+        notes.append(f"the quantization={q} UNET is not on disk; using {unet} already present.")
 
     clip = None
     for cand in MINIMAX_H3_CLIP_ORDER:
@@ -275,9 +283,11 @@ def minimax_h3_model_pick(requested, ref2va, is_present):
             break
     if clip is None:
         clip = MINIMAX_H3_CLIP_NVFP4
-    if clip != quants[q]["clip"]:
-        notes.append("using the smallest text encoder already on disk instead of the "
-                     f"quantization's default ({quants[q]['clip']}).")
+    if clip != MINIMAX_H3_CLIP_ORDER[0]:
+        # Only worth reporting when the preferred (smallest) encoder is absent
+        # and a heavier one had to stand in -- that is the case that costs RAM.
+        notes.append(f"{MINIMAX_H3_CLIP_ORDER[0]} is not on disk; using the larger {clip} "
+                     "text encoder already present.")
 
     return unet, clip, " ".join(notes) or None
 
@@ -307,6 +317,113 @@ def minimax_h3_length(duration):
     """Duration (seconds) -> frame count at 24 fps (min 5; the nodes snap it
     to the model's 17k+5 grid)."""
     return max(5, round(duration * MINIMAX_H3_FPS))
+
+
+def minimax_h3_align_frames(length):
+    """Frame count the H3 nodes will actually generate for ``length``.
+
+    Mirrors ``comfy_extras.nodes_minimax_h3.align_frame_count`` (kept local so
+    this module stays comfy-import-free): the model works in 17-frame blocks
+    plus a 5-frame head, so any length snaps up to the next 17k+5 value."""
+    n = max(5, length)
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+# H3's native canvas: a 768 px short edge capped at 768*1344 pixels, rounded to
+# a multiple of 32. Beyond that the model is out of distribution, so the wrapper
+# scales an oversized request down instead of generating something unusable.
+MINIMAX_H3_CANVAS_MULTIPLE = 32
+MINIMAX_H3_MAX_PIXELS = 1344 * 768
+
+# H3's four checkpoints total ~43 GB (21 GB UNET + 16 GB text encoder + 5.8 GB
+# VAEs), so on a 32 GB RAM box every job already runs at 29-31 GB of host RAM
+# before a single pixel is generated. What is left decides whether the run
+# finishes or the kernel OOM-kills the server (exit 137), which takes the whole
+# queue down with it -- so the wrapper refuses jobs it does not expect to
+# survive rather than discovering the limit the hard way.
+#
+# Measured on the target box (RTX 5090, 32 GB VRAM / 32 GB RAM, no swap, no
+# --fast-disk) with the int8 UNET + nvfp4 encoder:
+#
+#     canvas    frames  steps  Mpx-frames  peak RAM  result
+#      864x480     124     20        51.4    30.4 GB  ok, 91 s
+#      736x736     124      2        67.2    29.7 GB  ok, 33 s
+#     1152x640     124     20        91.4    31.4 GB  ok, 175 s
+#     1344x768     124      2       128.0    30.4 GB  ok, 57 s
+#      960x544     243      2       126.9    30.6 GB  OOM-killed
+#     1344x768     124     20       128.0    29.9 GB  OOM-killed after 298 s
+#     1344x768     158      2       163.1    30.4 GB  OOM-killed
+#     1344x768     192      2       198.3    31.1 GB  OOM-killed
+#     1344x768     243      2       250.9    30.9 GB  OOM-killed
+#
+# Two independent limits fall out of that. Frame count is the harder one: every
+# run above 124 frames died regardless of how small the canvas was, because the
+# video VAE tiles spatially (256 px) but not temporally. Canvas area matters
+# too, but only at a realistic step count -- 1344x768 x 124 survives 2 steps and
+# dies at 20, because the longer a job sits at ~30 GB the more likely it is to
+# lose the race. So both a frame cap and an area*frames budget are enforced.
+#
+# The budget is the largest combination that completed (1152x640 x 124), while
+# the form defaults below sit at the largest one that completed with real
+# margin (864x480 x 124, 1.6 GB of RAM to spare -- 1152x640 finished with only
+# 0.6 GB). Both limits are env-tunable: a host with more RAM, with swap, or
+# running with --fast-disk (see docker-compose.yml) can raise them without a
+# code change.
+MINIMAX_H3_MAX_FRAMES = max(5, int(os.environ.get("COMFY_MINIMAX_H3_MAX_FRAMES", "124")))
+MINIMAX_H3_MAX_DURATION = round(MINIMAX_H3_MAX_FRAMES / MINIMAX_H3_FPS, 2)
+MINIMAX_H3_MAX_PIXEL_FRAMES = max(1, int(float(
+    os.environ.get("COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES", str(1152 * 640 * 124)))))
+# Defaults: the largest canvas/length that finished a real 20-step job with RAM
+# to spare, so a request carrying nothing but a prompt gets the best output the
+# host can reliably finish. 864x480 is also the resolution the official H3
+# templates' own Resolution Selector ships (0.4 MP, 16:9).
+MINIMAX_H3_DEFAULT_WIDTH = 864
+MINIMAX_H3_DEFAULT_HEIGHT = 480
+MINIMAX_H3_DEFAULT_STEPS = 20
+
+
+def minimax_h3_check_budget(width, height, frames):
+    """Return an error detail when a canvas/length would risk OOM-killing the
+    host, or None when the job fits the configured budget."""
+    if frames > MINIMAX_H3_MAX_FRAMES:
+        return (f"{frames} frames at 24 fps is above this host's {MINIMAX_H3_MAX_FRAMES}-frame limit "
+                f"(max duration {MINIMAX_H3_MAX_DURATION}s). Frame count is the hardest limit for "
+                "MiniMax H3: the video VAE tiles spatially but not temporally, so a longer clip "
+                "costs far more memory than a wider one, and no resolution is small enough to "
+                "compensate.")
+    budget = MINIMAX_H3_MAX_PIXEL_FRAMES
+    used = width * height * frames
+    if used > budget:
+        max_pixels = budget // frames
+        # Largest 32-aligned canvas with this aspect ratio that fits the budget.
+        m = MINIMAX_H3_CANVAS_MULTIPLE
+        scale = (max_pixels / (width * height)) ** 0.5
+        fit_w = max(m, int(width * scale) // m * m)
+        fit_h = max(m, int(height * scale) // m * m)
+        return (f"{width}x{height} for {frames} frames needs {used / 1e6:.0f} megapixel-frames, "
+                f"above this host's {budget / 1e6:.0f} budget. Either drop the canvas to about "
+                f"{fit_w}x{fit_h} at this length, or shorten the clip.")
+    return None
+
+
+def minimax_h3_fit_canvas(width, height):
+    """Round a requested canvas up to H3's grid, scaling it down (aspect kept)
+    when it exceeds the model's 768*1344 pixel budget."""
+    m = MINIMAX_H3_CANVAS_MULTIPLE
+    width = max(m, -(-width // m) * m)
+    height = max(m, -(-height // m) * m)
+    if width * height <= MINIMAX_H3_MAX_PIXELS:
+        return width, height, None
+    # Round the fitted canvas *down* to the grid: rounding up here could push
+    # the area back over the cap the scale factor just brought it under.
+    scale = (MINIMAX_H3_MAX_PIXELS / (width * height)) ** 0.5
+    fitted_w = max(m, int(width * scale) // m * m)
+    fitted_h = max(m, int(height * scale) // m * m)
+    note = (f"{width}x{height} exceeds MiniMax H3's {MINIMAX_H3_MAX_PIXELS}-pixel native canvas; "
+            f"generating at {fitted_w}x{fitted_h} instead.")
+    return fitted_w, fitted_h, note
 
 
 def _minimax_h3_head(prompt, width, height, length, unet_name, clip_name,
@@ -356,23 +473,25 @@ def _minimax_h3_cond_and_tail(prompt, width, height, length, seed, steps, schedu
     return {**head, **loader_nodes, **tail}
 
 
-def build_minimax_h3_text_to_video(*, prompt, seed=0, steps=50, width=1344, height=768,
+def build_minimax_h3_text_to_video(*, prompt, seed=0, steps=MINIMAX_H3_DEFAULT_STEPS,
+                                   width=MINIMAX_H3_DEFAULT_WIDTH, height=MINIMAX_H3_DEFAULT_HEIGHT,
                                    duration=5.0, scheduler="beta",
                                    filename_prefix="wrapper/minimaxh3_t2v",
-                                   unet_name=MINIMAX_H3_UNET_FP8,
-                                   clip_name=MINIMAX_H3_CLIP):
+                                   unet_name=MINIMAX_H3_UNET_INT8,
+                                   clip_name=MINIMAX_H3_CLIP_NVFP4):
     """MiniMax H3 text-to-video: prompt -> joint audio+video MP4."""
     return _minimax_h3_cond_and_tail(prompt, width, height, minimax_h3_length(duration),
                                      seed, steps, scheduler, unet_name, clip_name, {}, {}, 7,
                                      filename_prefix)
 
 
-def build_minimax_h3_image_to_video(*, prompt, seed=0, steps=50, width=1344, height=768,
+def build_minimax_h3_image_to_video(*, prompt, seed=0, steps=MINIMAX_H3_DEFAULT_STEPS,
+                                    width=MINIMAX_H3_DEFAULT_WIDTH, height=MINIMAX_H3_DEFAULT_HEIGHT,
                                     duration=5.0, scheduler="beta",
                                     filename_prefix="wrapper/minimaxh3_i2v",
                                     first_frame=None, last_frame=None,
-                                    unet_name=MINIMAX_H3_UNET_FP8,
-                                    clip_name=MINIMAX_H3_CLIP):
+                                    unet_name=MINIMAX_H3_UNET_INT8,
+                                    clip_name=MINIMAX_H3_CLIP_NVFP4):
     """MiniMax H3 image-to-video: first (and optional last) frame + prompt ->
     joint audio+video MP4."""
     cond_inputs = {}
@@ -397,13 +516,14 @@ def _ref_list(refs):
     return refs or ()
 
 
-def build_minimax_h3_reference_to_video(*, prompt, seed=0, steps=50, width=1344, height=768,
+def build_minimax_h3_reference_to_video(*, prompt, seed=0, steps=MINIMAX_H3_DEFAULT_STEPS,
+                                        width=MINIMAX_H3_DEFAULT_WIDTH, height=MINIMAX_H3_DEFAULT_HEIGHT,
                                         duration=5.0, scheduler="beta", ref_image_size="match",
                                         filename_prefix="wrapper/minimaxh3_ref2va",
                                         ref_images=(), ref_videos=(), ref_video_audios=(),
                                         ref_audios=(),
-                                        unet_name=MINIMAX_H3_REF2VA_UNET_FP8,
-                                        clip_name=MINIMAX_H3_CLIP):
+                                        unet_name=MINIMAX_H3_REF2VA_UNET_INT8,
+                                        clip_name=MINIMAX_H3_CLIP_NVFP4):
     """MiniMax H3 reference-to-video (ref2va): reference images/videos/audio +
     prompt -> joint audio+video MP4. The prompt refers to references by tag
     (<Picture i> / <Video k> / <Audio j>) in the order they were provided.
@@ -440,19 +560,50 @@ def build_minimax_h3_reference_to_video(*, prompt, seed=0, steps=50, width=1344,
     return {**head, **loader_nodes, **tail}
 
 MINIMAX_H3_FORM_EXTRA = {
-    "width": {"type": "integer", "minimum": 32, "maximum": 8192, "default": 1344,
-              "description": "Output width (rounded to a multiple of 32)."},
-    "height": {"type": "integer", "minimum": 32, "maximum": 8192, "default": 768,
-               "description": "Output height (rounded to a multiple of 32)."},
-    "duration": {"type": "number", "minimum": 0.2, "maximum": 150, "default": 5.0,
-                  "description": "Video length in seconds at 24 fps (snapped to the model's frame grid; trained range ~124-362 frames = 5-15s)."},
+    "width": {"type": "integer", "minimum": 32, "maximum": 8192, "default": MINIMAX_H3_DEFAULT_WIDTH,
+              "description": "Output width, rounded up to a multiple of 32. Width*height is capped at "
+                             f"H3's native canvas ({MINIMAX_H3_MAX_PIXELS} px = 1344x768) and a larger "
+                             "request is scaled down keeping its aspect ratio. Separately, "
+                             "width*height*frames must fit this host's memory budget "
+                             f"({MINIMAX_H3_MAX_PIXEL_FRAMES // 1000000} megapixel-frames, i.e. up to "
+                             f"{MINIMAX_H3_MAX_PIXEL_FRAMES // MINIMAX_H3_MAX_FRAMES // 1000} kilopixels "
+                             f"at the full {MINIMAX_H3_MAX_FRAMES} frames) or the request is rejected "
+                             f"with a 400. The default {MINIMAX_H3_DEFAULT_WIDTH}x"
+                             f"{MINIMAX_H3_DEFAULT_HEIGHT} is the largest canvas that finished a "
+                             "20-step job on this box with memory to spare."},
+    "height": {"type": "integer", "minimum": 32, "maximum": 8192, "default": MINIMAX_H3_DEFAULT_HEIGHT,
+               "description": "Output height, rounded up to a multiple of 32. See width for the caps."},
+    "duration": {"type": "number", "minimum": 0.2, "maximum": MINIMAX_H3_MAX_DURATION,
+                 "default": MINIMAX_H3_MAX_DURATION,
+                 "description": f"Video length in seconds at 24 fps, snapped up to the model's 17k+5 "
+                                f"frame grid. This is the parameter that drives memory hardest: the "
+                                f"video VAE tiles spatially but not temporally, so no resolution is "
+                                f"small enough to buy back a longer clip. The maximum is the longest "
+                                f"length verified not to OOM-kill this host "
+                                f"({MINIMAX_H3_MAX_FRAMES} frames); raise it with the "
+                                f"COMFY_MINIMAX_H3_MAX_FRAMES env var on a host with more RAM or swap. "
+                                f"The model itself is trained for 124-362 frames (5-15 s)."},
+    "steps": {"type": "integer", "minimum": 1, "maximum": 1000,
+              "default": MINIMAX_H3_DEFAULT_STEPS,
+              "description": "Sampling steps. Barely affects peak memory, but a longer run spends "
+                             "longer at that peak, so very high step counts do make an OOM more "
+                             "likely. 20 is what the official MiniMax H3 templates ship and is a "
+                             "good quality/time balance; below ~15 motion and audio get mushy, "
+                             "above ~30 returns diminish."},
     "scheduler": {"type": "string", "enum": ["beta", "normal", "simple"], "default": "beta",
                    "description": "Sigma scheduler; beta/normal outperform simple for reference-heavy prompts."},
+    "quantization": {"type": "string", "default": MINIMAX_H3_DEFAULT_QUANT,
+                     "description": "Weight precision for the UNET. 'int8' (default) is the "
+                                    "int8_convrot checkpoint the official templates ship; 'fp8' is the "
+                                    "same size (~21 GB) fp8_scaled build; 'bf16' is ~40 GB and will not "
+                                    "fit this box. The text encoder is picked independently: the "
+                                    "smallest one already on disk wins, which on Blackwell is the "
+                                    "nvfp4_awq build (~16 GB vs 27 GB int8 / 52 GB bf16)."},
 }
 MINIMAX_H3_REF_FORM_EXTRA = {
     **MINIMAX_H3_FORM_EXTRA,
     "ref_image_size": {"type": "string", "enum": ["match", "max"], "default": "match",
-                        "description": "Reference image sizing: 'match' downscales refs to the generation's pixel area (faster); 'max' keeps a 2048px short edge for stronger identity fidelity (slower)."},
+                        "description": "Reference image sizing: 'match' downscales refs to the generation's pixel area (faster); 'max' keeps a 2048px short edge for stronger identity fidelity (slower). Reference tokens ride through every sampling step, so 'max' with several large refs costs both time and memory on top of the canvas budget -- keep 'match' unless identity fidelity is the priority."},
 }
 
 

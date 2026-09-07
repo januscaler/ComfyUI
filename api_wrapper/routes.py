@@ -132,6 +132,32 @@ async def _wait_for_prompt(prompt_queue, prompt_id, timeout=None, sleep_interval
         await asyncio.sleep(sleep_interval)
 
 
+def _header_value(text):
+    """Collapse a message to a single latin-1 safe header line."""
+    collapsed = " ".join(str(text).split())
+    return collapsed.encode("latin-1", "replace").decode("latin-1")
+
+
+def _resolution_headers(build_kwargs, note):
+    """Report what the setup actually resolved: the checkpoint file names it
+    picked, the canvas/length it settled on, and any advisory note."""
+    headers = {}
+    # Diffusion models first, then encoders/VAEs, so the header reads in the
+    # order someone comparing it against a workflow's loaders expects.
+    order = lambda key: (0 if "unet" in key else 1, key)
+    models = [str(v) for k, v in sorted(build_kwargs.items(), key=lambda kv: order(kv[0]))
+              if k.endswith("_name") and isinstance(v, str)]
+    if models:
+        headers["X-Wrapper-Models"] = _header_value(", ".join(models))
+    settings = [f"{k}={build_kwargs[k]}" for k in ("width", "height", "duration", "steps", "scheduler")
+                if k in build_kwargs]
+    if settings:
+        headers["X-Wrapper-Settings"] = _header_value(" ".join(settings))
+    if note:
+        headers["X-Wrapper-Note"] = _header_value(note)
+    return headers
+
+
 def _error_response(message, details="", missing=None, status=400):
     body = {
         "error": {
@@ -303,20 +329,38 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     except ValueError as e:
         raise _SetupError("Invalid quantization", str(e)) from None
     try:
-        steps = int(fields.get("steps", 50))
-        width = int(fields.get("width", 1344))
-        height = int(fields.get("height", 768))
-        duration = float(fields.get("duration", 5.0))
+        steps = int(fields.get("steps", wrapper_workflows.MINIMAX_H3_DEFAULT_STEPS))
+        width = int(fields.get("width", wrapper_workflows.MINIMAX_H3_DEFAULT_WIDTH))
+        height = int(fields.get("height", wrapper_workflows.MINIMAX_H3_DEFAULT_HEIGHT))
+        duration = float(fields.get("duration", wrapper_workflows.MINIMAX_H3_MAX_DURATION))
     except ValueError:
         raise _SetupError("Invalid parameter value", "steps/width/height/duration must be numbers.") from None
     if not 1 <= steps <= 1000:
         raise _SetupError("Invalid steps", "steps must be between 1 and 1000.")
     if not 32 <= width <= 8192 or not 32 <= height <= 8192:
         raise _SetupError("Invalid size", "width/height must be between 32 and 8192.")
-    width = max(32, (width + 31) // 32 * 32)
-    height = max(32, (height + 31) // 32 * 32)
-    if not 0.2 <= duration <= 150:
-        raise _SetupError("Invalid duration", "duration must be between 0.2 and 150 seconds.")
+    # Scale an over-large canvas back onto H3's native 768x1344 budget rather
+    # than letting the model run out of distribution.
+    width, height, canvas_note = wrapper_workflows.minimax_h3_fit_canvas(width, height)
+    if canvas_note:
+        note = f"{note} {canvas_note}".strip() if note else canvas_note
+    # Sanity range first: this also rejects nan/inf, which would otherwise blow
+    # up in the frame-count arithmetic below. The real (much tighter) limit is
+    # the budget check.
+    if not 0 < duration <= 3600:
+        raise _SetupError("Invalid duration", "duration must be between 0 and 3600 seconds.")
+    # Refuse anything past the host's measured envelope: a 400 here is far
+    # better than an OOM-kill mid-run, which takes the server and every queued
+    # job down with it.
+    frames = wrapper_workflows.minimax_h3_align_frames(
+        wrapper_workflows.minimax_h3_length(duration))
+    over_budget = wrapper_workflows.minimax_h3_check_budget(width, height, frames)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe MiniMax H3 budget",
+            f"{over_budget} The limits are set by COMFY_MINIMAX_H3_MAX_FRAMES and "
+            "COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES; raise them once the host has more RAM, swap, "
+            "or runs with --fast-disk.")
     scheduler = fields.get("scheduler", "beta")
     if scheduler not in comfy_samplers.SCHEDULER_NAMES:
         raise _SetupError("Invalid scheduler",
@@ -325,9 +369,10 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     if ref_image_size not in ("match", "max"):
         raise _SetupError("Invalid ref_image_size", "ref_image_size must be 'match' or 'max'.")
 
-    _raise_if_missing(await _download_models(
-        wrapper_workflows.minimax_h3_models("fp8", ref2va,
-                                            unet_name=unet_name, clip_name=clip_name), downloaded))
+    models = wrapper_workflows.minimax_h3_models(
+        wrapper_workflows.MINIMAX_H3_DEFAULT_QUANT, ref2va,
+        unet_name=unet_name, clip_name=clip_name)
+    _raise_if_missing(await _download_models(models, downloaded))
 
     if model_management.get_torch_device().type == "mps":
         mps_note = ("MiniMax H3 is a very large omni-modal model; on MPS the fp8 weights "
@@ -575,7 +620,12 @@ def register_wrapper_routes(routes, prompt_server):
         first = files[0]
         ext = os.path.splitext(first)[1].lower()
         headers = {"Content-Type": MIME_TYPES.get(ext, "application/octet-stream"),
-                   "Content-Disposition": f'attachment; filename="{os.path.basename(first)}"'}
+                   "Content-Disposition": f'attachment; filename="{os.path.basename(first)}"',
+                   "X-Wrapper-Job-Id": prompt_id}
+        # The response body is the artifact itself, so the only place to report
+        # which checkpoints actually ran (the setup may substitute a variant
+        # already on disk) and any advisory note is the headers.
+        headers.update(_resolution_headers(build_kwargs, note))
         return web.FileResponse(first, headers=headers)
 
     @routes.get("/wrapper/workflows")

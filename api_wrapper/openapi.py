@@ -9,7 +9,19 @@ WRAPPER_OPENAPI_SPEC = {
     "openapi": "3.0.3",
     "info": {
         "title": "ComfyUI Wrapper API",
-        "description": "Simplified generation API on top of ComfyUI. Submit a prompt and an input image, and the wrapper takes care of the internal workflow: it builds the FLUX.2 [klein] 9B image edit graph, downloads any model files that are missing, queues the job on the ComfyUI execution server and tracks it until the generated image is ready. VRAM and RAM are released automatically as soon as a job finishes; POST /api/wrapper/free releases them on demand.",
+        "description": (
+            "Simplified generation API on top of ComfyUI. Submit a prompt (plus any input image, "
+            "video or audio the workflow takes) and the wrapper handles the rest: it builds the "
+            "prompt graph, downloads any missing model files, queues the job on the ComfyUI "
+            "execution server and streams back the finished artifact. Every endpoint is "
+            "synchronous and returns the file itself; the X-Wrapper-Models / X-Wrapper-Settings "
+            "response headers report which checkpoints and resolved parameters produced it. "
+            "VRAM and RAM are released automatically as soon as a job finishes; POST "
+            "/api/wrapper/free releases them on demand.\n\n"
+            "The MiniMax H3 video endpoints are capped to what the host can actually finish: "
+            "clip length and canvas*frames are checked before the job is queued and an "
+            "over-budget request gets a 400 rather than OOM-killing the server. The form "
+            "defaults are the largest values measured to complete on this machine."),
         "version": "0.1.0",
     },
     "servers": [{"url": "/"}],
@@ -49,6 +61,12 @@ WRAPPER_OPENAPI_SPEC = {
                 "responses": {
                     "200": {
                         "description": "The final output image (image/png), shown inline in the docs.",
+                        "headers": {
+                            "X-Wrapper-Models": {"schema": {"type": "string"}, "description": "The checkpoint files this run actually loaded. The setup may substitute a variant already on disk for the requested quantization, so this is the authoritative record of what produced the output."},
+                            "X-Wrapper-Settings": {"schema": {"type": "string"}, "description": "The resolved width/height/duration/steps/scheduler after clamping and rounding."},
+                            "X-Wrapper-Note": {"schema": {"type": "string"}, "description": "Advisory note from the setup (model substitution, canvas downscale, ...). Absent when there is nothing to report."},
+                            "X-Wrapper-Job-Id": {"schema": {"type": "string", "format": "uuid"}, "description": "Id of the job that produced this file; usable with /api/wrapper/jobs/{job_id}."},
+                        },
                         "content": {
                             "image/png": {"schema": {"type": "string", "format": "binary"}},
                             "application/octet-stream": {"schema": {"type": "string", "format": "binary"}},
@@ -210,7 +228,9 @@ def _expanded_operation(template_operation, workflow, task, operation_suffix):
         universal = ("timeout", "free_vram", "quantization", "vram")
         schema["properties"] = {k: v for k, v in schema["properties"].items()
                                 if k in form or k in universal}
-        schema["properties"].update(task.get("extra_form_properties") or {})
+        # Deep-copied: a workflow's extra_form_properties dict is shared by all
+        # of its tasks, and the quantization enum below is patched per task.
+        schema["properties"].update(copy.deepcopy(task.get("extra_form_properties") or {}))
         for up_name, up_spec in (task.get("uploads") or {}).items():
             if up_name not in schema["properties"]:
                 schema["properties"][up_name] = {
