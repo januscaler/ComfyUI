@@ -169,6 +169,8 @@ WRAPPER_OPENAPI_SPEC = {
                 "properties": {
                     "prompt": {"type": "string", "description": "The rewritten prompt, ready to send back as 'raw_prompt'."},
                     "model": {"type": "string", "description": "The model that wrote it (after 'auto' resolution)."},
+                    "used_image": {"type": "boolean", "description": "Whether the model actually saw a context image. False when none was attached, or when a text-only model was pinned and the wrapper's own context image was skipped."},
+                    "note": {"type": "string", "nullable": True, "description": "Set when something about the request was adjusted rather than refused, e.g. a context image dropped because the pinned model cannot read one."},
                     "mode": {"type": "string", "enum": ["T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA"], "description": "H3 input mode inferred from which assets were attached."},
                     "width": {"type": "integer"},
                     "height": {"type": "integer"},

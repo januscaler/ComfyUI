@@ -132,6 +132,48 @@ class TestRequestShape(RewriterTestCase):
         self.assertEqual(model, pr.MODEL_PRO)
 
 
+class TestTextOnlyModelGuard(unittest.TestCase):
+    """mimo-v2.5-pro rejects any request carrying an image (live API: HTTP 404
+    'No endpoints found that support image input'), so the combination has to
+    be caught here rather than surfaced as an upstream error."""
+
+    def setUp(self):
+        self.image = pr.data_url_from_bytes(PNG, "ctx.png")
+
+    def test_uploaded_image_with_a_text_only_model_is_refused(self):
+        with self.assertRaises(pr.RewriteError) as ctx:
+            pr.resolve_model_and_image(pr.MODEL_PRO, self.image, image_is_explicit=True)
+        self.assertEqual(ctx.exception.status, 400)
+        # the message has to name both ways out
+        self.assertIn(pr.MODEL_OMNI, ctx.exception.details)
+        self.assertIn("auto", ctx.exception.details)
+
+    def test_wrapper_supplied_image_is_dropped_not_refused(self):
+        """The caller only picked the model; the keyframe became a context
+        image on the wrapper's initiative, so it yields instead of erroring."""
+        model, image, note = pr.resolve_model_and_image(
+            pr.MODEL_PRO, self.image, image_is_explicit=False)
+        self.assertEqual(model, pr.MODEL_PRO)
+        self.assertIsNone(image)
+        self.assertIn("text-only", note)
+
+    def test_omnimodal_model_keeps_the_image(self):
+        for requested in (pr.MODEL_OMNI, pr.MODEL_AUTO, None):
+            model, image, note = pr.resolve_model_and_image(
+                requested, self.image, image_is_explicit=True)
+            self.assertEqual(model, pr.MODEL_OMNI, requested)
+            self.assertEqual(image, self.image)
+            self.assertIsNone(note)
+
+    def test_text_only_model_without_an_image_is_untouched(self):
+        model, image, note = pr.resolve_model_and_image(pr.MODEL_PRO, None, False)
+        self.assertEqual((model, image, note), (pr.MODEL_PRO, None, None))
+
+    def test_capability_table(self):
+        self.assertFalse(pr.supports_images(pr.MODEL_PRO))
+        self.assertTrue(pr.supports_images(pr.MODEL_OMNI))
+
+
 class TestOutputHandling(RewriterTestCase):
     def test_strips_code_fences_and_reasoning(self):
         api = _MockAPI(reply="<think>planning</think>```text\nintegrated_multimodal_description: x\n```")

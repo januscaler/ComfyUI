@@ -35,6 +35,11 @@ MODEL_PRO = "mimo-v2.5-pro"
 MODEL_OMNI = "mimo-v2.5"
 MODEL_AUTO = "auto"
 MODEL_OPTIONS = (MODEL_AUTO, MODEL_PRO, MODEL_OMNI)
+# Confirmed against the live API: sending an image to mimo-v2.5-pro fails with
+# HTTP 404 {"message": "No endpoints found that support image input"} -- it is
+# not ignored, the whole request is rejected. mimo-v2.5 accepts images. This is
+# why MODEL_AUTO routes anything carrying an image to the omnimodal build.
+TEXT_ONLY_MODELS = frozenset({MODEL_PRO})
 
 SKILL_DIR = os.environ.get("H3_PROMPT_SKILL_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "h3_prompt_skill")
@@ -135,6 +140,33 @@ def resolve_model(requested, has_image):
         raise RewriteError("Invalid llm_model",
                            f"llm_model must be one of: {', '.join(MODEL_OPTIONS)}.")
     return choice
+
+
+def supports_images(model):
+    return model not in TEXT_ONLY_MODELS
+
+
+def resolve_model_and_image(requested, image, image_is_explicit):
+    """Pick the model, and decide whether the context image can travel with it.
+
+    A text-only model plus an image is a request the API refuses outright, so
+    it never reaches the wire. How that is reported depends on who asked for
+    the image: an ``llm_image`` the caller uploaded is a contradiction worth a
+    clear error, while the context image the wrapper adds by itself (the
+    keyframe or first reference) is just dropped, since the caller only chose
+    the model. Returns (model, image, note)."""
+    model = resolve_model(requested, has_image=bool(image))
+    if not image or supports_images(model):
+        return model, image, None
+    if image_is_explicit:
+        raise RewriteError(
+            "The selected model cannot read images",
+            f"llm_model={model} is text-only, and the API rejects any request carrying an image. "
+            f"Send llm_image with llm_model={MODEL_OMNI} (the omnimodal build) or drop llm_model "
+            "to let 'auto' pick it for you, or remove llm_image to write the prompt from text "
+            f"alone with {model}.")
+    return model, None, (f"{model} is text-only, so the prompt was written from text alone; "
+                         f"use llm_model={MODEL_OMNI} or 'auto' to give it visual context")
 
 
 def load_guide(name):

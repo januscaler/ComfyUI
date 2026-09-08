@@ -239,16 +239,22 @@ async def _rewrite_prompt(task_name, fields, build_kwargs, upload_refs):
         "audios": len(upload_refs.get("ref_video_audios", [])) + len(upload_refs.get("ref_audios", [])),
     }
 
+    image = prompt_rewriter.data_url_from_path(_input_path(context_ref)) if context_ref else None
+    model, image, image_note = prompt_rewriter.resolve_model_and_image(
+        fields.get("llm_model"), image, image_is_explicit=bool(upload_refs.get("llm_image")))
+    if image is None:
+        context_ref = None
+
     prompt, model_used = await prompt_rewriter.rewrite(
         intent=intent, mode=mode,
         duration=frames / wrapper_workflows.MINIMAX_H3_FPS, frames=frames,
         width=build_kwargs["width"], height=build_kwargs["height"],
-        reference_counts=reference_counts,
-        image=prompt_rewriter.data_url_from_path(_input_path(context_ref)) if context_ref else None,
-        model=fields.get("llm_model"))
+        reference_counts=reference_counts, image=image, model=model)
     note = f"prompt rewritten for {mode} by {model_used}"
     if context_ref and not upload_refs.get("llm_image"):
         note += " using the uploaded image as visual context"
+    if image_note:
+        note = _append_note(note, f"({image_note})")
     record = {
         "source": model_used,
         "mode": mode,
@@ -880,6 +886,9 @@ def register_wrapper_routes(routes, prompt_server):
             has_first_frame=bool(uploads.get("image")),
             has_last_frame=bool(uploads.get("last_frame")))
         try:
+            model, image, image_note = prompt_rewriter.resolve_model_and_image(
+                fields.get("llm_model"), image,
+                image_is_explicit=bool(uploads.get("llm_image")))
             prompt, model_used = await prompt_rewriter.rewrite(
                 intent=intent, mode=mode,
                 duration=frames / wrapper_workflows.MINIMAX_H3_FPS, frames=frames,
@@ -890,13 +899,15 @@ def register_wrapper_routes(routes, prompt_server):
                     "audios": len(uploads.get("ref_video_audios", []))
                               + len(uploads.get("ref_audios", [])),
                 },
-                image=image, model=fields.get("llm_model"))
+                image=image, model=model)
         except prompt_rewriter.RewriteError as e:
             return _error_response(e.message, e.details, status=e.status)
 
         return web.json_response({
             "prompt": prompt,
             "model": model_used,
+            "used_image": image is not None,
+            "note": image_note,
             "task": task_name,
             "mode": mode,
             "width": width,
