@@ -111,9 +111,11 @@ curl -o result.png -X POST http://127.0.0.1:8188/api/wrapper/flux2klein9b/genera
 - `POST /api/wrapper/minimaxh3/prompt` turns a free-form prompt into an H3 prompt and returns it as JSON — no GPU work, no render. The task is inferred from what you attach (reference assets → ref2va, a keyframe → image-to-video, nothing → text-to-video), so a prompt on its own is a complete request; `POST /api/wrapper/minimaxh3/{task}/prompt` pins one. Iterate there, then send the result back to `/generate` as `raw_prompt`. Accepts multipart, form-urlencoded or JSON.
 
 ```bash
-curl -s -X POST http://127.0.0.1:8188/api/wrapper/minimaxh3/prompt \
+curl -s --max-time 60 -X POST http://127.0.0.1:8188/api/wrapper/minimaxh3/prompt \
   -d 'prompt=two wrestlers in a gym, one chokeslams the other onto a crash mat, heavy metal soundtrack'
 ```
+
+A rewrite takes 10–20 s (it is one call to a large model), so allow at least 60 s — a short client timeout aborts mid-flight and looks like a missing endpoint. `/generate` is synchronous and streams the MP4 back in the response body, so it needs `-o out.mp4` and a timeout in minutes, not seconds.
 
 **Generated prompts are recorded.** Because the H3 prompt is written by a model rather than supplied, every generation logs the full prompt it ran with to the server log (job id, mode, model, and the free-form input it came from), and saves a `<video>.prompt.json` sidecar next to the output — input prompt, generated prompt, model, mode, settings and checkpoints. The `X-Wrapper-Prompt-File` response header gives its path. `raw_prompt` runs are recorded the same way, marked `"source": "raw_prompt"`, so every video in the output directory can be traced back to the exact prompt that made it.
 

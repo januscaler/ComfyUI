@@ -333,6 +333,10 @@ async def rewrite(*, intent, mode, duration, frames, width, height,
         width=width, height=height, reference_counts=reference_counts or {},
         image_data_url=data_url)
 
+    # max_completion_tokens, the thinking object and both auth headers below are
+    # all confirmed accepted by the live API on both models. That the endpoint
+    # *honours* thinking:disabled is inferred from latency and output shape
+    # rather than observed -- the response does not report it back.
     payload = {
         "model": model_used,
         "messages": messages,

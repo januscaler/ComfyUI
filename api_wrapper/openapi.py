@@ -331,7 +331,11 @@ def _prompt_preview_operation(workflow_name, task_name, task):
                        "send the result back to /generate as 'raw_prompt' to render it verbatim. "
                        f"{task_note} Whichever image you attach also gives the model visual "
                        "context. Accepts multipart, form-urlencoded or JSON. Requires "
-                       "MIMO_API_KEY.",
+                       "MIMO_API_KEY.\n\n"
+                       "Expect 10-20 s: this is one call to a large model, not a lookup. Give your "
+                       "client at least 60 s -- a short timeout aborts mid-flight and is easy to "
+                       "misread as the endpoint not existing. The server's own cap on the model "
+                       "call is MIMO_TIMEOUT (120 s by default).",
         "operationId": "previewPrompt" + "".join(
             part.capitalize()
             for part in f"{workflow_name}_{task_name or ''}".replace("-", "_").split("_")),
