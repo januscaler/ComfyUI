@@ -6,7 +6,8 @@ dedicated synchronous endpoint that returns the final artifact (image, video,
 audio, 3D asset, ...) as a downloadable file:
 - POST   /wrapper/{workflow}/generate    (also /api/wrapper/{workflow}/generate)
 - POST   /wrapper/{workflow}/{task}/generate
-- POST   /wrapper/{workflow}/{task}/prompt   (LLM prompt rewrite only, no render)
+- POST   /wrapper/{workflow}/prompt          (free prompt -> generated prompt, no render)
+- POST   /wrapper/{workflow}/{task}/prompt   (same, with the task pinned)
 - GET    /wrapper/workflows
 - GET    /wrapper/jobs/{job_id}          (also /api/wrapper/jobs/{job_id})
 - GET    /wrapper/jobs/{job_id}/image
@@ -17,6 +18,8 @@ audio, 3D asset, ...) as a downloadable file:
 
 import asyncio
 import gc
+import json
+import logging
 import os
 import random
 import time
@@ -212,7 +215,9 @@ async def _rewrite_prompt(task_name, fields, build_kwargs, upload_refs):
     caller did not supply ``raw_prompt``. The rewriter needs the job it is
     writing for -- mode, duration, canvas, which reference labels exist -- so
     this runs after the setup has resolved those, with build_kwargs already
-    populated. Returns (prompt, note)."""
+    populated. Returns (prompt, note, record) where ``record`` is the
+    provenance of the rewrite, kept so it can be logged and saved next to the
+    finished video."""
     intent = build_kwargs["prompt"]
     context_ref = None
     for name in ("llm_image", "image", "ref_images"):
@@ -244,7 +249,48 @@ async def _rewrite_prompt(task_name, fields, build_kwargs, upload_refs):
     note = f"prompt rewritten for {mode} by {model_used}"
     if context_ref and not upload_refs.get("llm_image"):
         note += " using the uploaded image as visual context"
-    return prompt, note
+    record = {
+        "source": model_used,
+        "mode": mode,
+        "input_prompt": intent,
+        "prompt": prompt,
+        "context_image": context_ref,
+        "reference_counts": reference_counts,
+    }
+    return prompt, note, record
+
+
+def _log_prompt_record(record, job_id, workflow_name, task_name):
+    """Print the prompt a job is about to run with, in full.
+
+    The H3 prompt is generated, not supplied, so without this there is no way
+    to see what the model was actually told -- and no way to reproduce a good
+    result. Logged before the job is queued so it survives a crashed render.
+    """
+    logging.info(
+        "%s/%s prompt for job %s (%s, via %s):\n%s",
+        workflow_name, task_name, job_id, record["mode"], record["source"], record["prompt"])
+    if record.get("input_prompt") and record["input_prompt"] != record["prompt"]:
+        logging.info("  rewritten from: %s", record["input_prompt"])
+
+
+def _save_prompt_record(output_path, record):
+    """Write the prompt next to the artifact it produced, as a sidecar JSON.
+
+    The rendered video carries no readable record of the generated prompt, so
+    a `<video>.prompt.json` alongside it keeps the two together on disk: what
+    was asked for, what the model wrote, and the settings it was written
+    against. Returns the path, or None if it could not be written -- a failure
+    here must never lose the caller their finished video.
+    """
+    path = os.path.splitext(output_path)[0] + ".prompt.json"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        logging.warning("Could not write prompt record %s: %s", path, e)
+        return None
+    return path
 
 
 def _error_response(message, details="", missing=None, status=400):
@@ -629,12 +675,19 @@ def register_wrapper_routes(routes, prompt_server):
             build_kwargs[param] = refs if upload_spec[name]["max"] != 1 else refs[0]
         build_kwargs["filename_prefix"] = f"wrapper/{workflow_name}"
 
+        prompt_record = None
         if task.get("prompt_rewrite"):
             if raw_prompt:
                 note = _append_note(note, "raw_prompt used verbatim; no LLM rewrite")
+                prompt_record = {"source": "raw_prompt", "input_prompt": None,
+                                 "prompt": raw_prompt,
+                                 "mode": prompt_rewriter.detect_mode(
+                                     task_name,
+                                     has_first_frame=bool(build_kwargs.get("first_frame")),
+                                     has_last_frame=bool(build_kwargs.get("last_frame")))}
             else:
                 try:
-                    build_kwargs["prompt"], rewrite_note = await _rewrite_prompt(
+                    build_kwargs["prompt"], rewrite_note, prompt_record = await _rewrite_prompt(
                         task_name, fields, build_kwargs, upload_refs)
                 except prompt_rewriter.RewriteError as e:
                     return _error_response(e.message, e.details, status=e.status)
@@ -642,6 +695,18 @@ def register_wrapper_routes(routes, prompt_server):
 
         prompt_id = str(uuid.uuid4())
         graph = task["build"](**build_kwargs)
+
+        if prompt_record is not None:
+            prompt_record.update({
+                "job_id": prompt_id, "workflow": workflow_name, "task": task_name,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "settings": {k: build_kwargs[k] for k in
+                             ("width", "height", "duration", "steps", "scheduler", "seed")
+                             if k in build_kwargs},
+                "models": [v for k, v in sorted(build_kwargs.items())
+                           if k.endswith("_name") and isinstance(v, str)],
+            })
+            _log_prompt_record(prompt_record, prompt_id, workflow_name, task_name)
 
         valid = await execution.validate_prompt(prompt_id, graph, None)
         if not valid[0]:
@@ -725,30 +790,53 @@ def register_wrapper_routes(routes, prompt_server):
         # which checkpoints actually ran (the setup may substitute a variant
         # already on disk) and any advisory note is the headers.
         headers.update(_resolution_headers(build_kwargs, note))
+        if prompt_record is not None:
+            record_path = _save_prompt_record(first, prompt_record)
+            if record_path:
+                headers["X-Wrapper-Prompt-File"] = _header_value(
+                    os.path.relpath(record_path, folder_paths.get_output_directory()))
         return web.FileResponse(first, headers=headers)
 
     @routes.post("/wrapper/{workflow}/{task}/prompt")
+    @routes.post("/wrapper/{workflow}/prompt")
     async def preview_prompt(request):
-        """Run only the prompt rewrite and return the H3 prompt as JSON.
+        """Turn a free-form prompt into the workflow's real prompt format, and
+        return it as JSON.
 
         Iterating on a prompt through /generate costs a full video render, so
         this exposes the rewrite on its own: same form fields, no GPU work, no
         model downloads. Feed the result back as 'raw_prompt' once it reads the
-        way you want."""
+        way you want. The task in the path is optional -- without it the task
+        is inferred from whatever assets you attach, so the simplest possible
+        call is a prompt and nothing else."""
         workflow_name = request.match_info["workflow"].lower()
-        task_name = request.match_info["task"]
+        task_name = request.match_info.get("task")
         workflow = wrapper_workflows.WORKFLOWS.get(workflow_name) or {}
-        task = (workflow.get("tasks") or {}).get(task_name)
-        if task is None or not task.get("prompt_rewrite"):
-            return _error_response(
-                "Unknown prompt endpoint",
-                "Prompt rewriting is only available on workflow tasks that declare it, "
-                "e.g. /api/wrapper/minimaxh3/{text,image,reference}/prompt.", status=404)
+        tasks = workflow.get("tasks") or {}
 
         try:
             fields, uploads = await _read_body(request)
         except ValueError as e:
             return _error_response("Invalid request body", str(e))
+
+        if task_name is None:
+            # Same rule the H3 modes follow: reference assets mean ref2va, a
+            # keyframe means image-to-video, neither means text-to-video.
+            if any(uploads.get(name) for name in
+                   ("ref_images", "ref_videos", "ref_video_audios", "ref_audios")):
+                task_name = "reference"
+            elif uploads.get("image") or uploads.get("last_frame"):
+                task_name = "image"
+            else:
+                task_name = "text"
+        task = tasks.get(task_name)
+        if task is None or not task.get("prompt_rewrite"):
+            available = sorted(n for n, t in tasks.items() if t.get("prompt_rewrite"))
+            return _error_response(
+                "Unknown prompt endpoint",
+                "Prompt rewriting is only available on workflow tasks that declare it"
+                + (f"; {workflow_name} supports: {', '.join(available)}." if available else
+                   ", e.g. /api/wrapper/minimaxh3/prompt."), status=404)
 
         intent = fields.get("prompt", "").strip()
         if not intent:
@@ -809,6 +897,7 @@ def register_wrapper_routes(routes, prompt_server):
         return web.json_response({
             "prompt": prompt,
             "model": model_used,
+            "task": task_name,
             "mode": mode,
             "width": width,
             "height": height,

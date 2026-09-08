@@ -66,6 +66,7 @@ WRAPPER_OPENAPI_SPEC = {
                             "X-Wrapper-Settings": {"schema": {"type": "string"}, "description": "The resolved width/height/duration/steps/scheduler after clamping and rounding."},
                             "X-Wrapper-Note": {"schema": {"type": "string"}, "description": "Advisory note from the setup (model substitution, canvas downscale, ...). Absent when there is nothing to report."},
                             "X-Wrapper-Job-Id": {"schema": {"type": "string", "format": "uuid"}, "description": "Id of the job that produced this file; usable with /api/wrapper/jobs/{job_id}."},
+                            "X-Wrapper-Prompt-File": {"schema": {"type": "string"}, "description": "Output-directory path of the sidecar JSON saved next to the artifact, recording the prompt that generated it: the free-form input, the prompt the LLM wrote from it (or the raw_prompt used verbatim), the model, the H3 mode and the settings. The same prompt is also written to the server log. Present only on workflows whose prompts are generated."},
                         },
                         "content": {
                             "image/png": {"schema": {"type": "string", "format": "binary"}},
@@ -312,17 +313,26 @@ def _prompt_preview_operation(workflow_name, task_name, task):
                 "description": f"Optional ({upload_spec['ext']}). Only its presence and count matter "
                                "here: they tell the rewriter which mode and reference labels the real "
                                "generation will use."}
+    task_note = (
+        "The task is inferred from what you attach: reference assets mean ref2va, a first/last "
+        "frame means image-to-video, and nothing attached means text-to-video -- so a prompt on "
+        "its own is a complete request. Use /{task}/prompt to pin one explicitly."
+        if task_name is None else
+        f"Fixed to the {task_name} task; the H3 input mode still follows which frames you attach.")
     return {
-        "summary": f"Preview the rewritten prompt for {workflow_name}/{task_name}",
+        "summary": (f"Turn a free-form prompt into a {workflow_name} prompt"
+                    if task_name is None else
+                    f"Preview the rewritten prompt for {workflow_name}/{task_name}"),
         "description": "Runs only the LLM prompt rewrite and returns the result as JSON -- no GPU "
                        "work, no model downloads, no video. Iterating on a prompt through "
                        "/generate costs a full render, so use this to get the wording right, then "
                        "send the result back to /generate as 'raw_prompt' to render it verbatim. "
-                       "Uploads behave the same as on /generate: whichever image you attach gives "
-                       "the model visual context, and the presence of first/last frames or "
-                       "reference assets selects the H3 input mode. Requires MIMO_API_KEY.",
+                       f"{task_note} Whichever image you attach also gives the model visual "
+                       "context. Accepts multipart, form-urlencoded or JSON. Requires "
+                       "MIMO_API_KEY.",
         "operationId": "previewPrompt" + "".join(
-            part.capitalize() for part in f"{workflow_name}_{task_name}".replace("-", "_").split("_")),
+            part.capitalize()
+            for part in f"{workflow_name}_{task_name or ''}".replace("-", "_").split("_")),
         "requestBody": {
             "required": True,
             "content": {"multipart/form-data": {"schema": {
@@ -351,10 +361,19 @@ def spec_with_workflows(workflows):
     template = paths.pop("/api/wrapper/{workflow}/generate")
     template_operation = template["post"]
     for name, workflow in workflows.items():
-        for task_name, task in (workflow.get("tasks") or {}).items():
-            if task.get("prompt_rewrite"):
-                paths[f"/api/wrapper/{name}/{task_name}/prompt"] = {
-                    "post": _prompt_preview_operation(name, task_name, task)}
+        rewriting = [(t_name, t) for t_name, t in (workflow.get("tasks") or {}).items()
+                     if t.get("prompt_rewrite")]
+        for task_name, task in rewriting:
+            paths[f"/api/wrapper/{name}/{task_name}/prompt"] = {
+                "post": _prompt_preview_operation(name, task_name, task)}
+        if rewriting:
+            # Task-less alias: the task is inferred from the attached assets,
+            # so turning a free-form idea into a prompt needs nothing but text.
+            merged = dict(rewriting[0][1])
+            merged["uploads"] = {k: v for _, t in rewriting
+                                 for k, v in (t.get("uploads") or {}).items()}
+            paths[f"/api/wrapper/{name}/prompt"] = {
+                "post": _prompt_preview_operation(name, None, merged)}
         tasks = workflow.get("tasks")
         if tasks:
             for task_name, task in tasks.items():

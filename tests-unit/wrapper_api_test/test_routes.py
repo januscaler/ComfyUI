@@ -230,8 +230,12 @@ class TestPromptRewriteHook(unittest.TestCase):
             task_name, fields or {}, base, upload_refs))
 
     def test_image_task_reports_i2va_and_grounds_on_the_first_frame(self):
-        prompt, note = self._run("image", {"first_frame": "wrapper/a.png"},
-                                 {"image": ["wrapper/a.png"]})
+        prompt, note, record = self._run("image", {"first_frame": "wrapper/a.png"},
+                                         {"image": ["wrapper/a.png"]})
+        self.assertEqual(record["prompt"], "REWRITTEN")
+        self.assertEqual(record["source"], "mimo-v2.5-pro")
+        self.assertEqual(record["mode"], "I2VA")
+        self.assertEqual(record["input_prompt"], "a wrestler chokeslams another")
         self.assertEqual(prompt, "REWRITTEN")
         call = self.calls[0]
         self.assertEqual(call["mode"], "I2VA")
@@ -250,7 +254,8 @@ class TestPromptRewriteHook(unittest.TestCase):
         self.assertIn("wrapper/ctx.png", call["image"])
 
     def test_text_task_without_uploads_sends_no_image(self):
-        _, note = self._run("text", {}, {})
+        _, note, record = self._run("text", {}, {})
+        self.assertIsNone(record["context_image"])
         call = self.calls[0]
         self.assertEqual(call["mode"], "T2VA")
         self.assertIsNone(call["image"])
@@ -272,6 +277,72 @@ class TestPromptRewriteHook(unittest.TestCase):
     def test_llm_model_field_is_forwarded(self):
         self._run("text", {}, {}, fields={"llm_model": "mimo-v2.5"})
         self.assertEqual(self.calls[0]["model"], "mimo-v2.5")
+
+
+class TestPromptRecord(unittest.TestCase):
+    """The H3 prompt is generated rather than supplied, so the only record of
+    what a video was actually made from is the one the wrapper writes."""
+
+    def setUp(self):
+        import folder_paths
+
+        self.video = os.path.join(folder_paths.get_output_directory(), "wrapper", "record_test.mp4")
+        os.makedirs(os.path.dirname(self.video), exist_ok=True)
+        with open(self.video, "wb") as f:
+            f.write(b"MP4")
+        self.sidecar = os.path.splitext(self.video)[0] + ".prompt.json"
+
+    def tearDown(self):
+        for path in (self.video, self.sidecar):
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_sidecar_lands_next_to_the_video_and_round_trips(self):
+        import json
+
+        record = {"source": "mimo-v2.5", "mode": "I2VA", "job_id": "abc",
+                  "input_prompt": "two wrestlers", "prompt": "integrated_multimodal_description: ...",
+                  "settings": {"width": 864, "duration": 5.17}}
+        path = wrapper_routes._save_prompt_record(self.video, record)
+        self.assertEqual(path, self.sidecar)
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), record)
+
+    def test_non_ascii_prompt_survives(self):
+        """H3 keeps dialogue in its original language, so the record must not
+        be ascii-escaped into something unreadable."""
+        import json
+
+        record = {"prompt": '一个男人说: <d>[Chinese] 我们走吧。</d>', "source": "mimo-v2.5"}
+        with open(wrapper_routes._save_prompt_record(self.video, record), encoding="utf-8") as f:
+            self.assertIn("我们走吧", f.read())
+        with open(self.sidecar, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["prompt"], record["prompt"])
+
+    def test_unwritable_target_does_not_lose_the_video(self):
+        missing = os.path.join(self.video, "no", "such", "dir", "x.mp4")
+        self.assertIsNone(wrapper_routes._save_prompt_record(missing, {"prompt": "x"}))
+
+    def test_logging_includes_the_generated_prompt(self):
+        record = {"source": "mimo-v2.5", "mode": "Ref2VA",
+                  "input_prompt": "a cat", "prompt": "THE GENERATED H3 PROMPT"}
+        with self.assertLogs(level="INFO") as logs:
+            wrapper_routes._log_prompt_record(record, "job-1", "minimaxh3", "reference")
+        joined = "\n".join(logs.output)
+        self.assertIn("THE GENERATED H3 PROMPT", joined)
+        self.assertIn("mimo-v2.5", joined)
+        self.assertIn("Ref2VA", joined)
+        self.assertIn("job-1", joined)
+        self.assertIn("a cat", joined)
+
+    def test_verbatim_raw_prompt_is_not_logged_as_a_rewrite(self):
+        record = {"source": "raw_prompt", "mode": "I2VA",
+                  "input_prompt": None, "prompt": "MY OWN PROMPT"}
+        with self.assertLogs(level="INFO") as logs:
+            wrapper_routes._log_prompt_record(record, "job-2", "minimaxh3", "image")
+        joined = "\n".join(logs.output)
+        self.assertIn("MY OWN PROMPT", joined)
+        self.assertNotIn("rewritten from", joined)
 
 
 if __name__ == "__main__":

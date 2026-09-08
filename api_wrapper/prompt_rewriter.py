@@ -341,5 +341,6 @@ async def rewrite(*, intent, mode, duration, frames, width, height,
         raise RewriteError("The prompt-rewriting model returned an empty prompt",
                            f"model={model_used}; try again or send 'raw_prompt' instead.",
                            status=502)
-    logging.info("MiniMax H3 prompt rewritten by %s (%s, %d chars)", model_used, mode, len(prompt))
+    logging.info("H3 prompt written by %s for %s (%d chars) from: %s",
+                 model_used, mode, len(prompt), intent.strip().replace("\n", " ")[:200])
     return prompt, model_used

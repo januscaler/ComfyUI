@@ -108,7 +108,14 @@ curl -o result.png -X POST http://127.0.0.1:8188/api/wrapper/flux2klein9b/genera
 - `raw_prompt` — a ready-made H3 prompt, used verbatim. Skips the rewrite entirely and needs no API key, so existing callers keep working by renaming `prompt` to `raw_prompt`.
 - `llm_image` — an image given to the rewriter as visual context, so it describes what is actually in your footage. It never reaches H3 itself. When omitted, the task's own first image (the `image` first frame, or `ref_images` #1) is used, so image- and reference-driven jobs get visual grounding for free.
 - `llm_model` — `auto` (default) routes image-bearing rewrites to `mimo-v2.5`, the omnimodal build, and text-only ones to `mimo-v2.5-pro`. Override to pin one.
-- `POST /api/wrapper/minimaxh3/{task}/prompt` returns just the rewritten prompt as JSON — no GPU work, no render. Iterate there, then send the result back to `/generate` as `raw_prompt`. Accepts multipart, form-urlencoded or JSON.
+- `POST /api/wrapper/minimaxh3/prompt` turns a free-form prompt into an H3 prompt and returns it as JSON — no GPU work, no render. The task is inferred from what you attach (reference assets → ref2va, a keyframe → image-to-video, nothing → text-to-video), so a prompt on its own is a complete request; `POST /api/wrapper/minimaxh3/{task}/prompt` pins one. Iterate there, then send the result back to `/generate` as `raw_prompt`. Accepts multipart, form-urlencoded or JSON.
+
+```bash
+curl -s -X POST http://127.0.0.1:8188/api/wrapper/minimaxh3/prompt \
+  -d 'prompt=two wrestlers in a gym, one chokeslams the other onto a crash mat, heavy metal soundtrack'
+```
+
+**Generated prompts are recorded.** Because the H3 prompt is written by a model rather than supplied, every generation logs the full prompt it ran with to the server log (job id, mode, model, and the free-form input it came from), and saves a `<video>.prompt.json` sidecar next to the output — input prompt, generated prompt, model, mode, settings and checkpoints. The `X-Wrapper-Prompt-File` response header gives its path. `raw_prompt` runs are recorded the same way, marked `"source": "raw_prompt"`, so every video in the output directory can be traced back to the exact prompt that made it.
 
 **MiniMax H3 memory limits:** H3's four checkpoints total ~43 GB (21 GB UNET + 16 GB text encoder + 5.8 GB VAEs), so on a 32 GB RAM box every job runs within ~2 GB of the ceiling and an over-large request does not fail gracefully — it OOM-kills the server and takes the queue with it. The wrapper therefore checks clip length and canvas×frames *before* queueing and returns a 400 for anything past the host's envelope. Frame count is the limit that bites: the video VAE tiles spatially but not temporally, so a longer clip costs far more memory than a wider one and no resolution is small enough to compensate. Defaults (`864x480`, 5.17 s, 20 steps, `int8`) are the largest values measured to complete with memory to spare on a 32 GB RTX 5090; raise `COMFY_MINIMAX_H3_MAX_FRAMES` / `COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES` on a host with more RAM, swap, or running with `--fast-disk`. See `.env.example` for the deployment side.
 
