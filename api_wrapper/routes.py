@@ -444,6 +444,24 @@ async def _setup_ideogram4(fields, downloaded):
     }, note
 
 
+async def _setup_flux2klein9b_edit(fields, downloaded):
+    """Model setup for the FLUX.2 [klein] 9B image edit: the shared model
+    setup, plus an optional output canvas (both width and height, or neither)."""
+    build_kwargs, note = await _setup_flux2klein9b(fields, downloaded)
+    if "width" in fields or "height" in fields:
+        try:
+            width = int(fields["width"])
+            height = int(fields["height"])
+        except (KeyError, ValueError):
+            raise _SetupError("Invalid parameter value",
+                              "width and height must be sent together, as numbers.") from None
+        if not 256 <= width <= 8192 or not 256 <= height <= 8192:
+            raise _SetupError("Invalid size", "width/height must be between 256 and 8192.")
+        build_kwargs["width"] = width
+        build_kwargs["height"] = height
+    return build_kwargs, note
+
+
 async def _setup_flux2klein9b_txt2img(fields, downloaded):
     """Model setup for the FLUX.2 [klein] 9B text-to-image workflow: same
     models as the image-edit variant, plus width/height validation."""
@@ -550,7 +568,7 @@ async def _setup_minimax_h3_reference(fields, downloaded):
     return await _setup_minimax_h3(fields, downloaded, ref2va=True)
 
 
-_WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b,
+_WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "flux2klein9b-txt2img": _setup_flux2klein9b_txt2img,
                     "ideogram4": _setup_ideogram4,
                     "minimaxh3": {"text": _setup_minimax_h3_text,
@@ -618,8 +636,11 @@ def register_wrapper_routes(routes, prompt_server):
                         "Send 'prompt' (plain description of the video you want, rewritten into an "
                         "H3 prompt by the LLM) or 'raw_prompt' (a ready-made H3 prompt).")
             return _error_response("No prompt provided", required)
-        if task.get("requires_image") and not uploads.get("image"):
-            return _error_response("No image provided", "The 'image' form field with the input image is required.")
+        image_fields = task.get("image_fields", ["image"])
+        if task.get("requires_image") and not any(uploads.get(name) for name in image_fields):
+            return _error_response(
+                "No image provided",
+                f"Send the input image in {' or '.join(repr(name) for name in image_fields)}.")
 
         try:
             seed = int(fields["seed"]) if "seed" in fields else random.randrange(0, 2 ** 64)
