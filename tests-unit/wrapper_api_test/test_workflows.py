@@ -152,7 +152,7 @@ class TestWorkflowRegistry(unittest.TestCase):
         self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_images"]["max"], 3)
         self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_videos"]["max"], 1)
         self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_video_audios"]["max"], 1)
-        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_audios"]["max"], 2)
+        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_audios"]["max"], 3)
 
     def test_klein_txt2img_registered(self):
         from api_wrapper import workflows as workflows_module
@@ -363,6 +363,19 @@ class TestMiniMaxH3Graph(unittest.TestCase):
             self.assertEqual(graph[scale]["inputs"]["crop"], "center")
             self.assertEqual((graph[scale]["inputs"]["width"], graph[scale]["inputs"]["height"]),
                              (graph["6"]["inputs"]["width"], graph["6"]["inputs"]["height"]))
+
+    def test_reference_to_video_takes_three_voices(self):
+        # A cast of three speakers, each with its voice-timbre clip: the node's
+        # own limit, and what Flow sends once its cap is raised to match.
+        graph = wrapper_workflows.build_minimax_h3_reference_to_video(
+            prompt="<Audio 1> <Audio 2> <Audio 3>",
+            ref_audios=["wrapper/a1.wav", "wrapper/a2.wav", "wrapper/a3.wav"])
+        audios = sorted(k for k in graph["6"]["inputs"] if k.startswith("ref_audios."))
+        self.assertEqual(audios, ["ref_audios.ref_audio_0", "ref_audios.ref_audio_1",
+                                  "ref_audios.ref_audio_2"])
+        for key in audios:
+            node = graph[graph["6"]["inputs"][key][0]]
+            self.assertEqual(node["class_type"], "LoadAudio")
 
     def test_reference_to_video_wires_refs(self):
         graph = wrapper_workflows.build_minimax_h3_reference_to_video(

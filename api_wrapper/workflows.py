@@ -817,7 +817,9 @@ WORKFLOWS = {
                 "uploads": {"ref_images": {"ext": "image", "max": 3},
                              "ref_videos": {"ext": "video", "max": 1},
                              "ref_video_audios": {"ext": "audio", "max": 1},
-                             "ref_audios": {"ext": "audio", "max": 2},
+                             # The node's own limit: three voice-timbre clips (a
+                             # cast of speakers, or two and the scene's sound).
+                             "ref_audios": {"ext": "audio", "max": 3},
                              # Pinned first / last frame (keyframe completion).
                              "image": {"ext": "image", "max": 1},
                              "last_frame": {"ext": "image", "max": 1},
