@@ -526,10 +526,21 @@ def build_minimax_h3_image_to_video(*, prompt, seed=0, steps=MINIMAX_H3_DEFAULT_
     cond_inputs = {}
     loader_nodes = {}
     next_id = 7
+    loaded = []
     for input_name, ref in (("first_frame", first_frame), ("last_frame", last_frame)):
         if ref is None:
             continue
         loader_nodes[str(next_id)] = {"class_type": "LoadImage", "inputs": {"image": ref}}
+        loaded.append((input_name, str(next_id)))
+        next_id += 1
+    for input_name, loader in loaded:
+        # Cover-crop to the canvas first. The node stretches a first frame to
+        # fit (and cover-crops a last one), so an off-aspect still — a 3:4
+        # photo in a 9:16 film, a 1:1 edit — squashed every face in the shot,
+        # and a pair from one source warped differently at each end.
+        loader_nodes[str(next_id)] = {"class_type": "ImageScale", "inputs": {
+            "image": [loader, 0], "upscale_method": "lanczos",
+            "width": width, "height": height, "crop": "center"}}
         cond_inputs[input_name] = [str(next_id), 0]
         next_id += 1
     return _minimax_h3_cond_and_tail(prompt, width, height, minimax_h3_length(duration),

@@ -148,6 +148,41 @@ def _header_value(text):
     return collapsed.encode("latin-1", "replace").decode("latin-1")
 
 
+#: What each recent job was actually rendered with, by job id: returned with an
+#: async submit's 504 and on /wrapper/jobs/{id}, because a caller that polls
+#: never sees the X-Wrapper-* headers of a synchronous reply. Bounded; the
+#: newest jobs win.
+_PROVENANCE: dict = {}
+_PROVENANCE_MAX = 512
+
+
+def _job_provenance(build_kwargs, note, prompt_record):
+    """The seed, checkpoint files, settings and prompt one job runs with."""
+    order = lambda key: (0 if "unet" in key else 1, key)
+    provenance = {
+        "seed": build_kwargs.get("seed"),
+        "models": [str(v) for k, v in sorted(build_kwargs.items(), key=lambda kv: order(kv[0]))
+                   if k.endswith("_name") and isinstance(v, str)],
+        "settings": {k: build_kwargs[k] for k in
+                     ("width", "height", "duration", "steps", "scheduler", "cfg", "megapixels")
+                     if k in build_kwargs},
+        "note": note,
+    }
+    if prompt_record is not None:
+        provenance["prompt_source"] = prompt_record.get("source")
+        provenance["mode"] = prompt_record.get("mode")
+        # A rewritten prompt exists nowhere else once the job's files are cleaned up.
+        if prompt_record.get("source") != "raw_prompt":
+            provenance["prompt"] = build_kwargs.get("prompt")
+    return provenance
+
+
+def _remember_provenance(job_id, provenance):
+    _PROVENANCE[job_id] = provenance
+    while len(_PROVENANCE) > _PROVENANCE_MAX:
+        _PROVENANCE.pop(next(iter(_PROVENANCE)))
+
+
 def _resolution_headers(build_kwargs, note):
     """Report what the setup actually resolved: the checkpoint file names it
     picked, the canvas/length it settled on, and any advisory note."""
@@ -159,7 +194,7 @@ def _resolution_headers(build_kwargs, note):
               if k.endswith("_name") and isinstance(v, str)]
     if models:
         headers["X-Wrapper-Models"] = _header_value(", ".join(models))
-    settings = [f"{k}={build_kwargs[k]}" for k in ("width", "height", "duration", "steps", "scheduler")
+    settings = [f"{k}={build_kwargs[k]}" for k in ("width", "height", "duration", "steps", "scheduler", "seed")
                 if k in build_kwargs]
     if settings:
         headers["X-Wrapper-Settings"] = _header_value(" ".join(settings))
@@ -753,6 +788,8 @@ def register_wrapper_routes(routes, prompt_server):
         valid = await execution.validate_prompt(prompt_id, graph, None)
         if not valid[0]:
             return _error_response("Workflow validation failed", str(valid[1]))
+        provenance = _job_provenance({**build_kwargs, "seed": seed}, note, prompt_record)
+        _remember_provenance(prompt_id, provenance)
 
         extra_data = {"create_time": int(time.time() * 1000)}
 
@@ -805,6 +842,8 @@ def register_wrapper_routes(routes, prompt_server):
                     "extra_info": {},
                 },
                 "job_id": prompt_id,
+                # The caller will poll rather than get this reply's headers.
+                "provenance": provenance,
             }, status=504 if timeout is not None else 500)
         status = history_entry.get("status") or {}
         status_str = status.get("status_str") if isinstance(status, dict) else status
@@ -984,6 +1023,8 @@ def register_wrapper_routes(routes, prompt_server):
                 image["filename"], image.get("subfolder", ""), image.get("type", "output")
             )
         job["images"] = images
+        if job_id in _PROVENANCE:
+            job["provenance"] = _PROVENANCE[job_id]  # additive, like progress
         # Additive: callers that predate it ignore the field. See api_wrapper/progress.py.
         progress = wrapper_progress.job_progress(job_id, job.get("status"), get_progress_state(), queued)
         if progress is not None:

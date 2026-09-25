@@ -352,8 +352,15 @@ class TestMiniMaxH3Graph(unittest.TestCase):
             prompt="x", first_frame="wrapper/a.png", last_frame="wrapper/b.png")
         self.assertEqual(graph["7"]["class_type"], "LoadImage")
         self.assertEqual(graph["8"]["class_type"], "LoadImage")
-        self.assertEqual(graph["6"]["inputs"]["first_frame"], ["7", 0])
-        self.assertEqual(graph["6"]["inputs"]["last_frame"], ["8", 0])
+        # each frame is cover-cropped to the canvas before the node sees it
+        self.assertEqual(graph["6"]["inputs"]["first_frame"], ["9", 0])
+        self.assertEqual(graph["6"]["inputs"]["last_frame"], ["10", 0])
+        for scale, loader in (("9", "7"), ("10", "8")):
+            self.assertEqual(graph[scale]["class_type"], "ImageScale")
+            self.assertEqual(graph[scale]["inputs"]["image"], [loader, 0])
+            self.assertEqual(graph[scale]["inputs"]["crop"], "center")
+            self.assertEqual((graph[scale]["inputs"]["width"], graph[scale]["inputs"]["height"]),
+                             (graph["6"]["inputs"]["width"], graph["6"]["inputs"]["height"]))
 
     def test_reference_to_video_wires_refs(self):
         graph = wrapper_workflows.build_minimax_h3_reference_to_video(
