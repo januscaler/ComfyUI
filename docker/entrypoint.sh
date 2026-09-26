@@ -5,7 +5,10 @@
 #   - a local GPU box through docker-compose.yml (bind mounts for models/ etc.);
 #   - an on-demand RunPod pod started by voxmin-backend, where RunPod mounts the
 #     pod's network volume at /workspace and runs the image's own CMD (there is
-#     no compose file), so everything a pod needs is decided here from env.
+#     no compose file), so everything a pod needs is decided here from env;
+#   - an on-demand vast.ai pod (full image), which has no shared volume and no
+#     HTTPS proxy: it copies the weights from a bucket onto its own disk and is
+#     reached through a Cloudflare tunnel (see "vast.ai pods" below).
 #
 # The runpod variant (COMFY_IMAGE_VARIANT=runpod) ships without torch and the
 # pip requirements: the first pod on a network volume builds them into a
@@ -356,6 +359,79 @@ if [[ "${1:-}" == "prefetch" ]]; then
 fi
 if [[ $# -gt 0 && "$1" != -* ]]; then
 	exec "$@"
+fi
+
+# --- vast.ai pods: tunnel and model weights ----------------------------------
+# A vast.ai pod has no network volume and no HTTPS proxy. voxmin-backend starts
+# it with COMFYUI_DATA_DIR=/workspace on the container disk and:
+#   CF_TUNNEL_TOKEN            token of the pod's own remotely-managed Cloudflare
+#                              tunnel, whose ingress routes the pod's hostname to
+#                              http://127.0.0.1:8188; cloudflared runs beside
+#                              ComfyUI and is restarted with backoff if it exits
+#   COMFY_MODELS_S3_BUCKET     (+ _ENDPOINT, _PREFIX, _INCLUDE, AWS_ACCESS_KEY_ID,
+#                              AWS_SECRET_ACCESS_KEY) the weights are copied from
+#                              this bucket into the models dir before ComfyUI
+#                              starts: docker/s3_models_sync.py
+#   COMFY_MODELS_PREFETCH=1    without a bucket: fetch the wrapper's default
+#                              checkpoints from Hugging Face first (`prefetch`)
+# A failed sync or prefetch exits non-zero: a pod that never becomes ready is
+# recycled by the backend. Server mode only, and with none of these set nothing
+# here runs (RunPod pods, the local box).
+#
+# The tunnel token reaches cloudflared as TUNNEL_TOKEN, not argv, so `ps` never
+# shows it, and it is masked in anything cloudflared prints. Its /ready metrics
+# endpoint answers 200 once an edge connection is registered.
+TUNNEL_METRICS=127.0.0.1:20241
+start_tunnel() {
+	local token=$CF_TUNNEL_TOKEN
+	(
+		delay=1
+		while :; do
+			started=$SECONDS
+			if TUNNEL_TOKEN=$token cloudflared tunnel --no-autoupdate --metrics "$TUNNEL_METRICS" run 2>&1 |
+				while IFS= read -r line; do echo "cloudflared: ${line//"$token"/***}" >&2; done; then
+				status=0
+			else
+				status=$?
+			fi
+			# A run that stayed up for a while starts the backoff over.
+			((SECONDS - started < 60)) || delay=1
+			log "cloudflared exited (status $status); restarting in ${delay}s"
+			sleep "$delay"
+			delay=$((delay * 2 > 60 ? 60 : delay * 2))
+		done
+	) &
+	(
+		deadline=$((SECONDS + 300))
+		while ((SECONDS < deadline)); do
+			if python -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2)' "http://$TUNNEL_METRICS/ready" 2>/dev/null; then
+				log "tunnel ready: cloudflared registered an edge connection (${SECONDS}s after container start)"
+				exit 0
+			fi
+			sleep 1
+		done
+		log "WARNING: the tunnel is still not ready after 300s; see the cloudflared: lines"
+	) &
+}
+
+if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+	if ! command -v cloudflared >/dev/null; then
+		log "ERROR: CF_TUNNEL_TOKEN is set but cloudflared is not installed (the full image, shivanshtalwar0/comfyui:latest, ships it)"
+		exit 1
+	fi
+	log "starting the cloudflared tunnel"
+	start_tunnel
+fi
+if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then
+	if ! python "$COMFY_ROOT/docker/s3_models_sync.py" "$COMFY_ROOT/models"; then
+		log "ERROR: copying the models from s3://$COMFY_MODELS_S3_BUCKET failed; not starting ComfyUI"
+		exit 1
+	fi
+elif [[ -n "${COMFY_MODELS_PREFETCH:-}" && "$COMFY_MODELS_PREFETCH" != 0 ]]; then
+	if ! python "$COMFY_ROOT/docker/prefetch_models.py"; then
+		log "ERROR: prefetching the models failed; not starting ComfyUI"
+		exit 1
+	fi
 fi
 
 # --- ComfyUI server ---------------------------------------------------------

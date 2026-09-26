@@ -14,6 +14,7 @@ onto the volume.
 
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -382,6 +383,142 @@ class TestRunpodBootstrap(unittest.TestCase):
         self.assertNotEqual(result.stdout, other.stdout, "another torch index is another env")
 
 
+class TestVastTools(unittest.TestCase):
+    """cloudflared and s5cmd: pinned release binaries, checksummed, in the full image only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stages = dockerfile_stages(read("Dockerfile"))
+        cls.tools = cls.stages["tools"][1]
+
+    def test_pinned_and_checksummed(self):
+        self.assertEqual(self.stages["tools"][0], "${BASE_IMAGE}")
+        for name, version in (("CLOUDFLARED", r"\d{4}\.\d+\.\d+"), ("S5CMD", r"\d+\.\d+\.\d+")):
+            self.assertRegex(self.tools, rf"(?m)^ARG {name}_VERSION={version}$")
+            self.assertRegex(self.tools, rf"(?m)^ARG {name}_SHA256=[0-9a-f]{{64}}$")
+        self.assertIn("https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64", self.tools)
+        self.assertIn("https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz", self.tools)
+        cloudflared_check = self.tools.index('echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c -')
+        s5cmd_check = self.tools.index('echo "${S5CMD_SHA256}  /tmp/s5cmd.tar.gz" | sha256sum -c -')
+        self.assertLess(s5cmd_check, self.tools.index("tar -xzf /tmp/s5cmd.tar.gz"), "checked before it is unpacked")
+        self.assertLess(cloudflared_check, self.tools.index("chmod 0755"))
+
+    def test_in_the_full_image_only(self):
+        copy = "COPY --from=tools /usr/local/bin/cloudflared /usr/local/bin/s5cmd /usr/local/bin/"
+        full = self.stages["comfyui"][1]
+        self.assertLess(full.index(copy), full.index("COPY . ."), "before the sources, so a code change keeps the layer")
+        self.assertNotIn("--from=tools", self.stages["runpod"][1], "the runpod image stays slim")
+
+
+class TestVastEntrypoint(unittest.TestCase):
+    """docker/entrypoint.sh on a vast.ai pod: the tunnel, then the weights, then ComfyUI."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = read("docker", "entrypoint.sh")
+
+    def test_server_mode_only_and_before_comfyui(self):
+        passthrough = self.script.index('exec "$@"')
+        server = self.script.index("exec python main.py")
+        steps = ("\tstart_tunnel\n", 'if ! python "$COMFY_ROOT/docker/s3_models_sync.py" "$COMFY_ROOT/models"; then',
+                 'if ! python "$COMFY_ROOT/docker/prefetch_models.py"; then')
+        for step in steps:
+            at = self.script.index(step)
+            self.assertLess(passthrough, at, f"{step!r} must not run for prefetch or passthrough commands")
+            self.assertLess(at, server, f"{step!r} must run before ComfyUI starts")
+        self.assertLess(self.script.index(steps[0]), self.script.index(steps[1]), "the tunnel connects while the weights copy")
+
+    def test_nothing_runs_without_the_env(self):
+        self.assertIn('if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then', self.script)
+        sync = self.script.index('if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then')
+        prefetch = self.script.index('elif [[ -n "${COMFY_MODELS_PREFETCH:-}" && "$COMFY_MODELS_PREFETCH" != 0 ]]; then')
+        self.assertLess(sync, prefetch, "the Hugging Face prefetch is only the fallback without a bucket")
+
+    def test_a_failed_sync_or_prefetch_stops_the_container(self):
+        block = self.script[self.script.index('if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then'):self.script.index("# --- ComfyUI server")]
+        self.assertIn('if ! python "$COMFY_ROOT/docker/s3_models_sync.py"', block)
+        self.assertIn('if ! python "$COMFY_ROOT/docker/prefetch_models.py"', block)
+        self.assertEqual(block.count("exit 1"), 2)
+        self.assertEqual(block.count("not starting ComfyUI"), 2)
+
+    def test_the_token_stays_off_argv_and_out_of_the_log(self):
+        self.assertIn('TUNNEL_TOKEN=$token cloudflared tunnel --no-autoupdate --metrics "$TUNNEL_METRICS" run', self.script)
+        self.assertIn("TUNNEL_METRICS=127.0.0.1:20241", self.script)
+        self.assertNotIn("--token", self.script)
+        uses = [line.strip() for line in self.script.splitlines() if "$CF_TUNNEL_TOKEN" in line or "${CF_TUNNEL_TOKEN" in line]
+        self.assertEqual(uses, ["local token=$CF_TUNNEL_TOKEN", 'if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then'])
+
+    def test_no_cloudflared_is_a_clear_error(self):
+        block = self.script[self.script.index('if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then'):self.script.index("\tstart_tunnel\n")]
+        self.assertIn("if ! command -v cloudflared >/dev/null; then", block)
+        self.assertIn("exit 1", block)
+
+
+@unittest.skipIf(sys.platform == "win32", "bash scripts")
+class TestTunnelSupervisor(unittest.TestCase):
+    """start_tunnel from docker/entrypoint.sh, run against a fake cloudflared."""
+
+    TOKEN = "eyJhIjoiZmFrZS10dW5uZWwtdG9rZW4ifQ=="
+    FAKE = r'''
+import http.server, os, sys, threading, time
+args = sys.argv[1:]
+print("args: " + " ".join(args), flush=True)
+print("INF token from env: " + os.environ.get("TUNNEL_TOKEN", ""), flush=True)
+if os.environ["FAKE_CLOUDFLARED"] == "exit":
+    sys.exit(3)
+host, port = args[args.index("--metrics") + 1].rsplit(":", 1)
+
+
+class Ready(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == "/ready" else 404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+threading.Thread(target=http.server.HTTPServer((host, int(port)), Ready).serve_forever, daemon=True).start()
+time.sleep(60)
+'''
+
+    def run_supervisor(self, mode, seconds):
+        script = read("docker", "entrypoint.sh")
+        log = re.search(r"^log\(\) \{.*\}$", script, re.MULTILINE).group(0)
+        start = script.index("TUNNEL_METRICS=127.0.0.1:20241")
+        block = script[start:script.index("\n}\n", start) + 3]
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        with tempfile.TemporaryDirectory() as bin_dir:
+            fake = os.path.join(bin_dir, "cloudflared")
+            with open(fake, "w") as f:
+                f.write(f"#!{sys.executable}\n{self.FAKE}")
+            os.chmod(fake, 0o755)
+            os.symlink(sys.executable, os.path.join(bin_dir, "python"))
+            # kill 0 ends the whole process group: the harness, the supervisor and the fake.
+            harness = "\n".join(["set -euo pipefail", log, block, f"TUNNEL_METRICS=127.0.0.1:{self.port}",
+                                 f"CF_TUNNEL_TOKEN='{self.TOKEN}'", "start_tunnel", f"sleep {seconds}", "kill 0"])
+            result = subprocess.run(["bash", "-c", harness], env={"PATH": bin_dir + os.pathsep + os.environ["PATH"], "FAKE_CLOUDFLARED": mode},
+                                    capture_output=True, text=True, timeout=60, start_new_session=True)
+        return result.stdout + result.stderr
+
+    def test_restarts_with_backoff_and_masks_the_token(self):
+        out = self.run_supervisor("exit", 3.5)
+        self.assertIn(f"cloudflared: args: tunnel --no-autoupdate --metrics 127.0.0.1:{self.port} run", out)
+        self.assertIn("cloudflared: INF token from env: ***", out, "the token reaches cloudflared through TUNNEL_TOKEN")
+        self.assertNotIn(self.TOKEN, out)
+        self.assertIn("entrypoint: cloudflared exited (status 3); restarting in 1s", out)
+        self.assertIn("entrypoint: cloudflared exited (status 3); restarting in 2s", out)
+        self.assertNotIn("tunnel ready", out)
+
+    def test_logs_when_the_tunnel_is_ready(self):
+        out = self.run_supervisor("serve", 4)
+        self.assertIn("entrypoint: tunnel ready: cloudflared registered an edge connection", out)
+        self.assertNotIn("cloudflared exited", out)
+        self.assertNotIn(self.TOKEN, out)
+
+
 class TestPublishWorkflow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -451,12 +588,26 @@ class TestPublishWorkflow(unittest.TestCase):
         self.assertIn("prefetch --dry-run", runs)
         self.assertIn('"401"', runs)
 
+    def test_full_smoke_tests_the_vast_tools(self):
+        runs = "\n".join(s.get("run", "") for s in self.jobs["build"]["steps"])
+        self.assertIn('--entrypoint cloudflared "$SMOKE_TAG" --version', runs)
+        self.assertIn('--entrypoint s5cmd "$SMOKE_TAG" version', runs)
+        self.assertIn("-e COMFY_MODELS_S3_BUCKET=smoke", runs)
+        self.assertIn("not starting ComfyUI", runs)
+
 
 class TestReadme(unittest.TestCase):
     def test_documents_the_runpod_variant(self):
         readme = read("README.md")
         for text in ("docker.io/shivanshtalwar0/comfyui:runpod", "prefetch --env-only", "/workspace/envs/<key>.tar",
                      "docker/runpod-bootstrap.sh", "COMFY_CODE_REF", "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"):
+            self.assertTrue(text in readme, f"README must document {text!r}")
+
+    def test_documents_vast_pods(self):
+        readme = read("README.md")
+        for text in ("`CF_TUNNEL_TOKEN`", "`COMFY_MODELS_S3_BUCKET`", "`COMFY_MODELS_S3_ENDPOINT`", "`COMFY_MODELS_S3_PREFIX`",
+                     "`COMFY_MODELS_S3_INCLUDE`", "`AWS_ACCESS_KEY_ID`", "`COMFY_MODELS_PREFETCH`", "docker/s3_models_sync.py",
+                     "#### vast.ai: no volume, no proxy"):
             self.assertTrue(text in readme, f"README must document {text!r}")
 
 

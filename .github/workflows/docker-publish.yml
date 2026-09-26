@@ -150,6 +150,19 @@ jobs:
       - name: "Smoke test: model prefetch resolves every wrapper checkpoint"
         run: docker run --rm "$SMOKE_TAG" prefetch --dry-run
 
+      # vast.ai pods: the tunnel and bucket-sync tools run, and a sync that
+      # cannot start stops the container before ComfyUI does.
+      - name: "Smoke test: cloudflared, s5cmd and the model sync's fail-fast"
+        run: |
+          docker run --rm --entrypoint cloudflared "$SMOKE_TAG" --version
+          docker run --rm --entrypoint s5cmd "$SMOKE_TAG" version
+          if docker run --rm -e COMFY_MODELS_S3_BUCKET=smoke "$SMOKE_TAG" > s3sync.log 2>&1; then
+            cat s3sync.log; echo "::error::a model sync without credentials must stop the container"; exit 1
+          fi
+          cat s3sync.log
+          grep -q "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required" s3sync.log
+          grep -q "not starting ComfyUI" s3sync.log
+
       - name: "Smoke test: server boots and the wrapper enforces bearer auth"
         run: |
           docker run -d --name smoke -p 8188:8188 \
