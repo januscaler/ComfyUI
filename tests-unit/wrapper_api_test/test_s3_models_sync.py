@@ -374,10 +374,14 @@ class TestSync(unittest.TestCase):
             self.run_sync()
         self.assertEqual(seen, [("ls", sync.LIST_TIMEOUT_SECONDS), ("cp", 600), ("cp", 600), ("cp", 600)], "the floor, for small files")
         f = sync.RemoteFile("unet/big.safetensors", "s3://weights/models/unet/big.safetensors", 40 * 10**9)
-        with mock.patch.object(sync.subprocess, "run", side_effect=sync.subprocess.TimeoutExpired("s5cmd", 2000)) as run:
+        with mock.patch.object(sync.subprocess, "run", side_effect=sync.subprocess.TimeoutExpired("s5cmd", 8000)) as run:
             error = sync.download(["s5cmd"], f, self.models, self.env)
-        self.assertEqual(run.call_args.kwargs["timeout"], 2000, "40 GB at 20 MB/s")
-        self.assertEqual(error, "timed out after 2000s (slower than 20 MB/s)")
+        self.assertEqual(run.call_args.kwargs["timeout"], 8000, "40 GB at 5 MB/s: a 20 MB/s link shared by 4 downloads")
+        self.assertEqual(error, "timed out after 8000s (slower than 5 MB/s: 20 MB/s shared by 4 downloads)")
+        with mock.patch.object(sync, "FILES_AT_ONCE", 1), \
+                mock.patch.object(sync.subprocess, "run", side_effect=sync.subprocess.TimeoutExpired("s5cmd", 2000)) as run:
+            sync.download(["s5cmd"], f, self.models, self.env)
+        self.assertEqual(run.call_args.kwargs["timeout"], 2000, "one download at a time has the whole link")
 
     def test_a_filesystem_error_is_a_failed_attempt_not_a_traceback(self):
         with open(os.path.join(self.models, "vae"), "w") as f:

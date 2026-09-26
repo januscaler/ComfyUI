@@ -20,9 +20,10 @@ so a container that is stopped and started again downloads nothing twice. Each
 download goes to <name>.s3-partial and is renamed into place only once it has
 the object's size, so a sync killed halfway never leaves a truncated model
 under a name ComfyUI would load; the next run deletes the leftovers. A
-download slower than 20 MB/s (and past 10 minutes) is killed; each file gets
-3 attempts, and if one still fails the exit status is 1, the pod never becomes
-ready and the backend recycles it. A progress line every 30 s shows files,
+download past 10 minutes and slower than its share of a 20 MB/s link (4
+downloads at once: 5 MB/s) is killed; each file gets 3 attempts, and if one
+still fails the exit status is 1, the pod never becomes ready and the backend
+recycles it. A progress line every 30 s shows files,
 bytes and MB/s so far. The disk must hold the download plus a 5 GB margin.
 
     python docker/s3_models_sync.py <models dir> [--dry-run]
@@ -49,7 +50,8 @@ RETRY_DELAY_SECONDS = 10
 FILES_AT_ONCE = 4
 PARTS_PER_FILE = 16
 PART_SIZE_MIB = 64
-# A download that has not finished at this rate (and after the floor) is stuck.
+# The slowest link a pod may have. FILES_AT_ONCE downloads share it, so a file
+# that has not arrived at its share of it (and after the floor) is stuck.
 DOWNLOAD_TIMEOUT_FLOOR_SECONDS = 600
 SLOWEST_BYTES_PER_SECOND = 20e6
 LIST_TIMEOUT_SECONDS = 300
@@ -171,7 +173,7 @@ def download(s5cmd: list[str], f: RemoteFile, models_dir: str, environ) -> str |
     """Fetch one object under its .s3-partial name, then rename it into place. Returns an error, or None."""
     path = local_path(models_dir, f)
     partial = path + PARTIAL_SUFFIX
-    timeout = max(DOWNLOAD_TIMEOUT_FLOOR_SECONDS, f.size / SLOWEST_BYTES_PER_SECOND)
+    timeout = max(DOWNLOAD_TIMEOUT_FLOOR_SECONDS, f.size * FILES_AT_ONCE / SLOWEST_BYTES_PER_SECOND)
     t0 = time.monotonic()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -185,7 +187,8 @@ def download(s5cmd: list[str], f: RemoteFile, models_dir: str, environ) -> str |
             return None
         error = output_tail(result, environ) if result.returncode != 0 else f"got {size} bytes, the object has {f.size}"
     except subprocess.TimeoutExpired:
-        error = f"timed out after {timeout:.0f}s (slower than {SLOWEST_BYTES_PER_SECOND / 1e6:.0f} MB/s)"
+        error = (f"timed out after {timeout:.0f}s (slower than {SLOWEST_BYTES_PER_SECOND / FILES_AT_ONCE / 1e6:.0f} MB/s: "
+                 f"{SLOWEST_BYTES_PER_SECOND / 1e6:.0f} MB/s shared by {FILES_AT_ONCE} downloads)")
     except OSError as e:  # e.g. a file where a folder should be, or the disk filled up
         error = redact(str(e), environ)
     for leftover in partial_files(models_dir, f):
