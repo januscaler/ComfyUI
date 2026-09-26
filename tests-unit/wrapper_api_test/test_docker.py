@@ -434,6 +434,7 @@ class TestVastEntrypoint(unittest.TestCase):
         prefetch = self.script.index('elif flag_on "${COMFY_MODELS_PREFETCH:-}"; then')
         self.assertLess(sync, prefetch, "the Hugging Face prefetch is only the fallback without a bucket")
 
+    @unittest.skipIf(sys.platform == "win32", "bash scripts")
     def test_prefetch_flag_values(self):
         flag_on = re.search(r"^flag_on\(\) \{\n.*?^\}$", self.script, re.MULTILINE | re.DOTALL).group(0)
         for value, on in (("", False), ("0", False), ("false", False), ("False", False), ("FALSE", False), ("no", False),
@@ -540,7 +541,8 @@ time.sleep(60)
         self.assertEqual(set(runs), {"cloudflared: INF token from env: ***"}, "every restart still gets the token")
 
     def test_logs_when_the_tunnel_is_ready(self):
-        out = self.run_supervisor("serve", 4)
+        # The readiness probe starts a Python per try, a second apart: slow CI runners (macOS) need a wide window.
+        out = self.run_supervisor("serve", 12)
         self.assertIn("entrypoint: tunnel ready: cloudflared registered an edge connection", out)
         self.assertNotIn("cloudflared exited", out)
         self.assertNotIn(self.TOKEN, out)
