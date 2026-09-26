@@ -1,13 +1,14 @@
 # ComfyUI + wrapper API worker image (published as shivanshtalwar0/comfyui).
 #
 # The same image runs on a local GPU box (docker-compose.yml) and as an
-# on-demand RunPod pod started by voxmin-backend's FloStudio scheduler. The
-# entrypoint (docker/entrypoint.sh) decides everything from env, because a
-# RunPod pod runs the image's own CMD with no compose file around it.
+# on-demand RunPod or vast.ai pod started by voxmin-backend's FloStudio
+# scheduler. The entrypoint (docker/entrypoint.sh) decides everything from env,
+# because a pod runs the image's own CMD with no compose file around it.
 #
 # Two published targets:
 #   - `comfyui` (the default, :latest): torch + requirements baked in, ~5 GB
-#     compressed. The local GPU box pulls it once and keeps it.
+#     compressed. The local GPU box pulls it once and keeps it. It also carries
+#     cloudflared and s5cmd for vast.ai pods (no volume, no HTTPS proxy).
 #   - `runpod` (:runpod): the same system packages and sources but NO Python
 #     dependencies. The entrypoint installs them once into a virtualenv on the
 #     pod's network volume (/workspace/envs/<env key>) and every later pod
@@ -21,6 +22,7 @@
 #     source tree changes (models/, output/ etc. are excluded via .dockerignore
 #     and mounted or linked at runtime).
 #   - `runpod`: system + the uv binary + the sources + the env key.
+#   - `tools`: fetches the pinned cloudflared and s5cmd binaries for `comfyui`.
 #
 # CUDA only. The PyTorch CUDA wheels bundle the CUDA runtime, so this slim
 # image uses the host GPU through the NVIDIA container toolkit. cu128 is the
@@ -34,6 +36,27 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.2
 
 FROM ${UV_IMAGE} AS uv
+
+# --- vast.ai tools: static linux-amd64 release binaries ----------------------
+# cloudflared runs the pod's Cloudflare tunnel; s5cmd copies the model weights
+# from R2 onto the pod's disk (docker/entrypoint.sh, docker/s3_models_sync.py).
+# Each download is checked against the sha256 its release publishes (the
+# cloudflared release notes' checksum list, s5cmd's s5cmd_checksums.txt).
+FROM ${BASE_IMAGE} AS tools
+
+ARG CLOUDFLARED_VERSION=2026.9.3
+ARG CLOUDFLARED_SHA256=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2
+ARG S5CMD_VERSION=2.3.0
+ARG S5CMD_SHA256=de0fdbfa3aceae55e069ba81a0fc17b2026567637603734a387b2fca06c299b4
+
+RUN set -eu; \
+    fetch() { python -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "$1" "$2"; }; \
+    fetch "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" /usr/local/bin/cloudflared; \
+    echo "${CLOUDFLARED_SHA256}  /usr/local/bin/cloudflared" | sha256sum -c -; \
+    fetch "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" /tmp/s5cmd.tar.gz; \
+    echo "${S5CMD_SHA256}  /tmp/s5cmd.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd; \
+    chmod 0755 /usr/local/bin/cloudflared /usr/local/bin/s5cmd
 
 FROM ${BASE_IMAGE} AS system
 
@@ -111,6 +134,9 @@ CMD []
 # --- Full target. Last, so a plain `docker build .` still builds it ------------
 FROM base AS comfyui
 
+# Before the sources, so a code change does not re-copy them.
+COPY --from=tools /usr/local/bin/cloudflared /usr/local/bin/s5cmd /usr/local/bin/
+
 COPY . .
 
 RUN mkdir -p input output temp user models api_server/workflows && \
@@ -121,7 +147,9 @@ RUN mkdir -p input output temp user models api_server/workflows && \
 ENV COMFYUI_PORT=8188
 EXPOSE 8188 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+# A vast.ai pod copies its weights before ComfyUI starts, hence the long start
+# period (compose sets its own healthcheck).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=900s --retries=5 \
     CMD python -c "import os, urllib.request; t = os.environ.get('WRAPPER_AUTH_TOKEN'); urllib.request.urlopen(urllib.request.Request('http://localhost:%s/system_stats' % os.environ.get('COMFYUI_PORT', '8188'), headers={'Authorization': 'Bearer ' + t} if t else {}), timeout=8)"
 
 ENTRYPOINT ["tini", "--", "/opt/ComfyUI/docker/entrypoint.sh"]

@@ -138,11 +138,11 @@ curl -o result.png -X POST http://127.0.0.1:8188/api/wrapper/flux2klein9b/genera
   -F "prompt=make it snow" -F "image=@input.png"
 ```
 
-### Docker image (local GPU box and RunPod)
+### Docker image (local GPU box, RunPod and vast.ai)
 
 The worker is published to Docker Hub as **`shivanshtalwar0/comfyui`** by [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml), in two flavours built from the same [`Dockerfile`](Dockerfile):
 
-- **full** (target `comfyui`, the default): torch + requirements baked in, a ~5.2 GB compressed pull. The local GPU box runs it.
+- **full** (target `comfyui`, the default): torch + requirements baked in, a ~5.2 GB compressed pull. The local GPU box and vast.ai pods run it; it also carries pinned `cloudflared` and `s5cmd` binaries for vast.ai (see [vast.ai](#vastai-no-volume-no-proxy)).
 - **runpod** (target `runpod`): the same system packages and sources, no Python dependencies, a ~0.38 GB pull. The first pod on a network volume installs the Python env onto the volume and every later pod reuses it (see [RunPod variant](#runpod-variant-runpod)).
 
 | Trigger | full image tags | runpod image tags |
@@ -152,7 +152,7 @@ The worker is published to Docker Hub as **`shivanshtalwar0/comfyui`** by [`.git
 | manual run (Actions → Docker image → Run workflow) | `<branch>`, `sha-<short>` | `runpod-<branch>`, `runpod-sha-<short>` |
 | pull request touching Docker files | nothing: build + smoke test only | nothing: build + smoke test only |
 
-Every build is smoke-tested before anything is pushed. Full image: torch has CUDA, `prefetch --dry-run` resolves every wrapper checkpoint, and the server boots (CPU mode) and answers `/api/wrapper/workflows` with 200 with the bearer token and 401 without it. Runpod image: no torch in the image, it refuses to start without a volume, a first container on a fresh docker volume builds the real CUDA env on it and passes the same 200/401 check, and a second container on that volume reuses the env (no rebuild) and comes up faster. The two flavours build in parallel jobs with separate registry build caches (`:buildcache`, `:buildcache-runpod`). Publishing needs the repository secret **`DOCKERHUB_TOKEN`** (a Docker Hub access token with Read & Write). `DOCKERHUB_USERNAME` / `DOCKERHUB_IMAGE` repository variables override the defaults.
+Every build is smoke-tested before anything is pushed. Full image: torch has CUDA, `prefetch --dry-run` resolves every wrapper checkpoint, `cloudflared` and `s5cmd` run, a bucket sync without credentials stops the container, and the server boots (CPU mode) and answers `/api/wrapper/workflows` with 200 with the bearer token and 401 without it. Runpod image: no torch in the image, it refuses to start without a volume, a first container on a fresh docker volume builds the real CUDA env on it and passes the same 200/401 check, and a second container on that volume reuses the env (no rebuild) and comes up faster. The two flavours build in parallel jobs with separate registry build caches (`:buildcache`, `:buildcache-runpod`). Publishing needs the repository secret **`DOCKERHUB_TOKEN`** (a Docker Hub access token with Read & Write). `DOCKERHUB_USERNAME` / `DOCKERHUB_IMAGE` repository variables override the defaults.
 
 Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu128** wheels (Blackwell / RTX 5090 kernels, host driver ≥ 570). The full image's build fails if any dependency leaves it with a CPU torch; the runpod image's env build on the volume fails the same way. Nothing model-sized is baked in. [`docker/entrypoint.sh`](docker/entrypoint.sh) configures everything from env, so the image runs the same with or without a compose file:
 
@@ -170,6 +170,13 @@ Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu128** whe
 | `COMFY_ENV_WAIT_SECONDS` | `1800` | Runpod image: how long a pod waits for another pod that is building the env before it gives up. |
 | `COMFY_ENV_LOCK_STALE_SECONDS` | `120` | Runpod image: an env lock whose heartbeat has not moved for this long belongs to a dead pod and is taken over. |
 | `COMFY_ENVS_DIR` | `<data dir>/envs` | Runpod image: where the envs live. |
+| `CF_TUNNEL_TOKEN` | unset | vast.ai: token of the pod's remotely-managed Cloudflare tunnel. Runs `cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 run` beside ComfyUI (server mode only), restarted with backoff. Never printed. |
+| `COMFY_MODELS_S3_BUCKET` | unset | vast.ai: copy the weights from this bucket into the models dir before ComfyUI starts (server mode only). |
+| `COMFY_MODELS_S3_ENDPOINT` | unset (AWS S3) | e.g. `https://<account>.r2.cloudflarestorage.com`. |
+| `COMFY_MODELS_S3_PREFIX` | `models/` (also when empty) | Key prefix mapped onto the models dir: `models/vae/x.safetensors` → `<models dir>/vae/x.safetensors`. `/` maps the bucket root. |
+| `COMFY_MODELS_S3_INCLUDE` | everything | Comma-separated globs on the path under the prefix (`*` also matches `/`), e.g. `diffusion_models/*int8*,text_encoders/*,vae/*`. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | unset, unset, `auto` | The bucket's credentials (required with a bucket, never printed); `auto` is R2's region. |
+| `COMFY_MODELS_PREFETCH` | unset | Without a bucket: `1` runs `prefetch` (the default checkpoints, from Hugging Face) before ComfyUI starts. Empty, `0`, `false`, `no` and `off` leave it off. |
 
 **Local GPU box**: `cp .env.example .env`, then `docker compose pull && docker compose up -d` (or `docker compose up -d --build` to build this tree). `COMFYUI_HOST_PORT=8282` publishes it where the FloStudio rig is reached over WireGuard.
 
@@ -222,6 +229,23 @@ Envs and code archives are never deleted automatically, because a pod still runn
 ```bash
 cd /workspace/envs && ls | grep -vx "$(cat /opt/ComfyUI/docker/env-key).tar" | xargs -r rm -rf
 ```
+
+#### vast.ai: no volume, no proxy
+
+vast.ai pods run the full image with `COMFYUI_DATA_DIR=/workspace` on the container disk. There is no shared volume and no HTTPS proxy, so voxmin-backend gives each pod its own Cloudflare tunnel (`CF_TUNNEL_TOKEN`; the tunnel's ingress routes the pod's hostname to `http://127.0.0.1:8188`) and a bucket to copy the weights from (`COMFY_MODELS_S3_*` and the R2 credentials). In server mode the entrypoint then:
+
+- starts `cloudflared` in the background with the token in `TUNNEL_TOKEN` (not argv, so `ps` never shows it), prefixes its output `cloudflared:` with the token masked, restarts it with backoff (1 s doubling to 60 s) whenever it exits, and logs `tunnel ready` once its `/ready` metrics endpoint answers 200;
+- copies the weights with [`docker/s3_models_sync.py`](docker/s3_models_sync.py) before ComfyUI starts: `s5cmd` fetches 4 files at once, each as 16 parallel 64 MiB ranged GETs. A file already on disk with the object's size is kept, so a stopped-then-started container downloads nothing; each download lands as `<name>.s3-partial` and is renamed only once it has the object's full size (leftovers of a killed sync are deleted on the next run). The disk must hold the download plus a 5 GB margin. A download still running after 10 minutes and slower than its share of a 20 MB/s link (5 MB/s with 4 at once) is killed. Each file gets 3 attempts; if one still fails the container exits non-zero and never becomes ready, and the backend recycles it. A `progress` line every 30 s and the last line report files, bytes, seconds and MB/s.
+
+Without a bucket, `COMFY_MODELS_PREFETCH=1` fetches the default checkpoints from Hugging Face (`prefetch`) before starting instead. To see what a pod would download, with the credentials exported in your shell (`-e NAME` with no value passes them through, so they stay out of your shell history):
+
+```bash
+docker run --rm -e COMFY_MODELS_S3_BUCKET=<bucket> -e COMFY_MODELS_S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  --entrypoint python shivanshtalwar0/comfyui docker/s3_models_sync.py models --dry-run
+```
+
+ComfyUI itself starts without the bucket credentials and the tunnel token in its environment: the entrypoint unsets them first.
 
 ## Features
 - A visual node graph for building and reusing image, video, audio, 3D, and text workflows without code.
