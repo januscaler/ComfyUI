@@ -154,9 +154,11 @@ jobs:
       # cannot start stops the container before ComfyUI does.
       - name: "Smoke test: cloudflared, s5cmd and the model sync's fail-fast"
         run: |
-          docker run --rm --entrypoint cloudflared "$SMOKE_TAG" --version
-          docker run --rm --entrypoint s5cmd "$SMOKE_TAG" version
-          if docker run --rm -e COMFY_MODELS_S3_BUCKET=smoke "$SMOKE_TAG" > s3sync.log 2>&1; then
+          docker run --rm --network none --entrypoint cloudflared "$SMOKE_TAG" --version
+          docker run --rm --network none --entrypoint s5cmd "$SMOKE_TAG" version
+          # Fails on the missing credentials before any request; the timeout
+          # catches an entrypoint that goes on to start ComfyUI instead.
+          if timeout 120 docker run --rm --network none -e COMFY_MODELS_S3_BUCKET=smoke "$SMOKE_TAG" > s3sync.log 2>&1; then
             cat s3sync.log; echo "::error::a model sync without credentials must stop the container"; exit 1
           fi
           cat s3sync.log

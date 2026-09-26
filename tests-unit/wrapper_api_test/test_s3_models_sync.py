@@ -34,9 +34,10 @@ SECRET = "s3cr3t-Value-xyz"
 
 # `ls` lists <FAKE_S3_ROOT>/<bucket>/<key> the way s5cmd 2.3 prints --json;
 # `cp` copies one object. FAKE_S3_FAIL ({key: times, -1 = always}),
-# FAKE_S3_TRUNCATE (keys) and FAKE_S3_LS_FAIL inject failures.
+# FAKE_S3_TRUNCATE (keys) and FAKE_S3_LS_FAIL inject failures; FAKE_S3_SLOW
+# ({key: [seconds, times]}) writes half the object, then stalls that long.
 FAKE_S5CMD = r'''
-import json, os, sys
+import json, os, sys, time
 
 root, state = os.environ["FAKE_S3_ROOT"], os.environ["FAKE_S3_STATE"]
 with open(os.path.join(state, "calls.jsonl"), "a") as calls:
@@ -81,7 +82,13 @@ elif command == "cp":
     data = open(os.path.join(root, bucket, key), "rb").read()
     if key in os.environ.get("FAKE_S3_TRUNCATE", "").split(","):
         data = data[:len(data) // 2]
+    slow = json.loads(os.environ.get("FAKE_S3_SLOW", "{}")).get(key)
     with open(dst, "wb") as out:
+        if slow and (slow[1] < 0 or tries < slow[1]):
+            out.write(data[:len(data) // 2])
+            out.flush()
+            time.sleep(slow[0])
+            data = data[len(data) // 2:]
         out.write(data)
 else:
     sys.exit("fake s5cmd: unsupported " + command)
@@ -176,9 +183,10 @@ class TestSync(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(bytes(i % 251 for i in range(size)))
 
-    def run_sync(self, *args, **env):
+    def run_sync(self, *args, free=10**15, **env):
         out = io.StringIO()
-        with contextlib.redirect_stderr(out), mock.patch.object(sync, "RETRY_DELAY_SECONDS", 0):
+        with contextlib.redirect_stderr(out), mock.patch.object(sync, "RETRY_DELAY_SECONDS", 0), \
+                mock.patch.object(sync.shutil, "disk_usage", return_value=mock.Mock(free=free)):
             code = sync.main([self.models, *args], {**self.env, **env})
         return code, out.getvalue()
 
@@ -322,12 +330,96 @@ class TestSync(unittest.TestCase):
         self.assertEqual(len(self.calls("ls")), sync.ATTEMPTS)
         self.assertIn("could not list s3://weights/models/*", out)
 
-    def test_not_enough_disk_fails_before_downloading(self):
-        with mock.patch.object(sync.shutil, "disk_usage", return_value=mock.Mock(free=100)):
-            code, out = self.run_sync()
+    def test_a_listing_that_hangs_is_a_failed_attempt(self):
+        with mock.patch.object(sync.subprocess, "run", side_effect=sync.subprocess.TimeoutExpired("s5cmd", 300)) as run, \
+                mock.patch.object(sync, "RETRY_DELAY_SECONDS", 0), contextlib.redirect_stderr(io.StringIO()) as out:
+            self.assertIsNone(sync.list_objects(["s5cmd"], "s3://weights/models/*", self.env))
+        self.assertEqual(run.call_count, sync.ATTEMPTS)
+        self.assertIn("failed (attempt 3/3): timed out after 300s", out.getvalue())
+
+    def test_the_disk_must_hold_the_download_and_a_margin(self):
+        need = 6000
+        code, out = self.run_sync(free=need + sync.DISK_MARGIN_BYTES - 1)
         self.assertEqual(code, 1)
-        self.assertIn("free under", out)
+        self.assertIn("0.0 GB to download plus a 5.0 GB margin, but only 5.0 GB free under", out)
         self.assertEqual(self.calls("cp"), [])
+        code, out = self.run_sync(free=need + sync.DISK_MARGIN_BYTES)
+        self.assertEqual(code, 0, out)
+
+    def test_a_stuck_download_is_killed_and_retried(self):
+        with mock.patch.object(sync, "DOWNLOAD_TIMEOUT_FLOOR_SECONDS", 1), mock.patch.object(sync, "SLOWEST_BYTES_PER_SECOND", 1e12):
+            code, out = self.run_sync(FAKE_S3_SLOW=json.dumps({"models/vae/vae.safetensors": [30, 1]}))
+        self.assertEqual(code, 0, out)
+        self.assertIn("FAILED   vae/vae.safetensors (attempt 1/3): timed out after 1s", out)
+        self.assert_same_bytes("vae/vae.safetensors", "models/vae/vae.safetensors")
+
+    def test_a_download_that_keeps_stalling_fails_without_leftovers(self):
+        with mock.patch.object(sync, "DOWNLOAD_TIMEOUT_FLOOR_SECONDS", 1), mock.patch.object(sync, "SLOWEST_BYTES_PER_SECOND", 1e12):
+            code, out = self.run_sync(FAKE_S3_SLOW=json.dumps({"models/vae/vae.safetensors": [30, -1]}))
+        self.assertEqual(code, 1, out)
+        self.assertEqual(out.count("timed out after 1s"), sync.ATTEMPTS)
+        self.assertIn("still failed after 3 attempts: vae/vae.safetensors", out)
+        self.assertFalse(os.path.exists(self.model("vae/vae.safetensors")))
+        self.assertEqual(self.leftovers(), [], "the half-written partial of a killed download is removed")
+
+    def test_the_timeout_scales_with_the_size(self):
+        seen = []
+        real_run = sync.subprocess.run
+
+        def run(argv, **kwargs):
+            seen.append((argv[argv.index("--json") + 1] if "--json" in argv else "cp", kwargs["timeout"]))
+            return real_run(argv, **kwargs)
+
+        with mock.patch.object(sync.subprocess, "run", side_effect=run):
+            self.run_sync()
+        self.assertEqual(seen, [("ls", sync.LIST_TIMEOUT_SECONDS), ("cp", 600), ("cp", 600), ("cp", 600)], "the floor, for small files")
+        f = sync.RemoteFile("unet/big.safetensors", "s3://weights/models/unet/big.safetensors", 40 * 10**9)
+        with mock.patch.object(sync.subprocess, "run", side_effect=sync.subprocess.TimeoutExpired("s5cmd", 2000)) as run:
+            error = sync.download(["s5cmd"], f, self.models, self.env)
+        self.assertEqual(run.call_args.kwargs["timeout"], 2000, "40 GB at 20 MB/s")
+        self.assertEqual(error, "timed out after 2000s (slower than 20 MB/s)")
+
+    def test_a_filesystem_error_is_a_failed_attempt_not_a_traceback(self):
+        with open(os.path.join(self.models, "vae"), "w") as f:
+            f.write("a file where the vae folder should be")
+        code, out = self.run_sync()
+        self.assertEqual(code, 1, out)
+        self.assertIn("FAILED   vae/vae.safetensors (attempt 3/3): [Errno 17] File exists", out)
+        self.assertNotIn("Traceback", out)
+        self.assertTrue(os.path.exists(self.model("diffusion_models/h3_int8.safetensors")), "the other files still land")
+
+    def test_progress_lines_while_downloading(self):
+        with mock.patch.object(sync, "PROGRESS_SECONDS", 0.2):
+            code, out = self.run_sync(FAKE_S3_SLOW=json.dumps({"models/vae/vae.safetensors": [1.5, 1]}))
+        self.assertEqual(code, 0, out)
+        lines = [line for line in out.splitlines() if line.startswith("s3-sync: progress ")]
+        self.assertGreaterEqual(len(lines), 3, out)
+        for line in lines:
+            self.assertRegex(line, r"^s3-sync: progress [0-3]/3 file\(s\), 0\.0 GB of 0\.0 GB in \d+s \(\d+ MB/s\)$")
+        self.assertIn("progress 2/3 file(s)", lines[-1], "the two fast files are done while the slow one runs")
+
+    def test_partial_bytes_counts_what_s5cmd_has_written(self):
+        f = sync.RemoteFile("vae/vae.safetensors", "s3://weights/models/vae/vae.safetensors", 1000)
+        self.assertEqual(sync.partial_bytes(self.models, f), 0, "no folder yet")
+        os.makedirs(self.model("vae"))
+        with open(self.model("vae/vae.safetensors.s3-partial8123"), "wb") as out:
+            out.write(b"x" * 300)
+        with open(self.model("vae/other.safetensors.s3-partial"), "wb") as out:
+            out.write(b"x" * 999)
+        self.assertEqual(sync.partial_bytes(self.models, f), 300)
+        with open(self.model("vae/vae.safetensors.s3-partial"), "wb") as out:
+            out.write(b"x" * 900)
+        self.assertEqual(sync.partial_bytes(self.models, f), 1000, "capped at the object's size")
+
+    def test_empty_prefix_means_models_and_slash_means_the_bucket_root(self):
+        code, out = self.run_sync(COMFY_MODELS_S3_PREFIX="")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls("ls")[-1]["argv"][-1], "s3://weights/models/*")
+        code, out = self.run_sync(COMFY_MODELS_S3_PREFIX="/")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.calls("ls")[-1]["argv"][-1], "s3://weights/*")
+        self.assert_same_bytes("other/not-a-model.bin", "other/not-a-model.bin")
+        self.assert_same_bytes("models/vae/vae.safetensors", "models/vae/vae.safetensors")
 
 
 if __name__ == "__main__":

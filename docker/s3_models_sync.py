@@ -7,7 +7,8 @@ COMFY_MODELS_S3_BUCKET is set:
     COMFY_MODELS_S3_ENDPOINT  e.g. https://<account>.r2.cloudflarestorage.com
     COMFY_MODELS_S3_BUCKET    the bucket
     COMFY_MODELS_S3_PREFIX    the key prefix that maps onto the models dir, default
-                              models/: models/vae/x.safetensors -> <models dir>/vae/x.safetensors
+                              models/ (also when empty): models/vae/x.safetensors ->
+                              <models dir>/vae/x.safetensors; "/" maps the bucket root
     COMFY_MODELS_S3_INCLUDE   comma-separated globs matched against the path under
                               the prefix (`*` also matches `/`), e.g.
                               "unet/*int8*,text_encoders/*,vae/*"; default: everything
@@ -18,9 +19,11 @@ s5cmd moves the bytes. A file already on disk with the object's size is kept,
 so a container that is stopped and started again downloads nothing twice. Each
 download goes to <name>.s3-partial and is renamed into place only once it has
 the object's size, so a sync killed halfway never leaves a truncated model
-under a name ComfyUI would load; the next run deletes the leftovers. Failed
-files are retried; if some still fail the exit status is 1, the pod never
-becomes ready and the backend recycles it.
+under a name ComfyUI would load; the next run deletes the leftovers. A
+download slower than 20 MB/s (and past 10 minutes) is killed; each file gets
+3 attempts, and if one still fails the exit status is 1, the pod never becomes
+ready and the backend recycles it. A progress line every 30 s shows files,
+bytes and MB/s so far. The disk must hold the download plus a 5 GB margin.
 
     python docker/s3_models_sync.py <models dir> [--dry-run]
 """
@@ -35,7 +38,7 @@ import shutil
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 PARTIAL_SUFFIX = ".s3-partial"
@@ -46,6 +49,13 @@ RETRY_DELAY_SECONDS = 10
 FILES_AT_ONCE = 4
 PARTS_PER_FILE = 16
 PART_SIZE_MIB = 64
+# A download that has not finished at this rate (and after the floor) is stuck.
+DOWNLOAD_TIMEOUT_FLOOR_SECONDS = 600
+SLOWEST_BYTES_PER_SECOND = 20e6
+LIST_TIMEOUT_SECONDS = 300
+# Room left for everything else a pod writes (outputs, caches, Triton kernels).
+DISK_MARGIN_BYTES = 5 * 10**9
+PROGRESS_SECONDS = 30
 SECRET_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 
 
@@ -115,6 +125,27 @@ def plan(files: list[RemoteFile], models_dir: str) -> tuple[list[RemoteFile], li
     return missing, present
 
 
+def partial_files(models_dir: str, f: RemoteFile) -> list[str]:
+    """f's .s3-partial file and s5cmd's own temp files next to it (<name>.s3-partial<random>)."""
+    folder, stem = os.path.split(local_path(models_dir, f) + PARTIAL_SUFFIX)
+    try:
+        return [os.path.join(folder, name) for name in os.listdir(folder) if name.startswith(stem)]
+    except OSError:  # its folder does not exist (yet), or is not a folder
+        return []
+
+
+def partial_bytes(models_dir: str, f: RemoteFile) -> int:
+    """Bytes of f written so far. s5cmd writes parts at their offsets, so count allocated blocks, not the size."""
+    written = 0
+    for path in partial_files(models_dir, f):
+        try:
+            st = os.stat(path)
+        except OSError:  # renamed into place since it was listed
+            continue
+        written += min(st.st_blocks * 512, st.st_size)
+    return min(written, f.size)
+
+
 def remove_partials(models_dir: str) -> None:
     """Delete what a killed sync left: .s3-partial files and s5cmd's own temp files beside them."""
     for root, _dirs, names in os.walk(models_dir):
@@ -140,32 +171,53 @@ def download(s5cmd: list[str], f: RemoteFile, models_dir: str, environ) -> str |
     """Fetch one object under its .s3-partial name, then rename it into place. Returns an error, or None."""
     path = local_path(models_dir, f)
     partial = path + PARTIAL_SUFFIX
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    timeout = max(DOWNLOAD_TIMEOUT_FLOOR_SECONDS, f.size / SLOWEST_BYTES_PER_SECOND)
     t0 = time.monotonic()
-    result = subprocess.run([*s5cmd, "--log", "error", "cp", "--raw", "--concurrency", str(PARTS_PER_FILE),
-                             "--part-size", str(PART_SIZE_MIB), f.url, partial],
-                            env=environ, capture_output=True, text=True)
-    size = os.path.getsize(partial) if os.path.isfile(partial) else None
-    if result.returncode != 0 or size != f.size:
-        if size is not None:
-            os.remove(partial)
-        if result.returncode != 0:
-            return output_tail(result, environ)
-        return f"got {size or 0} bytes, the object has {f.size}"
-    os.replace(partial, path)
-    say(f"ok       {f.path} ({gb(f.size)} in {time.monotonic() - t0:.0f}s)")
-    return None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        result = subprocess.run([*s5cmd, "--log", "error", "cp", "--raw", "--concurrency", str(PARTS_PER_FILE),
+                                 "--part-size", str(PART_SIZE_MIB), f.url, partial],
+                                env=environ, capture_output=True, text=True, timeout=timeout)
+        size = os.path.getsize(partial) if os.path.isfile(partial) else 0
+        if result.returncode == 0 and size == f.size:
+            os.replace(partial, path)
+            say(f"ok       {f.path} ({gb(f.size)} in {time.monotonic() - t0:.0f}s)")
+            return None
+        error = output_tail(result, environ) if result.returncode != 0 else f"got {size} bytes, the object has {f.size}"
+    except subprocess.TimeoutExpired:
+        error = f"timed out after {timeout:.0f}s (slower than {SLOWEST_BYTES_PER_SECOND / 1e6:.0f} MB/s)"
+    except OSError as e:  # e.g. a file where a folder should be, or the disk filled up
+        error = redact(str(e), environ)
+    for leftover in partial_files(models_dir, f):
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
+    return error
+
+
+def progress(models_dir: str, fetched: list[RemoteFile], in_flight: list[RemoteFile], missing: list[RemoteFile], started: float) -> str:
+    size = sum(f.size for f in fetched) + sum(partial_bytes(models_dir, f) for f in in_flight)
+    seconds = time.monotonic() - started
+    return (f"progress {len(fetched)}/{len(missing)} file(s), {gb(size)} of {gb(sum(f.size for f in missing))} "
+            f"in {seconds:.0f}s ({size / 1e6 / max(seconds, 1e-3):.0f} MB/s)")
 
 
 def list_objects(s5cmd: list[str], source: str, environ) -> str | None:
     """`s5cmd ls` JSON lines for source, retried; "" when nothing matches, None when listing kept failing."""
     for attempt in range(1, ATTEMPTS + 1):
-        result = subprocess.run([*s5cmd, "--json", "ls", source], env=environ, capture_output=True, text=True)
-        if result.returncode == 0:
-            return result.stdout
-        if "no object found" in result.stderr:
-            return ""
-        say(f"listing {source} failed (attempt {attempt}/{ATTEMPTS}): {output_tail(result, environ)}")
+        try:
+            result = subprocess.run([*s5cmd, "--json", "ls", source], env=environ, capture_output=True, text=True,
+                                    timeout=LIST_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            error = f"timed out after {LIST_TIMEOUT_SECONDS}s"
+        else:
+            if result.returncode == 0:
+                return result.stdout
+            if "no object found" in result.stderr:
+                return ""
+            error = output_tail(result, environ)
+        say(f"listing {source} failed (attempt {attempt}/{ATTEMPTS}): {error}")
         if attempt < ATTEMPTS:
             time.sleep(RETRY_DELAY_SECONDS * attempt)
     return None
@@ -222,20 +274,27 @@ def main(argv: list[str], environ=os.environ) -> int:
             say(f"missing  {f.path} ({gb(f.size)})")
         return 0
     free = shutil.disk_usage(models_dir).free
-    if need > free:
-        say(f"ERROR: {gb(need)} to download but only {gb(free)} free under {models_dir}")
+    if need + DISK_MARGIN_BYTES > free:
+        say(f"ERROR: {gb(need)} to download plus a {gb(DISK_MARGIN_BYTES)} margin, but only {gb(free)} free under {models_dir}")
         return 1
 
     # Biggest first, so the longest download is not the one left running alone at the end.
     pending = sorted(missing, key=lambda f: -f.size)
+    fetched: list[RemoteFile] = []
+    started = time.monotonic()
     for attempt in range(1, ATTEMPTS + 1):
         if not pending:
             break
         for f in pending:
             say(f"download {f.path} ({gb(f.size)})")
         with ThreadPoolExecutor(FILES_AT_ONCE) as pool:
-            errors = list(pool.map(lambda f: download(s5cmd, f, models_dir, environ), pending))
-        failed = [(f, error) for f, error in zip(pending, errors) if error]
+            jobs = {pool.submit(download, s5cmd, f, models_dir, environ): f for f in pending}
+            while wait(jobs, timeout=PROGRESS_SECONDS).not_done:
+                done = [f for job, f in jobs.items() if job.done() and job.result() is None]
+                in_flight = [f for job, f in jobs.items() if not job.done()]
+                say(progress(models_dir, fetched + done, in_flight, missing, started))
+        fetched += [f for job, f in jobs.items() if job.result() is None]
+        failed = [(f, job.result()) for job, f in jobs.items() if job.result() is not None]
         for f, error in failed:
             say(f"FAILED   {f.path} (attempt {attempt}/{ATTEMPTS}): {error}")
         pending = [f for f, _ in failed]
@@ -243,7 +302,6 @@ def main(argv: list[str], environ=os.environ) -> int:
             time.sleep(RETRY_DELAY_SECONDS * attempt)
 
     seconds = time.monotonic() - t0
-    fetched = [f for f in missing if f not in pending]
     size = sum(f.size for f in fetched)
     say(f"{len(fetched)} file(s), {gb(size)} downloaded in {seconds:.0f}s ({size / 1e6 / max(seconds, 1e-3):.0f} MB/s); "
         f"{len(present)} already present")

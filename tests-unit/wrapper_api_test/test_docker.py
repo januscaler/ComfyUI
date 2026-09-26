@@ -431,8 +431,26 @@ class TestVastEntrypoint(unittest.TestCase):
     def test_nothing_runs_without_the_env(self):
         self.assertIn('if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then', self.script)
         sync = self.script.index('if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then')
-        prefetch = self.script.index('elif [[ -n "${COMFY_MODELS_PREFETCH:-}" && "$COMFY_MODELS_PREFETCH" != 0 ]]; then')
+        prefetch = self.script.index('elif flag_on "${COMFY_MODELS_PREFETCH:-}"; then')
         self.assertLess(sync, prefetch, "the Hugging Face prefetch is only the fallback without a bucket")
+
+    def test_prefetch_flag_values(self):
+        flag_on = re.search(r"^flag_on\(\) \{\n.*?^\}$", self.script, re.MULTILINE | re.DOTALL).group(0)
+        for value, on in (("", False), ("0", False), ("false", False), ("False", False), ("FALSE", False), ("no", False),
+                          ("NO", False), ("off", False), ("1", True), ("true", True), ("yes", True)):
+            result = subprocess.run(["bash", "-c", f'{flag_on}\nflag_on "$1"', "_", value], capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, on, f"COMFY_MODELS_PREFETCH={value!r}")
+
+    def test_secrets_are_unset_before_comfyui_starts(self):
+        names = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "CF_TUNNEL_TOKEN", "COMFY_MODELS_S3_ENDPOINT")
+        unset = re.search(r"^unset (.*)$", self.script, re.MULTILINE)
+        self.assertEqual(tuple(unset.group(1).split()), names)
+        self.assertLess(self.script.index("\tstart_tunnel\n"), unset.start())
+        self.assertLess(self.script.index('if ! python "$COMFY_ROOT/docker/s3_models_sync.py"'), unset.start())
+        after = self.script[unset.end():]
+        self.assertIn("exec python main.py", after)
+        for name in names:
+            self.assertNotIn(name, after, f"{name} is read after it is unset")
 
     def test_a_failed_sync_or_prefetch_stops_the_container(self):
         block = self.script[self.script.index('if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then'):self.script.index("# --- ComfyUI server")]
@@ -487,6 +505,9 @@ time.sleep(60)
         log = re.search(r"^log\(\) \{.*\}$", script, re.MULTILINE).group(0)
         start = script.index("TUNNEL_METRICS=127.0.0.1:20241")
         block = script[start:script.index("\n}\n", start) + 3]
+        # As in the entrypoint: the token comes from the container's env, and is
+        # unset (here at once) before ComfyUI starts, while cloudflared keeps running.
+        unset = re.search(r"^unset .*CF_TUNNEL_TOKEN.*$", script, re.MULTILINE).group(0)
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
@@ -498,9 +519,9 @@ time.sleep(60)
             os.symlink(sys.executable, os.path.join(bin_dir, "python"))
             # kill 0 ends the whole process group: the harness, the supervisor and the fake.
             harness = "\n".join(["set -euo pipefail", log, block, f"TUNNEL_METRICS=127.0.0.1:{self.port}",
-                                 f"CF_TUNNEL_TOKEN='{self.TOKEN}'", "start_tunnel", f"sleep {seconds}", "kill 0"])
-            result = subprocess.run(["bash", "-c", harness], env={"PATH": bin_dir + os.pathsep + os.environ["PATH"], "FAKE_CLOUDFLARED": mode},
-                                    capture_output=True, text=True, timeout=60, start_new_session=True)
+                                 "start_tunnel", unset, f"sleep {seconds}", "kill 0"])
+            env = {"PATH": bin_dir + os.pathsep + os.environ["PATH"], "FAKE_CLOUDFLARED": mode, "CF_TUNNEL_TOKEN": self.TOKEN}
+            result = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60, start_new_session=True)
         return result.stdout + result.stderr
 
     def test_restarts_with_backoff_and_masks_the_token(self):
@@ -511,6 +532,12 @@ time.sleep(60)
         self.assertIn("entrypoint: cloudflared exited (status 3); restarting in 1s", out)
         self.assertIn("entrypoint: cloudflared exited (status 3); restarting in 2s", out)
         self.assertNotIn("tunnel ready", out)
+
+    def test_restarts_keep_the_token_after_it_is_unset(self):
+        out = self.run_supervisor("exit", 3.5)
+        runs = [line for line in out.splitlines() if line.startswith("cloudflared: INF token from env:")]
+        self.assertGreaterEqual(len(runs), 2, out)
+        self.assertEqual(set(runs), {"cloudflared: INF token from env: ***"}, "every restart still gets the token")
 
     def test_logs_when_the_tunnel_is_ready(self):
         out = self.run_supervisor("serve", 4)
@@ -592,7 +619,7 @@ class TestPublishWorkflow(unittest.TestCase):
         runs = "\n".join(s.get("run", "") for s in self.jobs["build"]["steps"])
         self.assertIn('--entrypoint cloudflared "$SMOKE_TAG" --version', runs)
         self.assertIn('--entrypoint s5cmd "$SMOKE_TAG" version', runs)
-        self.assertIn("-e COMFY_MODELS_S3_BUCKET=smoke", runs)
+        self.assertIn('timeout 120 docker run --rm --network none -e COMFY_MODELS_S3_BUCKET=smoke "$SMOKE_TAG"', runs)
         self.assertIn("not starting ComfyUI", runs)
 
 

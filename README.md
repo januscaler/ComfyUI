@@ -173,10 +173,10 @@ Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu128** whe
 | `CF_TUNNEL_TOKEN` | unset | vast.ai: token of the pod's remotely-managed Cloudflare tunnel. Runs `cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 run` beside ComfyUI (server mode only), restarted with backoff. Never printed. |
 | `COMFY_MODELS_S3_BUCKET` | unset | vast.ai: copy the weights from this bucket into the models dir before ComfyUI starts (server mode only). |
 | `COMFY_MODELS_S3_ENDPOINT` | unset (AWS S3) | e.g. `https://<account>.r2.cloudflarestorage.com`. |
-| `COMFY_MODELS_S3_PREFIX` | `models/` | Key prefix mapped onto the models dir: `models/vae/x.safetensors` → `<models dir>/vae/x.safetensors`. |
+| `COMFY_MODELS_S3_PREFIX` | `models/` (also when empty) | Key prefix mapped onto the models dir: `models/vae/x.safetensors` → `<models dir>/vae/x.safetensors`. `/` maps the bucket root. |
 | `COMFY_MODELS_S3_INCLUDE` | everything | Comma-separated globs on the path under the prefix (`*` also matches `/`), e.g. `diffusion_models/*int8*,text_encoders/*,vae/*`. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | unset, unset, `auto` | The bucket's credentials (required with a bucket, never printed); `auto` is R2's region. |
-| `COMFY_MODELS_PREFETCH` | unset | Without a bucket: `1` runs `prefetch` (the default checkpoints, from Hugging Face) before ComfyUI starts. |
+| `COMFY_MODELS_PREFETCH` | unset | Without a bucket: `1` runs `prefetch` (the default checkpoints, from Hugging Face) before ComfyUI starts. Empty, `0`, `false`, `no` and `off` leave it off. |
 
 **Local GPU box**: `cp .env.example .env`, then `docker compose pull && docker compose up -d` (or `docker compose up -d --build` to build this tree). `COMFYUI_HOST_PORT=8282` publishes it where the FloStudio rig is reached over WireGuard.
 
@@ -235,9 +235,17 @@ cd /workspace/envs && ls | grep -vx "$(cat /opt/ComfyUI/docker/env-key).tar" | x
 vast.ai pods run the full image with `COMFYUI_DATA_DIR=/workspace` on the container disk. There is no shared volume and no HTTPS proxy, so voxmin-backend gives each pod its own Cloudflare tunnel (`CF_TUNNEL_TOKEN`; the tunnel's ingress routes the pod's hostname to `http://127.0.0.1:8188`) and a bucket to copy the weights from (`COMFY_MODELS_S3_*` and the R2 credentials). In server mode the entrypoint then:
 
 - starts `cloudflared` in the background with the token in `TUNNEL_TOKEN` (not argv, so `ps` never shows it), prefixes its output `cloudflared:` with the token masked, restarts it with backoff (1 s doubling to 60 s) whenever it exits, and logs `tunnel ready` once its `/ready` metrics endpoint answers 200;
-- copies the weights with [`docker/s3_models_sync.py`](docker/s3_models_sync.py) before ComfyUI starts: `s5cmd` fetches 4 files at once, each as 16 parallel 64 MiB ranged GETs. A file already on disk with the object's size is kept, so a stopped-then-started container downloads nothing; each download lands as `<name>.s3-partial` and is renamed only once it has the object's full size (leftovers of a killed sync are deleted on the next run). Each file gets 3 attempts; if one still fails the container exits non-zero and never becomes ready, and the backend recycles it. The last line reports files, bytes, seconds and MB/s.
+- copies the weights with [`docker/s3_models_sync.py`](docker/s3_models_sync.py) before ComfyUI starts: `s5cmd` fetches 4 files at once, each as 16 parallel 64 MiB ranged GETs. A file already on disk with the object's size is kept, so a stopped-then-started container downloads nothing; each download lands as `<name>.s3-partial` and is renamed only once it has the object's full size (leftovers of a killed sync are deleted on the next run). The disk must hold the download plus a 5 GB margin. A download still running after 10 minutes and slower than 20 MB/s is killed. Each file gets 3 attempts; if one still fails the container exits non-zero and never becomes ready, and the backend recycles it. A `progress` line every 30 s and the last line report files, bytes, seconds and MB/s.
 
-Without a bucket, `COMFY_MODELS_PREFETCH=1` fetches the default checkpoints from Hugging Face (`prefetch`) before starting instead. To see what a pod would download: `docker run --rm -e COMFY_MODELS_S3_BUCKET=... -e COMFY_MODELS_S3_ENDPOINT=... -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... --entrypoint python shivanshtalwar0/comfyui docker/s3_models_sync.py models --dry-run`.
+Without a bucket, `COMFY_MODELS_PREFETCH=1` fetches the default checkpoints from Hugging Face (`prefetch`) before starting instead. To see what a pod would download, with the credentials exported in your shell (`-e NAME` with no value passes them through, so they stay out of your shell history):
+
+```bash
+docker run --rm -e COMFY_MODELS_S3_BUCKET=<bucket> -e COMFY_MODELS_S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  --entrypoint python shivanshtalwar0/comfyui docker/s3_models_sync.py models --dry-run
+```
+
+ComfyUI itself starts without the bucket credentials and the tunnel token in its environment: the entrypoint unsets them first.
 
 ## Features
 - A visual node graph for building and reusing image, video, audio, 3D, and text workflows without code.

@@ -30,6 +30,12 @@ cd "$COMFY_ROOT"
 
 log() { echo "entrypoint: $*" >&2; }
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# An on/off env var: unset, empty, 0, false, no and off are off.
+flag_on() {
+	case "${1:-}" in
+		"" | 0 | [Ff]alse | FALSE | [Nn]o | NO | [Oo]ff | OFF) return 1 ;;
+	esac
+}
 
 # --- Persistent storage --------------------------------------------------
 # COMFYUI_DATA_DIR holds what must outlive a container: model weights, the
@@ -373,7 +379,8 @@ fi
 #                              this bucket into the models dir before ComfyUI
 #                              starts: docker/s3_models_sync.py
 #   COMFY_MODELS_PREFETCH=1    without a bucket: fetch the wrapper's default
-#                              checkpoints from Hugging Face first (`prefetch`)
+#                              checkpoints from Hugging Face first (`prefetch`);
+#                              empty, 0, false, no or off leave it off
 # A failed sync or prefetch exits non-zero: a pod that never becomes ready is
 # recycled by the backend. Server mode only, and with none of these set nothing
 # here runs (RunPod pods, the local box).
@@ -427,7 +434,7 @@ if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then
 		log "ERROR: copying the models from s3://$COMFY_MODELS_S3_BUCKET failed; not starting ComfyUI"
 		exit 1
 	fi
-elif [[ -n "${COMFY_MODELS_PREFETCH:-}" && "$COMFY_MODELS_PREFETCH" != 0 ]]; then
+elif flag_on "${COMFY_MODELS_PREFETCH:-}"; then
 	if ! python "$COMFY_ROOT/docker/prefetch_models.py"; then
 		log "ERROR: prefetching the models failed; not starting ComfyUI"
 		exit 1
@@ -464,6 +471,10 @@ if [[ -n "${WRAPPER_AUTH_TOKEN:-}" ]]; then
 else
 	echo "entrypoint: WARNING: WRAPPER_AUTH_TOKEN is unset; the server is open to anyone who can reach it" >&2
 fi
+
+# ComfyUI and its custom nodes need none of these: keep them out of its
+# environment (/proc/self/environ). The tunnel loop has its own copy of the token.
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN CF_TUNNEL_TOKEN COMFY_MODELS_S3_ENDPOINT
 
 log "starting ComfyUI ($(command -v python), ${SECONDS}s after container start)"
 exec python main.py "${args[@]}" "${extra[@]}" "$@"
