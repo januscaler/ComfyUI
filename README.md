@@ -247,6 +247,335 @@ docker run --rm -e COMFY_MODELS_S3_BUCKET=<bucket> -e COMFY_MODELS_S3_ENDPOINT=h
 
 ComfyUI itself starts without the bucket credentials and the tunnel token in its environment: the entrypoint unsets them first.
 
+### Serverless API (RunPod and vast.ai)
+
+Serverless workers render MiniMax H3 videos (or any other wrapper workflow) on GPUs that run only while there is work. [`docker/serverless/Dockerfile`](docker/serverless/Dockerfile) builds two worker images on top of the full image:
+
+| Image | Platform | Worker |
+|---|---|---|
+| `shivanshtalwar0/comfyui:serverless-runpod` | RunPod Serverless, queue endpoint | [`runpod_handler.py`](docker/serverless/runpod_handler.py) |
+| `shivanshtalwar0/comfyui:serverless-vast` | vast.ai Serverless, PyWorker | [`vast_worker.py`](docker/serverless/vast_worker.py) |
+
+Each worker starts ComfyUI + wrapper on `127.0.0.1`, with a bearer token it makes at boot so nothing else can reach it, and runs each request as one wrapper render ([`docker/serverless/jobs.py`](docker/serverless/jobs.py)). The platform SDK lives in its own venv (`/opt/worker-env`), away from ComfyUI's packages. A job means the same on both platforms; only the envelope differs. CI builds both images on the full image of the same commit, smoke-tests them in CPU mode and pushes them as `serverless-<platform>` and `serverless-<platform>-sha-<short>` (plus `-X.Y.Z` for version tags, `-<branch>` for manual runs).
+
+#### Quick start (RunPod)
+
+```bash
+export RUNPOD_API_KEY=...   # RunPod console → Settings → API Keys
+export ENDPOINT_ID=...      # RunPod console → Serverless → the endpoint's id
+
+curl -s "https://api.runpod.ai/v2/$ENDPOINT_ID/runsync" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"input": {"prompt": "A red fox trots across fresh snow at sunrise, its breath misting in the cold air.", "fields": {"duration": 3}}}' \
+  > reply.json
+jq '{status, error, seconds: .output.seconds, settings: .output.provenance.settings}' reply.json
+jq -r .output.base64 reply.json | base64 --decode > fox.mp4
+```
+
+A warm RTX PRO 6000 worker renders that 3 s, 864×480 clip in about 70 s; a default clip (5.17 s) on a freshly started worker took 259 s, loading the models included. `/runsync` waits about 90 s. A job that takes longer (a cold worker, a first-use model download, a longer clip) comes back as `IN_QUEUE` or `IN_PROGRESS` with its `id`: poll `/status/<id>`, as the clients below do.
+
+#### The job
+
+The job is RunPod's `input` and vast.ai's `payload`. Only `prompt` is required; the defaults render a MiniMax H3 text-to-video clip.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `prompt` | required | What to render. Sent to the wrapper as `raw_prompt`, which H3 gets verbatim. |
+| `rewrite` | `false` | `true` sends `prompt` as a plain description that a MiMo LLM rewrites into H3's structured prompt format (needs `MIMO_API_KEY` in the endpoint's env). |
+| `workflow` | `minimaxh3` | Any wrapper workflow: `minimaxh3`, `flux2klein9b`, `flux2klein9b-txt2img`, `qwenimage21`, `qwenimage21-txt2img`, `ideogram4`. |
+| `task` | `text` | The H3 task: `text`, `image` or `reference`. Without `workflow` it defaults to `text`; with another workflow, only workflows that have tasks take one. |
+| `fields` | `{}` | The wrapper's form fields, as they are (below). |
+| `files` | `[]` | Uploads (below). |
+| `upload_url` | none | A presigned `PUT` URL: the output is uploaded there instead of returned inline. |
+| `timeout` | `1800` | Seconds the job may take, including a first-use checkpoint download. A render still running then is cancelled. |
+
+H3 `fields`, all optional:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `width`, `height` | `864`, `480` | Rounded up to a multiple of 32. A canvas larger than H3's native 1344×768 is scaled down, keeping the aspect ratio. |
+| `duration` | `5.17` | Seconds at 24 fps. The wrapper caps a clip at 124 frames (5.17 s) and width×height×frames at 1152×640×124. Those are the limits of a 32 GB-RAM box: raise them on bigger workers with `COMFY_MINIMAX_H3_MAX_FRAMES` / `COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES` in the endpoint's env. The model is trained for 5-15 s. A request past a cap fails with a message naming it. |
+| `steps` | `20` | Below ~15, motion and audio get mushy; above ~30, the returns diminish. |
+| `seed` | random | Reported back in `provenance.seed`. |
+| `scheduler` | `beta` | `beta`, `normal` or `simple`. |
+| `quantization` | `int8` | UNET precision: `int8` or `fp8` (~21 GB each), `bf16` (~40 GB), `nvfp4`. Anything but `int8` downloads its checkpoint on first use. |
+| `ref_image_size` | `match` | `reference` task: `match` sizes references to the video's pixel area; `max` keeps a 2048 px short edge (stronger identity, slower). |
+| `llm_model` | `auto` | With `rewrite`: which MiMo model writes the prompt. |
+| `free_vram` | `false` | `true` unloads the models after the job, so the next job reloads them. |
+
+`files` items are `{"field": "image", "url": "https://..."}`, which the worker downloads (the file name comes from the URL unless `filename` is given), or `{"field": "image", "base64": "...", "filename": "first.png"}`, where `filename` is required because its extension picks the file type. RunPod limits the size of a request body, so send anything bigger than a small image as a URL. To attach several files to one field, repeat the field; they are numbered in the order given.
+
+| Task | Upload fields |
+|---|---|
+| `text` | `llm_image`: visual context for `rewrite` only; never reaches H3 |
+| `image` | `image`: first frame, required; `last_frame`: optional end frame; `llm_image` |
+| `reference` | `ref_images` (up to 3), `ref_videos` (1), `ref_video_audios` (1), `ref_audios` (up to 3), `image` / `last_frame` (pinned first / last frame), `llm_image` |
+
+Images are `.png .jpg .jpeg .webp .bmp .gif` (up to 64 MB), videos `.mp4 .webm .mov .mkv .avi .gif` (512 MB), audio `.wav .mp3 .flac .ogg .m4a .aac .wma` (256 MB). In a `reference` prompt the assets are `<Picture 1>`, `<Video 1>` and `<Audio 1>`, numbered in upload order. The first reference job downloads the 21 GB ref2va UNET.
+
+**Prompts.** H3 was trained on a structured prompt: an alignment instruction, `integrated_multimodal_description` split into timed shots, `overall_soundscape` and `non_diegetic_music` (see [MiniMax's prompt guide](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing)). A plain description sent verbatim still renders, just with less control. To get the structured version, either set `"rewrite": true`, or draft it once with the wrapper's `POST /api/wrapper/minimaxh3/prompt` on any box that has `MIMO_API_KEY` and send the result back as `prompt`.
+
+#### Example jobs
+
+These go in `{"input": ...}` on RunPod and as the `payload` on vast.ai.
+
+```jsonc
+// Text to video, with settings
+{"prompt": "A lighthouse keeper climbs a spiral staircase at night, lantern swinging, wind howling outside.",
+ "fields": {"width": 768, "height": 768, "duration": 4, "steps": 24, "seed": 42}}
+
+// Image to video: the photo is the first frame
+{"task": "image",
+ "prompt": "The woman in the photo turns toward the camera and smiles as the wind lifts her hair.",
+ "files": [{"field": "image", "url": "https://example.com/portrait.jpg"}]}
+
+// First and last frame, inline
+{"task": "image", "prompt": "The empty room fills with furniture as the camera slowly pushes in.",
+ "files": [{"field": "image", "base64": "<base64 of first.png>", "filename": "first.png"},
+           {"field": "last_frame", "base64": "<base64 of last.png>", "filename": "last.png"}]}
+
+// Reference to video: a character and a voice
+{"task": "reference",
+ "prompt": "Show <Picture 1> skateboarding down a sunlit street, the camera follows from the side, <Audio 1> with the sound of wheels rolling on asphalt, cinematic 24fps handheld shot.",
+ "files": [{"field": "ref_images", "url": "https://example.com/skater.png"},
+           {"field": "ref_audios", "url": "https://example.com/voice.wav"}]}
+
+// Plain description, rewritten by the LLM (needs MIMO_API_KEY on the endpoint)
+{"prompt": "two wrestlers in a gym, one chokeslams the other onto a crash mat, heavy metal soundtrack", "rewrite": true}
+
+// A still image from another workflow
+{"workflow": "flux2klein9b-txt2img", "prompt": "A cozy reading nook with a cat asleep on a stack of books, warm lamp light"}
+
+// Output to your own bucket instead of inline
+{"prompt": "Ocean waves roll onto a quiet beach at golden hour.", "upload_url": "https://<bucket>.r2.cloudflarestorage.com/renders/waves.mp4?X-Amz-..."}
+```
+
+To build a base64 file item from the shell: `jq -n --arg b64 "$(base64 < first.png)" '{field: "image", base64: $b64, filename: "first.png"}'`. The worker ignores line breaks in base64.
+
+For `upload_url`, the worker `PUT`s the file with `Content-Type` set to the output's type (`video/mp4` for H3), so presign for that type. Any S3-compatible store works; for example, with boto3 against R2:
+
+```python
+import boto3
+
+s3 = boto3.client("s3", endpoint_url="https://<account>.r2.cloudflarestorage.com")
+upload_url = s3.generate_presigned_url("put_object", ExpiresIn=3600,
+                                       Params={"Bucket": "renders", "Key": "waves.mp4", "ContentType": "video/mp4"})
+```
+
+#### The result
+
+RunPod's `/runsync` or `/status/<id>` for a finished job (vast.ai returns the same object as `{"result": ...}`):
+
+```json
+{
+  "id": "d7efb7a5-18b9-4e73-9e59-9c75e1078e7c-e2",
+  "status": "COMPLETED",
+  "delayTime": 65598,
+  "executionTime": 108305,
+  "workerId": "ytuk0vik4wxvlw",
+  "output": {
+    "job_id": "17bfa0db-dcac-4a51-97a4-1ee9e5568578",
+    "content_type": "video/mp4",
+    "filename": "minimaxh3_00001_.mp4",
+    "bytes": 398263,
+    "seconds": 107.9,
+    "provenance": {
+      "mode": "T2VA",
+      "seed": 7,
+      "models": ["minimax_h3_fl2va_pruned_int8_convrot.safetensors", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"],
+      "settings": {"width": 864, "height": 480, "duration": 2, "steps": 20, "scheduler": "beta"},
+      "prompt_source": "raw_prompt",
+      "note": "raw_prompt used verbatim; no LLM rewrite"
+    },
+    "base64": "AAAAIGZ0eXBpc29tAAACAGlzb21pc28y..."
+  }
+}
+```
+
+With `upload_url` the output has `"uploaded": true` and no `base64`. RunPod keeps results small, so an output over 15 MB needs `upload_url`. `delayTime` (queue plus worker start) and `executionTime` are milliseconds; `seconds` is the render as the worker timed it. `provenance` records what actually ran; send its `seed` and settings back to reproduce a clip.
+
+While a job runs, `/status/<id>` has `"status": "IN_PROGRESS"` and the render's progress as `output`:
+
+```json
+{"status": "in_progress", "percent": 64, "step": {"value": 12, "max": 20}, "node": "SamplerCustomAdvanced"}
+```
+
+A job that cannot be rendered fails with the wrapper's reason, for example on RunPod:
+
+```json
+{"status": "FAILED", "error": "the render was refused (HTTP 400): Unknown workflow — Available workflows: flux2klein9b, flux2klein9b-txt2img, ideogram4, minimaxh3, qwenimage21, qwenimage21-txt2img"}
+```
+
+#### RunPod API
+
+All routes are under `https://api.runpod.ai/v2/<endpoint_id>` with `Authorization: Bearer <RUNPOD_API_KEY>`:
+
+| Route | Use |
+|---|---|
+| `POST /runsync` `{"input": job}` | Waits about 90 s, then answers with the result or with `id` + `IN_QUEUE` / `IN_PROGRESS`. The result is kept for 1 minute. |
+| `POST /run` `{"input": job, "webhook": "https://..."}` | Answers `{"id", "status": "IN_QUEUE"}` at once. The result is kept for 30 minutes. With `webhook`, RunPod also POSTs the final status object there. |
+| `GET /status/<id>` | `IN_QUEUE`, `IN_PROGRESS` (with progress), then `COMPLETED`, `FAILED`, `CANCELLED` or `TIMED_OUT`. |
+| `POST /cancel/<id>` | Cancels a queued or running job. |
+| `GET /health` | Jobs by state and workers by state. `throttled` workers mean RunPod has no GPU of the allowed types free in the endpoint's data center at the moment; queued jobs start once one frees up. |
+
+A shell loop around `/run`:
+
+```bash
+id=$(curl -s "https://api.runpod.ai/v2/$ENDPOINT_ID/run" -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -H 'Content-Type: application/json' -d '{"input": {"prompt": "A lighthouse keeper climbs a spiral staircase at night."}}' | jq -r .id)
+while :; do
+  curl -s "https://api.runpod.ai/v2/$ENDPOINT_ID/status/$id" -H "Authorization: Bearer $RUNPOD_API_KEY" > status.json
+  status=$(jq -r .status status.json)
+  echo "$status $(jq -r '.output.percent // empty' status.json)"
+  case $status in COMPLETED | FAILED | CANCELLED | TIMED_OUT) break ;; esac
+  sleep 5
+done
+jq -r .output.base64 status.json | base64 --decode > lighthouse.mp4
+```
+
+Python (`requests`):
+
+```python
+import base64
+import os
+import time
+
+import requests
+
+API = f"https://api.runpod.ai/v2/{os.environ['ENDPOINT_ID']}"
+HEADERS = {"Authorization": f"Bearer {os.environ['RUNPOD_API_KEY']}"}
+
+
+def render(job: dict, poll_seconds: float = 5) -> dict:
+    """Run one job and return its output; raises with the worker's reason if it fails."""
+    job_id = requests.post(f"{API}/run", json={"input": job}, headers=HEADERS, timeout=30).json()["id"]
+    while True:
+        status = requests.get(f"{API}/status/{job_id}", headers=HEADERS, timeout=30).json()
+        if status["status"] == "COMPLETED":
+            return status["output"]
+        if status["status"] in ("FAILED", "CANCELLED", "TIMED_OUT"):
+            raise RuntimeError(status.get("error") or status["status"])
+        if status.get("output"):
+            print(f"{status['output'].get('percent')}% {status['output'].get('node')}")
+        time.sleep(poll_seconds)
+
+
+output = render({"prompt": "A red fox trots across fresh snow at sunrise.", "fields": {"duration": 3, "seed": 7}})
+with open("fox.mp4", "wb") as f:
+    f.write(base64.b64decode(output["base64"]))
+print(output["seconds"], "s", output["provenance"]["settings"])
+```
+
+TypeScript (Node 18+, `fetch`):
+
+```ts
+import { writeFile } from "node:fs/promises";
+
+const API = `https://api.runpod.ai/v2/${process.env.ENDPOINT_ID}`;
+const headers = { Authorization: `Bearer ${process.env.RUNPOD_API_KEY}`, "Content-Type": "application/json" };
+
+type RenderOutput = {
+  job_id: string; content_type: string; filename: string; bytes: number; seconds: number;
+  provenance: Record<string, unknown>; base64?: string; uploaded?: boolean;
+};
+
+export async function render(job: Record<string, unknown>, pollMs = 5000): Promise<RenderOutput> {
+  const { id } = await (await fetch(`${API}/run`, { method: "POST", headers, body: JSON.stringify({ input: job }) })).json();
+  for (;;) {
+    const status = await (await fetch(`${API}/status/${id}`, { headers })).json();
+    if (status.status === "COMPLETED") return status.output;
+    if (["FAILED", "CANCELLED", "TIMED_OUT"].includes(status.status)) throw new Error(status.error ?? status.status);
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+const output = await render({ prompt: "A red fox trots across fresh snow at sunrise.", fields: { duration: 3 } });
+await writeFile("fox.mp4", Buffer.from(output.base64!, "base64"));
+```
+
+#### vast.ai API
+
+vast.ai has no job queue of its own. A client asks vast's router (`https://run.vast.ai/route/`) for a ready worker, then POSTs `{"auth_data": <the router's reply>, "payload": job}` to that worker's `/generate` over TLS. The worker checks the router's signature, renders, and answers `{"result": <the result>}` (errors as `{"result": {"error": "..."}}`). The `vastai` SDK does all of that, including waiting while the endpoint starts a worker:
+
+```python
+import asyncio
+import base64
+
+from vastai import Serverless  # pip install vastai
+
+
+async def main():
+    async with Serverless() as client:  # reads VAST_API_KEY
+        endpoint = await client.get_endpoint(name="comfyui-serverless-h3")
+        reply = await endpoint.request("/generate", {"prompt": "A red fox trots across fresh snow at sunrise.",
+                                                     "fields": {"duration": 3}})
+        result = reply["response"]["result"]
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        with open("fox.mp4", "wb") as f:
+            f.write(base64.b64decode(result["base64"]))
+
+
+asyncio.run(main())
+```
+
+The SDK gives a worker 600 s to answer, which covers H3 clips at the default settings; send longer jobs with an `upload_url`. The same flow by hand (the router answers without a `url` while no worker is ready; ask again after a few seconds):
+
+```bash
+curl -s -o jvastai_root.cer https://console.vast.ai/static/jvastai_root.cer   # vast's CA for worker certificates
+route=$(curl -s https://run.vast.ai/route/ -H "Authorization: Bearer $VAST_API_KEY" -H 'Content-Type: application/json' \
+  -d "{\"endpoint\": \"comfyui-serverless-h3\", \"api_key\": \"$VAST_API_KEY\", \"cost\": 100}")
+jq -n --argjson auth "$route" '{auth_data: $auth, payload: {prompt: "A red fox trots across fresh snow at sunrise."}}' \
+  | curl -s --cacert jvastai_root.cer "$(jq -r .url <<<"$route")/generate" -H 'Content-Type: application/json' -d @- > reply.json
+jq -r .result.base64 reply.json | base64 --decode > fox.mp4
+```
+
+A render longer than one request should stay open (or one that must survive a client restart) runs asynchronously on one worker, pinned by a vast session. Route once, then send to that worker's URL, each body carrying the router's reply as `auth_data`:
+
+| Worker route | Body | Answer |
+|---|---|---|
+| `POST /session/create` | `{"auth_data", "payload": {"lifetime": 900}}` | `{"session_id"}`; every later request extends the session by `lifetime` |
+| `POST /submit` | `{"auth_data", "session_id", "payload": job}` | `{"result": {"job_id"}}`, or `{"result": {"error"}}` for a job the wrapper refuses |
+| `POST /status` | `{"auth_data", "session_id", "payload": {"job_id", "upload_url"?}}` | `{"result": {"status": "pending" \| "in_progress" \| "completed" \| "failed" \| "cancelled", "progress"?, "output"?, "error"?}}` |
+| `POST /cancel` | `{"auth_data", "session_id", "payload": {"job_id"}}` | `{"result": {"cancelled": true}}` |
+| `POST /session/end` | `{"auth_data", "session_id"}` | |
+
+`output` is the same result as above and is reported once; the worker then deletes its copy. A `410` means the worker restarted and lost the session: submit again. These routes carry no workload of their own, so they never queue behind a `/generate`.
+
+#### Deploying
+
+**RunPod.** A serverless template on `docker.io/shivanshtalwar0/comfyui:serverless-runpod` (pin a `serverless-runpod-sha-<short>` tag or a digest so workers roll deliberately), 20 GB container disk. A queue endpoint on it:
+
+```json
+{"name": "comfyui-serverless-h3", "templateId": "<template id>", "networkVolumeId": "<volume id>",
+ "gpuTypeIds": ["NVIDIA GeForce RTX 5090", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"],
+ "minCudaVersion": "12.8", "workersMin": 0, "workersMax": 2, "idleTimeout": 60, "executionTimeoutMs": 3600000, "flashboot": true}
+```
+
+(`POST https://rest.runpod.io/v1/endpoints`.) The network volume (80 GB holds every H3 task plus Qwen Image 2.1) is mounted at `/runpod-volume` and becomes the data dir, in the layout the pods use on `/workspace`. Without one, every new worker downloads the checkpoints onto its container disk (about 43 GB for H3, 17 GB for Qwen Image 2.1), so give it 80 GB instead of 20. The first job on an empty volume downloads that task's checkpoints onto it, and every later worker reuses them. The volume pins the endpoint to its data center, so list every GPU type that can run H3 there: a data center out of those GPUs shows `throttled` workers until one frees up. `workersMin: 1` keeps one worker warm (billed while idle); `idleTimeout` is how long a worker stays up after its last job. Put `MIMO_API_KEY` (for `rewrite`) and `HF_TOKEN` (for gated FLUX.2 weights) in the template's env.
+
+**vast.ai.** A private template on `shivanshtalwar0/comfyui:serverless-vast` in entrypoint mode (neither `--ssh` nor `--jupyter`) with `-p 3000:3000` for the PyWorker and a disk that holds the weights. A workergroup without a template starts its instances in SSH mode, which replaces the image's entrypoint, so the PyWorker never runs. The weights come either from R2, through the vast.ai pod env (`COMFY_MODELS_S3_*` + R2 credentials; keep the template private), or from Hugging Face (`COMFY_MODELS_PREFETCH=1 PREFETCH_MODELS=minimaxh3:int8`). Then an endpoint and a workergroup:
+
+```bash
+vastai create template --name comfyui-serverless-vast --image shivanshtalwar0/comfyui --image_tag serverless-vast \
+  --env '-p 3000:3000 -e COMFY_MODELS_PREFETCH=1 -e PREFETCH_MODELS=minimaxh3:int8' --disk_space 100 \
+  --search_params 'gpu_name=RTX_5090 num_gpus=1 verified=true rentable=true direct_port_count>=2 cuda_max_good>=12.8 disk_space>=100 reliability>=0.98 inet_down>=1000 cpu_ram>=60 disk_bw>=1500 dlperf>=150 storage_cost<=0.2'
+vastai create endpoint --endpoint_name comfyui-serverless-h3 --cold_workers 1 --max_workers 2 --min_load 0 --inactivity_timeout 600
+vastai create workergroup --endpoint_name comfyui-serverless-h3 --template_hash <hash from create template>
+```
+
+At boot a vast.ai worker has vast sign its TLS certificate, copies the weights, starts ComfyUI, and renders the benchmark job twice (a warm-up that loads the models, then a timed run that tells vast how fast the worker is) before it takes traffic. A stopped (cold) worker keeps its weights and its benchmark result, so it restarts much faster. An endpoint that serves another workflow sets `SERVERLESS_BENCHMARK_JOB` to a job of that workflow (JSON). Creating an endpoint needs $5 of vast.ai credit.
+
+A cold worker still pays for its disk. Hosts price disk from about $0.07 to $1.00 per GB per month, so cap it in the search (`storage_cost<=0.2`: 80 GB costs at most $16 a month). `--cold_workers 0` costs nothing idle, but every render after a quiet spell then waits for a new worker: about 7 minutes to copy the 42.5 GB of H3 weights, plus the two benchmark renders. Hosts also vary a lot in speed beyond the GPU. One RTX 5090 host whose container was limited to 43.5 GB of RAM (less than the weights) rendered a 2 s clip at 2.5 s a step but a 5 s clip at 26 s a step, several times slower than RunPod's 5090s: the weights no longer fit in RAM next to the activations. The floors above (`inet_down`, `cpu_ram`, `disk_bw`, `dlperf`) are the ones FloStudio's vast.ai pods use; that host fails `inet_down>=1000`.
+
+| Worker env | Default | Meaning |
+|---|---|---|
+| `SERVERLESS_BOOT_TIMEOUT` | `1800` | Seconds a worker may take to boot (weights copy included) before it gives up. |
+| `SERVERLESS_BENCHMARK_JOB` | an H3 text job | vast.ai: the job the worker benchmarks with. |
+| `COMFY_MINIMAX_H3_MAX_FRAMES`, `COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES` | `124`, `1152*640*124` | The H3 length and canvas×frames caps, for workers with more RAM than the 32 GB box they were measured on. |
+| `MIMO_API_KEY`, `HF_TOKEN` | unset | `rewrite`; gated FLUX.2 [klein] weights. |
+| `COMFYUI_ARGS`, `VRAM_HEADROOM_GB`, ... | | As in the [Docker image](#docker-image-local-gpu-box-runpod-and-vastai) table. |
+
 ## Features
 - A visual node graph for building and reusing image, video, audio, 3D, and text workflows without code.
 - Reusable subgraphs, workflow templates, App Mode, and a local API for integrating workflows into applications.

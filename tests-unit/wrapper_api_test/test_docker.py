@@ -158,6 +158,44 @@ class TestDockerfile(unittest.TestCase):
         self.assertIn("COPY . .", stages["comfyui"][1])
 
 
+class TestServerlessImages(unittest.TestCase):
+    """docker/serverless/Dockerfile: a worker in its own venv on top of the full image."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stages = dockerfile_stages(read("docker", "serverless", "Dockerfile"))
+
+    def test_each_target_runs_its_worker_from_the_worker_venv(self):
+        for target, script, sdk in (("runpod", "runpod_handler.py", "runpod=="), ("vast", "vast_worker.py", "vastai==")):
+            image, text = self.stages[target]
+            self.assertEqual(image, "${BASE_IMAGE}")
+            self.assertIn(f"{sdk}${{", text)
+            self.assertIn("uv venv", text)
+            self.assertIn(f"COPY jobs.py {script} /opt/ComfyUI/docker/serverless/", text)
+            self.assertIn(f'ENTRYPOINT ["tini", "--", "/opt/worker-env/bin/python", "/opt/ComfyUI/docker/serverless/{script}"]', text)
+            # The base healthcheck needs a WRAPPER_AUTH_TOKEN the worker no longer exports.
+            self.assertIn("HEALTHCHECK NONE", text)
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, "docker", "serverless", script)))
+        self.assertIn("EXPOSE 3000", self.stages["vast"][1])
+
+    def test_ci_builds_both_on_the_pushed_full_image(self):
+        job = yaml.safe_load(read(".github", "workflows", "docker-publish.yml"))["jobs"]["serverless"]
+        self.assertEqual(job["needs"], ["mode", "build"])
+        self.assertEqual(job["strategy"]["matrix"]["target"], ["runpod", "vast"])
+        steps = {step.get("name"): step for step in job["steps"]}
+        self.assertIn(':sha-${GITHUB_SHA::7}', steps["Base image"]["run"])
+        self.assertTrue(steps["Build"]["with"]["load"])
+        self.assertTrue(steps["Push to Docker Hub"]["with"]["push"])
+        meta = steps["Image tags"]["with"]
+        self.assertIn("latest=false", meta["flavor"])
+        self.assertIn("type=raw,value=serverless-${{ matrix.target }},enable={{is_default_branch}}", meta["tags"])
+        runs = "\n".join(step.get("run", "") for step in job["steps"])
+        self.assertIn("--test_input", runs)
+        self.assertIn("Lifecycle startup failed", runs)
+        self.assertIn("ComfyUI stopped on this worker", runs)
+        self.assertEqual(runs.count("Unknown workflow"), 2)
+
+
 class TestRunpodTarget(unittest.TestCase):
     """The slim RunPod image: system packages + uv + sources, no Python deps."""
 

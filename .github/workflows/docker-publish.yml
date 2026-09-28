@@ -16,6 +16,11 @@
 # The two flavours build in parallel jobs (own runner disk, own registry build
 # cache: :buildcache and :buildcache-runpod).
 #
+# Once the full image is pushed, the serverless workers (docker/serverless/
+# Dockerfile) are built on top of it: :serverless-runpod and :serverless-vast
+# (+ -sha-<short>, -X.Y.Z, -<branch> as above). A pull request never pushes
+# the full image, so it builds neither.
+#
 # Needs the repository secret DOCKERHUB_TOKEN (a Docker Hub access token with
 # Read & Write on the repository). DOCKERHUB_USERNAME / DOCKERHUB_IMAGE can be
 # set as repository variables to override the defaults below.
@@ -420,4 +425,128 @@ jobs:
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
             echo "RunPod image: \`docker.io/${IMAGE}:runpod-sha-${GITHUB_SHA::7}\` (or \`:runpod\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The serverless workers on top of the full image this run pushed. Each is
+  # smoke-tested in CPU mode: the worker boots ComfyUI, and a job for an
+  # unknown workflow comes back as the wrapper's error.
+  serverless:
+    needs: [mode, build]
+    if: needs.mode.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        target: [runpod, vast]
+    env:
+      SERVERLESS_SMOKE_TAG: comfyui-smoke:serverless
+    steps:
+      # The full image (~5 GB compressed) is pulled into the builder and loaded.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=serverless-${{ matrix.target }},enable={{is_default_branch}}
+            type=semver,pattern={{version}},prefix=serverless-${{ matrix.target }}-
+            type=semver,pattern={{major}}.{{minor}},prefix=serverless-${{ matrix.target }}-
+            type=ref,event=branch,prefix=serverless-${{ matrix.target }}-,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=sha,prefix=serverless-${{ matrix.target }}-sha-,format=short
+
+      - name: Base image
+        id: base
+        run: echo "image=docker.io/${IMAGE}:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/serverless
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          build-args: BASE_IMAGE=${{ steps.base.outputs.image }}
+          load: true
+          push: false
+          tags: ${{ env.SERVERLESS_SMOKE_TAG }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: "Smoke test: RunPod worker runs a job through ComfyUI"
+        if: matrix.target == 'runpod'
+        run: |
+          # --test_input runs one job locally and exits non-zero on an error result.
+          if timeout 600 docker run --rm -e COMFYUI_ARGS=--cpu "$SERVERLESS_SMOKE_TAG" \
+            --test_input '{"input": {"workflow": "nope", "prompt": "smoke"}}' > worker.log 2>&1; then
+            cat worker.log; echo "::error::a job for an unknown workflow must fail"; exit 1
+          fi
+          cat worker.log
+          grep -q "ComfyUI ready after" worker.log
+          grep -q "Unknown workflow" worker.log
+
+      - name: "Smoke test: vast.ai PyWorker runs a job through ComfyUI"
+        if: matrix.target == 'vast'
+        run: |
+          # No vast.ai here: no TLS, no signature check, reports to a closed port.
+          docker run -d --name worker -p 3000:3000 -e COMFYUI_ARGS=--cpu \
+            -e USE_SSL=false -e UNSECURED=true -e CONTAINER_ID=1 -e PUBLIC_IPADDR=127.0.0.1 \
+            -e VAST_TCP_PORT_3000=3000 -e REPORT_ADDR=http://127.0.0.1:9 \
+            -e SERVERLESS_BENCHMARK_JOB='{"workflow": "nope", "prompt": "smoke"}' "$SERVERLESS_SMOKE_TAG"
+          for i in $(seq 1 60); do
+            docker logs worker 2>&1 | grep -q "Lifecycle startup failed" && break
+            sleep 5
+          done
+          docker logs worker > worker.log 2>&1
+          grep -q "ComfyUI ready after" worker.log || { tail -60 worker.log; echo "::error::ComfyUI did not come up"; exit 1; }
+          # The benchmark job reached the wrapper, and its failure marks the
+          # worker errored (never ready) and stops ComfyUI.
+          grep "Lifecycle startup failed" worker.log | grep -q "Unknown workflow" \
+            || { tail -60 worker.log; echo "::error::the failed benchmark was not reported"; exit 1; }
+          auth='{"cost": 100, "endpoint": "smoke", "reqnum": 1, "request_idx": 1, "signature": "", "url": "http://127.0.0.1:3000"}'
+          curl -s -X POST http://127.0.0.1:3000/generate -H 'Content-Type: application/json' \
+            -d "{\"auth_data\": $auth, \"payload\": {\"prompt\": \"smoke\"}}" | tee reply.json
+          python3 -c "import json; error = json.load(open('reply.json'))['result']['error']; assert 'ComfyUI stopped on this worker' in error, error"
+          docker rm -f worker
+
+      - name: Push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/serverless
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          build-args: BASE_IMAGE=${{ steps.base.outputs.image }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed (serverless ${{ matrix.target }})"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
