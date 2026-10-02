@@ -10,6 +10,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 import uuid
 
 import pytest
@@ -184,3 +185,77 @@ def test_without_followers_renders_stay_on_one_gpu(tiny_checkpoint):
     assert checks["forward"]["diff"] == 0.0 and checks["forward"]["posted"] == 0
     assert checks["forward"]["malloc_graph_ends"] == 0
     assert "did not join" in stderr
+
+
+# --- docker/sp_probe.py: the group's GPUs tried before ComfyUI starts -----------
+
+def _probe_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("sp_probe", os.path.join(ROOT, "docker", "sp_probe.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="gloo process groups")
+def test_the_probe_passes_when_every_rank_exchanges_tensors():
+    env = {**os.environ, "COMFY_SP_BACKEND": "gloo", "TORCH_CPP_LOG_LEVEL": "ERROR", "COMFY_SP_PROBE_SECONDS": "120"}
+    for gpus in (["0", "1"], ["0", "1", "2", "3"]):
+        out = subprocess.run([sys.executable, os.path.join(ROOT, "docker", "sp_probe.py"), *gpus], env=env,
+                             capture_output=True, text=True, timeout=180)
+        assert out.returncode == 0, out.stderr[-3000:]
+        assert f"GPUs {','.join(gpus)} exchanged tensors (broadcast, all-to-all, all-gather)" in out.stderr
+        assert "deprecated" not in out.stderr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signals")
+def test_a_rank_that_hangs_fails_the_probe_at_its_deadline_and_is_killed():
+    probe = _probe_module()
+    launched = []
+
+    def launch(command, env):
+        launched.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]))
+        return launched[-1]
+
+    started = time.monotonic()
+    problem = probe.probe(["3", "6"], 1, launch=launch)
+    assert problem == "rank 0 (GPU 3), rank 1 (GPU 6) did not finish within 1s"
+    assert time.monotonic() - started < 15
+    assert all(proc.poll() is not None for proc in launched), "no rank outlives the probe"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="signals")
+def test_a_rank_that_fails_ends_the_probe_without_waiting_for_the_deadline():
+    probe = _probe_module()
+    launched = []
+
+    def launch(command, env):
+        rank = int(command[command.index("--rank") + 1])
+        assert env["CUDA_VISIBLE_DEVICES"] == ["4", "5"][rank], "each rank sees only its own GPU"
+        code = "import sys; sys.exit(3)" if rank == 1 else "import time; time.sleep(60)"
+        launched.append(subprocess.Popen([sys.executable, "-c", code]))
+        return launched[-1]
+
+    started = time.monotonic()
+    problem = probe.probe(["4", "5"], 60, launch=launch)
+    assert problem == "rank 1 (GPU 5) exited with status 3"
+    assert time.monotonic() - started < 15
+    assert launched[0].poll() is not None, "rank 0, left waiting for rank 1, is killed"
+
+
+def test_values_that_arrive_wrong_fail_the_exchange(monkeypatch):
+    probe = _probe_module()
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, src: None)  # nothing arrives at rank 1
+    with pytest.raises(RuntimeError, match="broadcast"):
+        probe.exchange(1, 2, torch.device("cpu"))
+    # Rank 0 keeps its own broadcast; an all-to-all that hands back what was sent is wrong.
+    monkeypatch.setattr(dist, "all_to_all_single", lambda recv, send: recv.copy_(send))
+    with pytest.raises(RuntimeError, match="all-to-all"):
+        probe.exchange(0, 2, torch.device("cpu"))
+    monkeypatch.setattr(dist, "all_to_all_single", lambda recv, send: recv.copy_(torch.tensor([0, 2], dtype=torch.int32).repeat_interleave(recv.numel() // 2)))
+    monkeypatch.setattr(dist, "all_gather_into_tensor", lambda out, part: out.zero_())
+    with pytest.raises(RuntimeError, match="all-gather"):
+        probe.exchange(0, 2, torch.device("cpu"))

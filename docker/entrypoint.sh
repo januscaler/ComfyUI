@@ -548,6 +548,25 @@ sp_world() {
 	log "WARNING: COMFY_SEQUENCE_PARALLEL_GPUS=$setting is not 1, auto, or one of ${SP_GROUP_SIZES[*]} GPUs within the $count here; using one GPU"
 	echo 1
 }
+# Before the group starts: can its GPUs move tensors to each other? NCCL can open
+# a group over a GPU-to-GPU path that carries no data, and then hang in a render's
+# first collective (RunPod, 2x RTX PRO 6000). docker/sp_probe.py runs a split
+# forward's collectives on the group's GPUs ($@) within COMFY_SP_PROBE_SECONDS
+# (90 s). The first try leaves NCCL its own choice of path. Unless
+# NCCL_P2P_DISABLE is already set, a second try goes without PCIe peer-to-peer
+# (through host memory), and ComfyUI and the followers keep that setting.
+# Neither works = one GPU.
+#   COMFY_SP_PROBE   1 (default); 0: start the group without trying it
+sp_probe_group() {
+	[[ "${COMFY_SP_PROBE:-1}" == 0 ]] && return 0
+	python "$COMFY_ROOT/docker/sp_probe.py" "$@" && return 0
+	if [[ -z "${NCCL_P2P_DISABLE+set}" ]] && NCCL_P2P_DISABLE=1 python "$COMFY_ROOT/docker/sp_probe.py" "$@"; then
+		export NCCL_P2P_DISABLE=1
+		log "sequence parallelism: GPU peer-to-peer does not work here; NCCL_P2P_DISABLE=1 for ComfyUI and the followers"
+		return 0
+	fi
+	return 1
+}
 start_sequence_parallel() {
 	local -a gpus
 	local world rank main=$$
@@ -560,6 +579,10 @@ start_sequence_parallel() {
 	fi
 	world=$(sp_world "${#gpus[@]}")
 	((world >= 2)) || return 0
+	if ! sp_probe_group "${gpus[@]:0:world}"; then
+		log "WARNING: sequence parallelism is off: GPUs ${gpus[*]:0:world} could not exchange tensors; ComfyUI renders on one GPU"
+		return 0
+	fi
 	export COMFY_SP_WORLD=$world COMFY_SP_PORT=${COMFY_SP_PORT:-29511}
 	# Each follower runs in the foreground of its own subshell, which notices when
 	# it fails (after the exec below, ComfyUI would never reap it) and stops ComfyUI.

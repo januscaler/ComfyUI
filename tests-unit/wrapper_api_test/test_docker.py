@@ -597,17 +597,30 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
                         "followers must not inherit the bucket or tunnel credentials")
         self.assertLess(call, self.script.index("exec python main.py"))
 
-    def run_block(self, gpus=4, setting=None, extra_env=None, rank1_exits=None, comfyui_args="--verbose INFO"):
-        """The block in a bash harness with stand-in nvidia-smi and python; returns (exit code, log, launches)."""
+    def run_block(self, gpus=4, setting=None, extra_env=None, rank1_exits=None, comfyui_args="--verbose INFO", probe="pass"):
+        """The block in a bash harness with stand-in nvidia-smi and python; returns (exit code, log, launches).
+
+        The stand-in docker/sp_probe.py passes (`probe="pass"`), passes only with
+        NCCL_P2P_DISABLE=1 ("p2p"), or fails ("fail"). Its calls land in
+        self.probes as "<NCCL_P2P_DISABLE> <GPUs>", and each follower's
+        NCCL_P2P_DISABLE in self.follower_p2p as "<rank> <value>".
+        """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = os.path.join(tmp, "bin")
             os.mkdir(bin_dir)
             launched = os.path.join(tmp, "launched")
+            probes = os.path.join(tmp, "probes")
+            follower_p2p = os.path.join(tmp, "follower_p2p")
             if gpus is not None:
                 with open(os.path.join(bin_dir, "nvidia-smi"), "w") as f:
                     f.write("#!/bin/sh\n" + "".join(f"echo {i}\n" for i in range(gpus)))
             with open(os.path.join(bin_dir, "python"), "w") as f:
                 f.write("#!/bin/bash\n"
+                        'if [[ "$1" == */docker/sp_probe.py ]]; then\n'
+                        f'  echo "${{NCCL_P2P_DISABLE:-default}} ${{*:2}}" >> {probes}\n'
+                        '  case "$FAKE_PROBE" in pass) exit 0 ;; p2p) [ "${NCCL_P2P_DISABLE:-}" = 1 ] && exit 0; exit 1 ;; *) exit 1 ;; esac\n'
+                        'fi\n'
+                        f'echo "$COMFY_SP_RANK ${{NCCL_P2P_DISABLE:-default}}" >> {follower_p2p}\n'
                         f'echo "$COMFY_SP_RANK $CUDA_VISIBLE_DEVICES $COMFY_SP_WORLD ${{*:2}}" >> {launched}\n'
                         + (f'[ "$COMFY_SP_RANK" = 1 ] && exit {rank1_exits}\n' if rank1_exits is not None else "")
                         + "sleep 20\n")
@@ -618,8 +631,9 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
                        "args=(--listen 0.0.0.0 --fast-disk)\nread -r -a extra <<<\"$COMFYUI_ARGS\"\n"
                        + self.block + 'start_sequence_parallel "$@"\n'
                        'echo "rank0 ${COMFY_SP_WORLD:-1} ${CUDA_VISIBLE_DEVICES:-unset}"\n'
+                       'echo "rank0 p2p ${NCCL_P2P_DISABLE:-default}"\n'
                        + ("sleep 5\necho STILL_RUNNING\n" if rank1_exits is not None else ""))
-            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "COMFYUI_ARGS": comfyui_args, **(extra_env or {})}
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "COMFYUI_ARGS": comfyui_args, "FAKE_PROBE": probe, **(extra_env or {})}
             if setting is not None:
                 env["COMFY_SEQUENCE_PARALLEL_GPUS"] = setting
             # A file, not a pipe: the backgrounded followers would hold a pipe open until they exit.
@@ -638,6 +652,8 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
             while len(launches()) < expected and time.monotonic() < deadline:
                 time.sleep(0.1)
             subprocess.run(["pkill", "-f", bin_dir], capture_output=True)
+            self.probes = open(probes).read().splitlines() if os.path.exists(probes) else []
+            self.follower_p2p = sorted(open(follower_p2p).read().splitlines()) if os.path.exists(follower_p2p) else []
             return result.returncode, output, sorted(launches())
 
     def test_group_size_follows_the_gpus_and_the_setting(self):
@@ -679,6 +695,52 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
         self.assertEqual(code, 0, log)
         self.assertIn("STILL_RUNNING", log)
         self.assertNotIn("stopping ComfyUI", log)
+
+    def test_the_group_is_tried_on_its_own_gpus_before_it_starts(self):
+        _, log, launched = self.run_block(gpus=6)
+        self.assertEqual(self.probes, ["default 0 1 2 3"], "the 4 GPUs of the group, not all 6")
+        self.assertEqual(len(launched), 3)
+        self.assertIn("rank0 p2p default", log)
+        self.assertEqual(self.follower_p2p, ["1 default", "2 default", "3 default"])
+        self.run_block(gpus=8, extra_env={"CUDA_VISIBLE_DEVICES": "2,5"})
+        self.assertEqual(self.probes, ["default 2 5"])
+        for gpus, args in ((1, "--verbose INFO"), (4, "--cpu")):
+            self.run_block(gpus=gpus, comfyui_args=args)
+            self.assertEqual(self.probes, [], "no group, nothing to try")
+
+    def test_peer_to_peer_goes_off_when_only_that_works(self):
+        _, log, launched = self.run_block(gpus=2, probe="p2p")
+        self.assertEqual(self.probes, ["default 0 1", "1 0 1"])
+        self.assertIn("GPU peer-to-peer does not work here; NCCL_P2P_DISABLE=1 for ComfyUI and the followers", log)
+        self.assertIn("rank0 2 0", log)
+        self.assertIn("rank0 p2p 1", log)
+        self.assertEqual(launched, ["1 1 2 --listen 0.0.0.0 --fast-disk --verbose INFO"])
+        self.assertEqual(self.follower_p2p, ["1 1"])
+
+    def test_one_gpu_when_the_gpus_cannot_exchange_tensors(self):
+        code, log, launched = self.run_block(gpus=4, probe="fail")
+        self.assertEqual(code, 0, log)
+        self.assertEqual(self.probes, ["default 0 1 2 3", "1 0 1 2 3"])
+        self.assertIn("WARNING: sequence parallelism is off: GPUs 0 1 2 3 could not exchange tensors; ComfyUI renders on one GPU", log)
+        self.assertIn("rank0 1 unset", log)
+        self.assertIn("rank0 p2p default", log, "a failed retry leaves NCCL as it was")
+        self.assertEqual(launched, [])
+
+    def test_a_peer_to_peer_setting_from_the_environment_is_kept(self):
+        _, log, launched = self.run_block(gpus=2, probe="fail", extra_env={"NCCL_P2P_DISABLE": "0"})
+        self.assertEqual(self.probes, ["0 0 1"], "no retry with another setting")
+        self.assertIn("rank0 1 unset", log)
+        self.assertEqual(launched, [])
+        _, log, launched = self.run_block(gpus=2, probe="p2p", extra_env={"NCCL_P2P_DISABLE": "1"})
+        self.assertEqual(self.probes, ["1 0 1"])
+        self.assertNotIn("GPU peer-to-peer does not work here", log)
+        self.assertEqual(self.follower_p2p, ["1 1"])
+
+    def test_the_probe_can_be_skipped(self):
+        _, log, launched = self.run_block(gpus=2, probe="fail", extra_env={"COMFY_SP_PROBE": "0"})
+        self.assertEqual(self.probes, [])
+        self.assertIn("rank0 2 0", log)
+        self.assertEqual(len(launched), 1)
 
 
 @unittest.skipIf(sys.platform == "win32", "bash scripts")

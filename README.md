@@ -168,6 +168,7 @@ Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu130** whe
 | `VRAM_HEADROOM_GB`, `CACHE_RAM_GB`, `ASYNC_OFFLOAD_STREAMS`, `FAST_DISK` | `2`, `2 8`, `0`, `1` | Memory tuning, as in `.env.example`. |
 | `COMFYUI_ARGS` | empty | Extra ComfyUI flags. |
 | `COMFY_SEQUENCE_PARALLEL_GPUS` | `auto` | Several GPUs: how many split each MiniMax H3 forward (see below). `auto` takes the largest group the box has (8, 7, 4 or 2), `1` turns it off, `N` asks for exactly N. |
+| `COMFY_SP_PROBE`, `COMFY_SP_PROBE_SECONDS` | `1`, `90` | Several GPUs: try the group's GPUs before it starts (see below). `0` skips the check. |
 | `COMFY_HF_DOWNLOAD_MODE` | `direct` with a data dir, else `cache` | `direct` downloads Hugging Face weights next to the models dir and moves them in (one copy). `cache` keeps the HF cache plus a copy, which is useful when the HF cache is shared between projects. |
 | `MIMO_API_KEY`, `HF_TOKEN` | unset | H3 prompt rewrite; gated FLUX.2 [klein] weights. |
 | `COMFY_ENV_WAIT_SECONDS` | `1800` | Runpod image: how long a pod waits for another pod that is building the env before it gives up. |
@@ -279,6 +280,7 @@ How it runs:
 - A forward the followers could not reproduce exactly runs on the first GPU alone: weight patches (a LoRA), another diffusion-model wrapper, block or attention patches, an attention override.
 - A cancel waits for the current step to finish (the GPUs run each forward in lockstep): a cancel at step 8 of 20 returned 3 s later, and the next render ran split again.
 - A split forward runs outside ComfyUI's allocation compiler (the comfy_aimdo malloc graph), which cannot plan its first and last blocks.
+- Before the group starts, the entrypoint checks that its GPUs can move tensors to each other ([`docker/sp_probe.py`](docker/sp_probe.py)): one process per GPU runs a split forward's collectives on 64 MB buffers and checks every value, within `COMFY_SP_PROBE_SECONDS`. NCCL can open a group over a GPU-to-GPU path that carries no data and then hang in the first collective. On RunPod with 2x RTX PRO 6000 (2026-10-03) a render's first broadcast never completed, and the render failed after 10 minutes. When NCCL's own path fails the check, the entrypoint tries again with `NCCL_P2P_DISABLE=1` (through host memory), and ComfyUI and the followers keep that setting. When that fails too, ComfyUI renders on one GPU. An `NCCL_P2P_DISABLE` already in the environment is kept as it is.
 - A follower that exits stops ComfyUI too, and the container restarts with a fresh group. If the followers never join (`COMFY_SP_JOIN_SECONDS`, 300 s), renders use one GPU.
 
 To time one DiT step on 1 against N GPUs without ComfyUI, with seeded inputs (`--compare` reports how far apart two runs' outputs are):
