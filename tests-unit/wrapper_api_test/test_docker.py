@@ -601,7 +601,7 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
         """The block in a bash harness with stand-in nvidia-smi and python; returns (exit code, log, launches).
 
         The stand-in docker/sp_probe.py passes (`probe="pass"`), passes only with
-        NCCL_P2P_DISABLE=1 ("p2p"), or fails ("fail"). Its calls land in
+        NCCL_P2P_DISABLE=1 ("p2p") or only without it ("nccl"), or fails ("fail"). Its calls land in
         self.probes as "<NCCL_P2P_DISABLE> <GPUs>", and each follower's
         NCCL_P2P_DISABLE in self.follower_p2p as "<rank> <value>".
         """
@@ -618,7 +618,8 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
                 f.write("#!/bin/bash\n"
                         'if [[ "$1" == */docker/sp_probe.py ]]; then\n'
                         f'  echo "${{NCCL_P2P_DISABLE:-default}} ${{*:2}}" >> {probes}\n'
-                        '  case "$FAKE_PROBE" in pass) exit 0 ;; p2p) [ "${NCCL_P2P_DISABLE:-}" = 1 ] && exit 0; exit 1 ;; *) exit 1 ;; esac\n'
+                        '  case "$FAKE_PROBE" in pass) exit 0 ;; p2p) [ "${NCCL_P2P_DISABLE:-}" = 1 ] && exit 0; exit 1 ;;\n'
+                        '    nccl) [ -z "${NCCL_P2P_DISABLE+set}" ] && exit 0; exit 1 ;; *) exit 1 ;; esac\n'
                         'fi\n'
                         f'echo "$COMFY_SP_RANK ${{NCCL_P2P_DISABLE:-default}}" >> {follower_p2p}\n'
                         f'echo "$COMFY_SP_RANK $CUDA_VISIBLE_DEVICES $COMFY_SP_WORLD ${{*:2}}" >> {launched}\n'
@@ -698,32 +699,32 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
 
     def test_the_group_is_tried_on_its_own_gpus_before_it_starts(self):
         _, log, launched = self.run_block(gpus=6)
-        self.assertEqual(self.probes, ["default 0 1 2 3"], "the 4 GPUs of the group, not all 6")
+        self.assertEqual(self.probes, ["1 0 1 2 3"], "the 4 GPUs of the group, not all 6, peer-to-peer off")
         self.assertEqual(len(launched), 3)
-        self.assertIn("rank0 p2p default", log)
-        self.assertEqual(self.follower_p2p, ["1 default", "2 default", "3 default"])
+        self.assertIn("rank0 p2p 1", log)
+        self.assertEqual(self.follower_p2p, ["1 1", "2 1", "3 1"])
         self.run_block(gpus=8, extra_env={"CUDA_VISIBLE_DEVICES": "2,5"})
-        self.assertEqual(self.probes, ["default 2 5"])
+        self.assertEqual(self.probes, ["1 2 5"])
         for gpus, args in ((1, "--verbose INFO"), (4, "--cpu")):
             self.run_block(gpus=gpus, comfyui_args=args)
             self.assertEqual(self.probes, [], "no group, nothing to try")
 
-    def test_peer_to_peer_goes_off_when_only_that_works(self):
-        _, log, launched = self.run_block(gpus=2, probe="p2p")
-        self.assertEqual(self.probes, ["default 0 1", "1 0 1"])
-        self.assertIn("GPU peer-to-peer does not work here; NCCL_P2P_DISABLE=1 for ComfyUI and the followers", log)
+    def test_nccls_own_path_when_host_memory_does_not_work(self):
+        _, log, launched = self.run_block(gpus=2, probe="nccl")
+        self.assertEqual(self.probes, ["1 0 1", "default 0 1"])
+        self.assertIn("NCCL_P2P_DISABLE=1 did not work here; ComfyUI and the followers use NCCL's own path", log)
         self.assertIn("rank0 2 0", log)
-        self.assertIn("rank0 p2p 1", log)
+        self.assertIn("rank0 p2p default", log)
         self.assertEqual(launched, ["1 1 2 --listen 0.0.0.0 --fast-disk --verbose INFO"])
-        self.assertEqual(self.follower_p2p, ["1 1"])
+        self.assertEqual(self.follower_p2p, ["1 default"])
 
     def test_one_gpu_when_the_gpus_cannot_exchange_tensors(self):
         code, log, launched = self.run_block(gpus=4, probe="fail")
         self.assertEqual(code, 0, log)
-        self.assertEqual(self.probes, ["default 0 1 2 3", "1 0 1 2 3"])
+        self.assertEqual(self.probes, ["1 0 1 2 3", "default 0 1 2 3"])
         self.assertIn("WARNING: sequence parallelism is off: GPUs 0 1 2 3 could not exchange tensors; ComfyUI renders on one GPU", log)
         self.assertIn("rank0 1 unset", log)
-        self.assertIn("rank0 p2p default", log, "a failed retry leaves NCCL as it was")
+        self.assertIn("rank0 p2p default", log, "failed tries leave NCCL as it was")
         self.assertEqual(launched, [])
 
     def test_a_peer_to_peer_setting_from_the_environment_is_kept(self):
@@ -731,10 +732,13 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
         self.assertEqual(self.probes, ["0 0 1"], "no retry with another setting")
         self.assertIn("rank0 1 unset", log)
         self.assertEqual(launched, [])
-        _, log, launched = self.run_block(gpus=2, probe="p2p", extra_env={"NCCL_P2P_DISABLE": "1"})
-        self.assertEqual(self.probes, ["1 0 1"])
-        self.assertNotIn("GPU peer-to-peer does not work here", log)
-        self.assertEqual(self.follower_p2p, ["1 1"])
+        _, log, launched = self.run_block(gpus=2, probe="nccl", extra_env={"NCCL_P2P_DISABLE": "0"})
+        self.assertEqual(self.probes, ["0 0 1"])
+        self.assertIn("rank0 1 unset", log, "an explicit 0 is not NCCL's own choice either")
+        _, log, launched = self.run_block(gpus=2, probe="pass", extra_env={"NCCL_P2P_DISABLE": "0"})
+        self.assertEqual(self.probes, ["0 0 1"])
+        self.assertNotIn("did not work here", log)
+        self.assertEqual(self.follower_p2p, ["1 0"])
 
     def test_the_probe_can_be_skipped(self):
         _, log, launched = self.run_block(gpus=2, probe="fail", extra_env={"COMFY_SP_PROBE": "0"})
