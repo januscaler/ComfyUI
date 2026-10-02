@@ -10,7 +10,8 @@
 #
 # Bump ENV_RECIPE when entrypoint.sh changes HOW the env is built or stored, so
 # every volume gets a fresh env instead of reusing an old recipe.
-# TORCH_INDEX_URL (the Dockerfile's build arg) selects the torch wheels.
+# TORCH_INDEX_URL and TORCH_VERSION (the Dockerfile's build args) select the
+# torch wheels; their defaults here match the Dockerfile's.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,5 +26,6 @@ echo "python_path=$python"
 echo "platform=$(uname -m)"
 # shellcheck disable=SC1091 # the running system's file, not part of this repo
 echo "os=$(. /etc/os-release && echo "${ID}${VERSION_ID}")"
-echo "torch_index=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+echo "torch_index=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+echo "torch_version=${TORCH_VERSION:-2.11.0}"
 echo "requirements_sha256=$(sha256sum requirements.txt | cut -d' ' -f1)"

@@ -192,8 +192,8 @@ build_env() {
 	fi
 	uv venv --python "$base_python" "$ENV_DIR"
 	t=$SECONDS
-	uv pip install --python "$ENV_DIR/bin/python" --index-url "$TORCH_INDEX_URL" torch torchvision torchaudio
-	log "env build: torch from $TORCH_INDEX_URL in $((SECONDS - t))s"
+	uv pip install --python "$ENV_DIR/bin/python" --index-url "$TORCH_INDEX_URL" "torch==$TORCH_VERSION" torchvision torchaudio
+	log "env build: torch $TORCH_VERSION from $TORCH_INDEX_URL in $((SECONDS - t))s"
 	t=$SECONDS
 	uv pip install --python "$ENV_DIR/bin/python" -r "$COMFY_ROOT/requirements.txt"
 	log "env build: requirements.txt in $((SECONDS - t))s"
@@ -323,6 +323,7 @@ if [[ "${COMFY_IMAGE_VARIANT:-}" == "runpod" ]]; then
 	ENV_KEY=$(cat "$COMFY_ROOT/docker/env-key")
 	export COMFY_ENV_KEY="$ENV_KEY"
 	TORCH_INDEX_URL=$(sed -n 's/^torch_index=//p' "$COMFY_ROOT/docker/env-inputs")
+	TORCH_VERSION=$(sed -n 's/^torch_version=//p' "$COMFY_ROOT/docker/env-inputs")
 	ENVS_DIR="${COMFY_ENVS_DIR:-$DATA_DIR/envs}"
 	ENV_ARCHIVE="$ENVS_DIR/$ENV_KEY.tar"
 	ENV_LOCK="$ENVS_DIR/.lock-$ENV_KEY"
@@ -366,6 +367,38 @@ fi
 if [[ $# -gt 0 && "$1" != -* ]]; then
 	exec "$@"
 fi
+
+# --- Host driver vs the image's CUDA ------------------------------------------
+# The torch wheels bundle their CUDA runtime, but it still needs a host driver
+# that supports that CUDA: cu130 needs >= 580. On an older driver torch sees no
+# GPU and ComfyUI starts on the CPU, where one H3 render runs for hours on a
+# billed GPU host. Stop instead, before any weights are copied, so the backend
+# recycles the pod or worker. Skipped with --cpu, and where there is no
+# nvidia-smi (CI, a CPU-only box).
+check_host_driver() {
+	local torch_version cuda driver need
+	[[ " ${COMFYUI_ARGS:-} $* " == *" --cpu "* ]] && return 0
+	command -v nvidia-smi >/dev/null || return 0
+	# The installed version (e.g. 2.11.0+cu130), without importing torch.
+	torch_version=$(python -c 'import importlib.metadata as m; print(m.version("torch"))' 2>/dev/null) || return 0
+	cuda=${torch_version##*+cu}
+	[[ "$torch_version" == *+cu* && "$cuda" =~ ^[0-9]{3,}$ ]] || return 0
+	case "${cuda:0:2}" in
+		13) need=580 ;;
+		*) return 0 ;;
+	esac
+	driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1) || driver=""
+	if [[ ! "${driver%%.*}" =~ ^[0-9]+$ ]]; then
+		log "WARNING: could not read the NVIDIA driver version; torch $torch_version needs >= $need"
+		return 0
+	fi
+	if ((${driver%%.*} < need)); then
+		log "ERROR: torch $torch_version needs an NVIDIA driver >= $need for CUDA ${cuda:0:2}, and this host has $driver; not starting ComfyUI"
+		exit 1
+	fi
+	log "NVIDIA driver $driver, torch $torch_version"
+}
+check_host_driver "$@"
 
 # --- vast.ai pods: tunnel and model weights ----------------------------------
 # A vast.ai pod has no network volume and no HTTPS proxy. voxmin-backend starts

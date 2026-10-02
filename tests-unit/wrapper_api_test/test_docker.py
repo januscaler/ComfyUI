@@ -134,7 +134,10 @@ class TestDockerfile(unittest.TestCase):
             self.assertIn(tool, apt, f"{tool} must be installed for Triton JIT")
 
     def test_cuda_only_and_entrypoint(self):
-        self.assertIn("ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128", self.dockerfile)
+        # cu130: comfy/quant_ops.py turns comfy-kitchen's CUDA kernels off below CUDA 13.
+        self.assertIn("ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130", self.dockerfile)
+        self.assertRegex(self.dockerfile, r"(?m)^ARG TORCH_VERSION=\d+\.\d+\.\d+$", "pin torch, so a rebuild cannot move it")
+        self.assertIn('--index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}" torchvision torchaudio', self.dockerfile)
         self.assertIn("assert torch.version.cuda", self.dockerfile)
         torch_install = self.dockerfile.index('--index-url "${TORCH_INDEX_URL}"')
         requirements_install = self.dockerfile.index("pip install -r requirements.txt")
@@ -225,8 +228,9 @@ class TestRunpodTarget(unittest.TestCase):
 
     def test_env_key_is_baked(self):
         self.assertIn("ARG TORCH_INDEX_URL", self.runpod)
+        self.assertIn("ARG TORCH_VERSION", self.runpod)
         # One script prints the hashed inputs, for the image and for the boot-time key alike.
-        self.assertIn('TORCH_INDEX_URL="${TORCH_INDEX_URL}" docker/env-inputs.sh > docker/env-inputs', self.runpod)
+        self.assertIn('TORCH_INDEX_URL="${TORCH_INDEX_URL}" TORCH_VERSION="${TORCH_VERSION}" docker/env-inputs.sh > docker/env-inputs', self.runpod)
         self.assertIn("sha256sum docker/env-inputs | cut -c1-16 > docker/env-key", self.runpod)
         self.assertIn("COMFY_IMAGE_VARIANT=runpod", self.runpod)
         self.assertNotIn("ENV_RECIPE", self.dockerfile, "the recipe lives in docker/env-inputs.sh")
@@ -238,6 +242,8 @@ class TestRunpodTarget(unittest.TestCase):
         # The script's default index is the Dockerfile's, so a boot-time key matches the baked one.
         default = re.search(r"^ARG TORCH_INDEX_URL=(\S+)$", self.dockerfile, re.MULTILINE).group(1)
         self.assertIn(f"torch_index=${{TORCH_INDEX_URL:-{default}}}", inputs)
+        version = re.search(r"^ARG TORCH_VERSION=(\S+)$", self.dockerfile, re.MULTILINE).group(1)
+        self.assertIn(f"torch_version=${{TORCH_VERSION:-{version}}}", inputs)
 
     def test_entrypoint_and_healthcheck(self):
         self.assertIn('ENTRYPOINT ["tini", "--", "/opt/ComfyUI/docker/entrypoint.sh"]', self.runpod)
@@ -265,8 +271,10 @@ class TestRunpodEntrypoint(unittest.TestCase):
         # One archive per key on the volume; the env itself on the container disk, at a fixed path.
         self.assertIn('ENV_ARCHIVE="$ENVS_DIR/$ENV_KEY.tar"', self.script)
         self.assertIn('ENV_DIR="${COMFY_ENV_LOCAL_DIR:-/opt/comfy-env}/$ENV_KEY"', self.script)
-        # The torch index comes from the hashed inputs, so it always matches the key.
+        # The torch index and version come from the hashed inputs, so they always match the key.
         self.assertIn("s/^torch_index=//p", self.script)
+        self.assertIn("s/^torch_version=//p", self.script)
+        self.assertIn('--index-url "$TORCH_INDEX_URL" "torch==$TORCH_VERSION" torchvision torchaudio', self.script)
 
     def test_key_computed_at_boot_for_fetched_code(self):
         start = self.script.index('if [[ ! -s "$COMFY_ROOT/docker/env-key" ]]; then')
@@ -328,7 +336,7 @@ class TestRunpodEntrypoint(unittest.TestCase):
     def test_env_build_recipe(self):
         build = self.script[self.script.index("build_env() {"):self.script.index("ensure_env() {")]
         self.assertIn('uv venv --python "$base_python" "$ENV_DIR"', build)
-        torch_install = build.index('uv pip install --python "$ENV_DIR/bin/python" --index-url "$TORCH_INDEX_URL" torch torchvision torchaudio')
+        torch_install = build.index('uv pip install --python "$ENV_DIR/bin/python" --index-url "$TORCH_INDEX_URL" "torch==$TORCH_VERSION" torchvision torchaudio')
         requirements_install = build.index('uv pip install --python "$ENV_DIR/bin/python" -r "$COMFY_ROOT/requirements.txt"')
         cuda_assert = build.index("cuda = torch.version.cuda")
         marker = build.index('mv -f "$ENV_DIR/$ENV_MARKER_NAME.tmp" "$ENV_DIR/$ENV_MARKER_NAME"')
@@ -415,10 +423,12 @@ class TestRunpodBootstrap(unittest.TestCase):
         result = self.run_script("env-inputs.sh", {})
         self.assertEqual(result.returncode, 0, result.stderr)
         keys = [line.split("=", 1)[0] for line in result.stdout.splitlines()]
-        self.assertEqual(keys, ["recipe", "python", "python_path", "platform", "os", "torch_index", "requirements_sha256"])
+        self.assertEqual(keys, ["recipe", "python", "python_path", "platform", "os", "torch_index", "torch_version", "requirements_sha256"])
         self.assertEqual(result.stdout, self.run_script("env-inputs.sh", {}).stdout, "the key must be deterministic")
-        other = self.run_script("env-inputs.sh", {"TORCH_INDEX_URL": "https://download.pytorch.org/whl/cu130"})
+        other = self.run_script("env-inputs.sh", {"TORCH_INDEX_URL": "https://download.pytorch.org/whl/cu128"})
         self.assertNotEqual(result.stdout, other.stdout, "another torch index is another env")
+        other = self.run_script("env-inputs.sh", {"TORCH_VERSION": "2.12.0"})
+        self.assertNotEqual(result.stdout, other.stdout, "another torch version is another env")
 
 
 class TestVastTools(unittest.TestCase):
@@ -509,6 +519,65 @@ class TestVastEntrypoint(unittest.TestCase):
         block = self.script[self.script.index('if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then'):self.script.index("\tstart_tunnel\n")]
         self.assertIn("if ! command -v cloudflared >/dev/null; then", block)
         self.assertIn("exit 1", block)
+
+
+class TestHostDriverCheck(unittest.TestCase):
+    """docker/entrypoint.sh stops on a host driver too old for the image's CUDA build."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = read("docker", "entrypoint.sh")
+        cls.function = re.search(r"^check_host_driver\(\) \{\n.*?^\}$", cls.script, re.MULTILINE | re.DOTALL).group(0)
+
+    def test_runs_in_server_mode_before_the_weights(self):
+        call = self.script.index('check_host_driver "$@"\n')
+        self.assertLess(self.script.index('exec "$@"'), call, "not for prefetch or passthrough commands")
+        for later in ('if [[ -n "${COMFY_MODELS_S3_BUCKET:-}" ]]; then', "exec python main.py"):
+            self.assertLess(call, self.script.index(later), f"before {later!r}")
+
+    def check(self, torch_version, driver, args=(), comfyui_args=""):
+        """Runs the function with a stand-in python (prints the torch version) and nvidia-smi (prints the driver)."""
+        with tempfile.TemporaryDirectory() as bin_dir:
+            with open(os.path.join(bin_dir, "python"), "w") as f:
+                f.write(f"#!/bin/sh\necho '{torch_version}'\n")
+            if driver is not None:
+                with open(os.path.join(bin_dir, "nvidia-smi"), "w") as f:
+                    f.write(f"#!/bin/sh\necho '{driver}'\n")
+            for name in os.listdir(bin_dir):
+                os.chmod(os.path.join(bin_dir, name), 0o755)
+            harness = f'set -euo pipefail\nlog() {{ echo "entrypoint: $*" >&2; }}\n{self.function}\ncheck_host_driver "$@"\necho started'
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "COMFYUI_ARGS": comfyui_args}
+            return subprocess.run(["bash", "-c", harness, "_", *args], env=env, capture_output=True, text=True, timeout=30)
+
+    @unittest.skipIf(sys.platform == "win32", "bash scripts")
+    def test_old_driver_stops_a_cuda13_torch(self):
+        result = self.check("2.11.0+cu130", "575.57.08")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("started", result.stdout)
+        self.assertIn("needs an NVIDIA driver >= 580", result.stderr)
+        self.assertIn("575.57.08", result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "bash scripts")
+    def test_new_enough_drivers_start(self):
+        for driver in ("580.173.02", "595.84"):
+            result = self.check("2.11.0+cu130", driver)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("started", result.stdout)
+
+    @unittest.skipIf(sys.platform == "win32", "bash scripts")
+    def test_skipped_where_it_cannot_or_need_not_tell(self):
+        cases = (
+            ("2.11.0+cu128", "570.10", (), ""),           # CUDA 12 build: no CUDA 13 floor
+            ("2.11.0+cu130", None, (), ""),               # no nvidia-smi (CI, CPU box)
+            ("2.11.0+cu130", "575.57.08", ("--cpu",), ""),
+            ("2.11.0+cu130", "575.57.08", (), "--fast --cpu"),
+            ("2.11.0", "575.57.08", (), ""),              # not a CUDA wheel
+            ("2.11.0+cu130", "not a version", (), ""),    # unreadable driver: warn, go on
+        )
+        for torch_version, driver, args, comfyui_args in cases:
+            result = self.check(torch_version, driver, args, comfyui_args)
+            self.assertEqual(result.returncode, 0, (torch_version, driver, args, comfyui_args, result.stderr))
+            self.assertIn("started", result.stdout)
 
 
 @unittest.skipIf(sys.platform == "win32", "bash scripts")
