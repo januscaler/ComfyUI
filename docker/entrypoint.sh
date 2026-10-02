@@ -509,5 +509,74 @@ fi
 # environment (/proc/self/environ). The tunnel loop has its own copy of the token.
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN CF_TUNNEL_TOKEN COMFY_MODELS_S3_ENDPOINT
 
+# --- Sequence parallelism: one H3 render on every GPU -------------------------
+# On a box with several GPUs, each MiniMax H3 forward is split over all of them
+# (comfy/ldm/minimax/sequence_parallel.py). ComfyUI keeps the first GPU (rank 0);
+# a follower (docker/sp_follower.py, ComfyUI's own flags) runs on each other GPU.
+# H3 has 56 attention heads, so a group is 8, 7, 4 or 2 GPUs.
+#   COMFY_SEQUENCE_PARALLEL_GPUS   auto (default): the largest group the box has;
+#                                  1: off; N: exactly N GPUs
+# The group cannot go on without one of its followers, so a follower that fails
+# (non-zero exit) stops ComfyUI too and the container restarts with a fresh group.
+# A follower exits 0 when ComfyUI is gone, or when the group could not start, in
+# which case ComfyUI renders on one GPU. Off with --cpu and where there is no
+# nvidia-smi (one GPU, as before).
+SP_GROUP_SIZES=(8 7 4 2)
+# The group size for $1 usable GPUs, from COMFY_SEQUENCE_PARALLEL_GPUS.
+sp_world() {
+	local count=$1 setting=${COMFY_SEQUENCE_PARALLEL_GPUS:-auto} size
+	if [[ "$setting" == auto ]]; then
+		for size in "${SP_GROUP_SIZES[@]}"; do
+			if ((size <= count)); then
+				echo "$size"
+				return
+			fi
+		done
+		echo 1
+		return
+	fi
+	if [[ "$setting" == 1 ]]; then
+		echo 1
+		return
+	fi
+	for size in "${SP_GROUP_SIZES[@]}"; do
+		if [[ "$setting" == "$size" ]] && ((size <= count)); then
+			echo "$size"
+			return
+		fi
+	done
+	log "WARNING: COMFY_SEQUENCE_PARALLEL_GPUS=$setting is not 1, auto, or one of ${SP_GROUP_SIZES[*]} GPUs within the $count here; using one GPU"
+	echo 1
+}
+start_sequence_parallel() {
+	local -a gpus
+	local world rank main=$$
+	[[ " ${COMFYUI_ARGS:-} $* " == *" --cpu "* ]] && return 0
+	command -v nvidia-smi >/dev/null || return 0
+	if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+		IFS=, read -r -a gpus <<<"$CUDA_VISIBLE_DEVICES"
+	else
+		read -r -a gpus <<<"$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' | tr '\n' ' ')"
+	fi
+	world=$(sp_world "${#gpus[@]}")
+	((world >= 2)) || return 0
+	export COMFY_SP_WORLD=$world COMFY_SP_PORT=${COMFY_SP_PORT:-29511}
+	# Each follower runs in the foreground of its own subshell, which notices when
+	# it fails (after the exec below, ComfyUI would never reap it) and stops ComfyUI.
+	for ((rank = 1; rank < world; rank++)); do
+		(
+			status=0
+			CUDA_VISIBLE_DEVICES=${gpus[rank]} COMFY_SP_RANK=$rank python "$COMFY_ROOT/docker/sp_follower.py" "${args[@]}" "${extra[@]}" "$@" || status=$?
+			if ((status != 0)); then
+				log "sequence-parallel follower $rank failed (status $status); stopping ComfyUI so the container restarts with a fresh group"
+				kill -TERM "$main" 2>/dev/null || true
+			fi
+		) &
+	done
+	export CUDA_VISIBLE_DEVICES=${gpus[0]}
+	log "sequence parallelism: $world GPUs; ComfyUI on GPU ${gpus[0]}, followers on ${gpus[*]:1:world-1}"
+}
+start_sequence_parallel "$@"
+
 log "starting ComfyUI ($(command -v python), ${SECONDS}s after container start)"
 exec python main.py "${args[@]}" "${extra[@]}" "$@"

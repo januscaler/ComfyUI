@@ -167,6 +167,7 @@ Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu130** whe
 | `AUTO_DOWNLOAD_MODELS` | `1` | Fetch a workflow's checkpoints on first use. |
 | `VRAM_HEADROOM_GB`, `CACHE_RAM_GB`, `ASYNC_OFFLOAD_STREAMS`, `FAST_DISK` | `2`, `2 8`, `0`, `1` | Memory tuning, as in `.env.example`. |
 | `COMFYUI_ARGS` | empty | Extra ComfyUI flags. |
+| `COMFY_SEQUENCE_PARALLEL_GPUS` | `auto` | Several GPUs: how many split each MiniMax H3 forward (see below). `auto` takes the largest group the box has (8, 7, 4 or 2), `1` turns it off, `N` asks for exactly N. |
 | `COMFY_HF_DOWNLOAD_MODE` | `direct` with a data dir, else `cache` | `direct` downloads Hugging Face weights next to the models dir and moves them in (one copy). `cache` keeps the HF cache plus a copy, which is useful when the HF cache is shared between projects. |
 | `MIMO_API_KEY`, `HF_TOKEN` | unset | H3 prompt rewrite; gated FLUX.2 [klein] weights. |
 | `COMFY_ENV_WAIT_SECONDS` | `1800` | Runpod image: how long a pod waits for another pod that is building the env before it gives up. |
@@ -248,6 +249,44 @@ docker run --rm -e COMFY_MODELS_S3_BUCKET=<bucket> -e COMFY_MODELS_S3_ENDPOINT=h
 ```
 
 ComfyUI itself starts without the bucket credentials and the tunnel token in its environment: the entrypoint unsets them first.
+
+#### Several GPUs: one H3 render on all of them
+
+On a box with several GPUs, each MiniMax H3 forward is split over all of them with sequence parallelism (DeepSpeed-Ulysses, [`comfy/ldm/minimax/sequence_parallel.py`](comfy/ldm/minimax/sequence_parallel.py)). One render gets faster; the box still renders one job at a time. The text encoder and the VAEs stay on the first GPU, so a whole render gains less than one DiT step.
+
+| Shape (DiT int8, cu130, 4x RTX 5090) | 1 GPU | 2 GPUs | 4 GPUs |
+|---|---|---|---|
+| 480p, 2.3 s (7.3k tokens) | 0.98 s/step | 0.68 | 0.38 (2.6x) |
+| 720p, 5 s (26.6k tokens) | 7.40 s/step | 4.23 | 2.24 (3.3x) |
+| 720p, 15 s (76.4k tokens) | 47.7 s/step | 25.8 | 13.4 (3.6x) |
+
+Whole renders through the wrapper (`POST /api/wrapper/minimaxh3/text/generate`, int8, 20 steps, the image's entrypoint on a vast.ai 4x RTX 5090 host, 2026-10-02):
+
+| Render | 1 GPU | 4 GPUs |
+|---|---|---|
+| 720p, 5 s | 164.1 s (7.50 s/step) | 57.5 s (2.19 s/step): 2.85x |
+| 720p, 15 s | about 16 min (47.7 s/step, the DiT benchmark) | 298.9 s (13.27 s/step) |
+
+The text encoder and VAE decode took about 14 s (5 s clip) and 33 s (15 s clip) of those totals, on the first GPU either way. Each GPU holds the whole DiT: at 720p 15 s the first GPU peaked at 28.2 GB and the followers at 26.6–28.0 GB, and the host used 62 GB of RAM. Measured on PCIe 5.0 x16 boards without P2P; boards with slower links scale worse.
+
+Given the same inputs the split DiT's output is bit-identical to one GPU's. Whole renders are not bit-identical run to run even on one GPU (repeats differ by about 41 dB PSNR, or not at all), and one-GPU against four-GPU renders fall in the same range; the audio came out identical.
+
+How it runs:
+
+- The entrypoint gives ComfyUI the first GPU and starts one follower per other GPU ([`docker/sp_follower.py`](docker/sp_follower.py), with ComfyUI's own flags and only its own GPU visible). H3 has 56 attention heads, so a group is 8, 7, 4 or 2 GPUs; `COMFY_SEQUENCE_PARALLEL_GPUS` overrides the size (`1` turns it off).
+- When ComfyUI loads an H3 diffusion model it opens the group on `127.0.0.1:29511` (`COMFY_SP_PORT`), and the followers load the same file the first time a forward needs it.
+- Each step, ComfyUI posts the forward's arguments on that TCP store and broadcasts their tensors over NCCL. Every GPU runs 1/N of the packed sequence; attention exchanges heads for rows with two all-to-alls; the last block gathers the whole output.
+- A forward the followers could not reproduce exactly runs on the first GPU alone: weight patches (a LoRA), another diffusion-model wrapper, block or attention patches, an attention override.
+- A cancel waits for the current step to finish (the GPUs run each forward in lockstep): a cancel at step 8 of 20 returned 3 s later, and the next render ran split again.
+- A split forward runs outside ComfyUI's allocation compiler (the comfy_aimdo malloc graph), which cannot plan its first and last blocks.
+- A follower that exits stops ComfyUI too, and the container restarts with a fresh group. If the followers never join (`COMFY_SP_JOIN_SECONDS`, 300 s), renders use one GPU.
+
+To time one DiT step on 1 against N GPUs without ComfyUI, with seeded inputs (`--compare` reports how far apart two runs' outputs are):
+
+```bash
+torchrun --nproc-per-node 4 script_examples/h3_sp_bench.py --ckpt models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --width 1120 --height 640 --frames 124 --out sp4.pt
+```
 
 ### Serverless API (RunPod and vast.ai)
 

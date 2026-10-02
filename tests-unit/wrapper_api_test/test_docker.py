@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -578,6 +579,106 @@ class TestHostDriverCheck(unittest.TestCase):
             result = self.check(torch_version, driver, args, comfyui_args)
             self.assertEqual(result.returncode, 0, (torch_version, driver, args, comfyui_args, result.stderr))
             self.assertIn("started", result.stdout)
+
+
+@unittest.skipIf(sys.platform == "win32", "bash scripts")
+class TestSequenceParallelEntrypoint(unittest.TestCase):
+    """docker/entrypoint.sh starts a follower per extra GPU and hands ComfyUI the first one."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = read("docker", "entrypoint.sh")
+        start = cls.script.index("SP_GROUP_SIZES=(")
+        cls.block = cls.script[start:cls.script.index('start_sequence_parallel "$@"\n', start)]
+
+    def test_runs_after_the_secrets_are_unset_and_before_comfyui(self):
+        call = self.script.index('start_sequence_parallel "$@"\n')
+        self.assertLess(re.search(r"^unset AWS_ACCESS_KEY_ID", self.script, re.MULTILINE).start(), call,
+                        "followers must not inherit the bucket or tunnel credentials")
+        self.assertLess(call, self.script.index("exec python main.py"))
+
+    def run_block(self, gpus=4, setting=None, extra_env=None, rank1_exits=None, comfyui_args="--verbose INFO"):
+        """The block in a bash harness with stand-in nvidia-smi and python; returns (exit code, log, launches)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.mkdir(bin_dir)
+            launched = os.path.join(tmp, "launched")
+            if gpus is not None:
+                with open(os.path.join(bin_dir, "nvidia-smi"), "w") as f:
+                    f.write("#!/bin/sh\n" + "".join(f"echo {i}\n" for i in range(gpus)))
+            with open(os.path.join(bin_dir, "python"), "w") as f:
+                f.write("#!/bin/bash\n"
+                        f'echo "$COMFY_SP_RANK $CUDA_VISIBLE_DEVICES $COMFY_SP_WORLD ${{*:2}}" >> {launched}\n'
+                        + (f'[ "$COMFY_SP_RANK" = 1 ] && exit {rank1_exits}\n' if rank1_exits is not None else "")
+                        + "sleep 20\n")
+            for name in os.listdir(bin_dir):
+                os.chmod(os.path.join(bin_dir, name), 0o755)
+            # A non-empty `extra`: bash 3.2 (macOS) calls an empty array unbound under set -u.
+            harness = ("set -euo pipefail\nlog() { echo \"entrypoint: $*\" >&2; }\nCOMFY_ROOT=/opt/ComfyUI\n"
+                       "args=(--listen 0.0.0.0 --fast-disk)\nread -r -a extra <<<\"$COMFYUI_ARGS\"\n"
+                       + self.block + 'start_sequence_parallel "$@"\n'
+                       'echo "rank0 ${COMFY_SP_WORLD:-1} ${CUDA_VISIBLE_DEVICES:-unset}"\n'
+                       + ("sleep 5\necho STILL_RUNNING\n" if rank1_exits is not None else ""))
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "COMFYUI_ARGS": comfyui_args, **(extra_env or {})}
+            if setting is not None:
+                env["COMFY_SEQUENCE_PARALLEL_GPUS"] = setting
+            # A file, not a pipe: the backgrounded followers would hold a pipe open until they exit.
+            log_path = os.path.join(tmp, "log")
+            with open(log_path, "w") as log:
+                result = subprocess.run(["bash", "-c", harness], env=env, stdout=log, stderr=subprocess.STDOUT, timeout=60)
+            output = open(log_path).read()
+            world = re.search(r"^rank0 (\d+) ", output, re.MULTILINE)
+            expected = int(world.group(1)) - 1 if world else 0
+
+            def launches():
+                return open(launched).read().splitlines() if os.path.exists(launched) else []
+
+            # A new executable's first run can take a while on macOS (it is scanned).
+            deadline = time.monotonic() + 15
+            while len(launches()) < expected and time.monotonic() < deadline:
+                time.sleep(0.1)
+            subprocess.run(["pkill", "-f", bin_dir], capture_output=True)
+            return result.returncode, output, sorted(launches())
+
+    def test_group_size_follows_the_gpus_and_the_setting(self):
+        for gpus, setting, world in ((1, None, 1), (2, None, 2), (3, None, 2), (4, None, 4), (6, None, 4), (7, None, 7),
+                                     (8, None, 8), (16, None, 8), (8, "4", 4), (8, "1", 1), (8, "auto", 8)):
+            _, log, launched = self.run_block(gpus=gpus, setting=setting)
+            self.assertIn(f"rank0 {world} ", log, (gpus, setting))
+            self.assertEqual(len(launched), world - 1, (gpus, setting))
+        for setting in ("3", "16", "abc"):
+            _, log, launched = self.run_block(gpus=8, setting=setting)
+            self.assertIn("rank0 1 unset", log)
+            self.assertIn("WARNING: COMFY_SEQUENCE_PARALLEL_GPUS", log)
+            self.assertEqual(launched, [])
+
+    def test_each_follower_gets_its_own_gpu_and_comfyuis_flags(self):
+        _, log, launched = self.run_block(gpus=4)
+        self.assertIn("rank0 4 0", log)
+        self.assertEqual(launched, [f"{rank} {rank} 4 --listen 0.0.0.0 --fast-disk --verbose INFO" for rank in (1, 2, 3)])
+        _, log, launched = self.run_block(gpus=None, extra_env={"CUDA_VISIBLE_DEVICES": "2,5"})
+        self.assertEqual(launched, [], "no nvidia-smi: one GPU")
+        _, log, launched = self.run_block(gpus=8, extra_env={"CUDA_VISIBLE_DEVICES": "2,5"})
+        self.assertIn("rank0 2 2", log)
+        self.assertEqual(launched, ["1 5 2 --listen 0.0.0.0 --fast-disk --verbose INFO"])
+
+    def test_off_with_cpu(self):
+        _, log, launched = self.run_block(gpus=4, comfyui_args="--cpu")
+        self.assertIn("rank0 1 unset", log)
+        self.assertEqual(launched, [])
+
+    def test_a_follower_that_fails_stops_comfyui(self):
+        code, log, _ = self.run_block(gpus=2, rank1_exits=3)
+        self.assertEqual(code, -15, log)  # SIGTERM
+        self.assertIn("sequence-parallel follower 1 failed (status 3); stopping ComfyUI", log)
+        self.assertNotIn("STILL_RUNNING", log)
+
+    def test_a_follower_that_exits_cleanly_leaves_comfyui_running(self):
+        # ComfyUI is gone, or the group could not start and ComfyUI renders on one GPU.
+        code, log, _ = self.run_block(gpus=2, rank1_exits=0)
+        self.assertEqual(code, 0, log)
+        self.assertIn("STILL_RUNNING", log)
+        self.assertNotIn("stopping ComfyUI", log)
 
 
 @unittest.skipIf(sys.platform == "win32", "bash scripts")
