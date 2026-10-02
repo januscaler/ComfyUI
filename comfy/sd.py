@@ -2430,6 +2430,10 @@ def load_diffusion_model(unet_path, model_options={}, disable_dynamic=False):
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
     model.cached_patcher_init = (load_diffusion_model, (unet_path, model_options))
+    if os.environ.get("COMFY_SP_WORLD", "1") not in ("", "0", "1"):
+        # One MiniMax H3 forward on several GPUs: the followers load this same file.
+        from comfy.ldm.minimax import sequence_parallel  # not `import comfy....`: that would make `comfy` local here
+        sequence_parallel.attach(model)
     return model
 
 

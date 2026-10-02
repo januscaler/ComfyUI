@@ -2203,9 +2203,27 @@ def processing_interrupted():
     with interrupt_processing_mutex:
         return interrupt_processing
 
+_interrupt_deferral = threading.local()
+
+@contextmanager
+def defer_processing_interrupt():
+    """Holds an interrupt until the block ends; the next check after it raises.
+
+    For work that must not stop halfway, e.g. a forward other processes run in
+    lockstep with this one (comfy/ldm/minimax/sequence_parallel.py).
+    """
+    depth = getattr(_interrupt_deferral, "depth", 0)
+    _interrupt_deferral.depth = depth + 1
+    try:
+        yield
+    finally:
+        _interrupt_deferral.depth = depth
+
 def throw_exception_if_processing_interrupted():
     global interrupt_processing
     global interrupt_processing_mutex
+    if getattr(_interrupt_deferral, "depth", 0):
+        return
     with interrupt_processing_mutex:
         if interrupt_processing:
             interrupt_processing = False
