@@ -25,14 +25,18 @@
 #   - `tools`: fetches the pinned cloudflared and s5cmd binaries for `comfyui`.
 #
 # CUDA only. The PyTorch CUDA wheels bundle the CUDA runtime, so this slim
-# image uses the host GPU through the NVIDIA container toolkit. cu128 is the
-# oldest CUDA with Blackwell (RTX 5090, sm_120) kernels and needs host driver
-# >= 570, which every RTX 5090 host already has. A newer CUDA index can be
-# chosen (e.g. --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130),
-# but any torch that is not a CUDA build fails the image build (`comfyui`) or
-# the env build on the volume (`runpod`).
+# image uses the host GPU through the NVIDIA container toolkit. The torch build
+# is cu130, which needs host driver >= 580: comfy/quant_ops.py turns off
+# comfy-kitchen's CUDA kernels on any torch older than CUDA 13, and without
+# them one RTX 5090 samples MiniMax H3 1.8-2.9x slower (720p 5 s: 13.5 s/step
+# on cu128, 7.4 s/step on cu130). The backend only rents hosts whose driver
+# supports CUDA 13, and docker/entrypoint.sh stops on an older driver.
+# TORCH_VERSION is pinned so a rebuild changes torch only when this file does.
+# Any torch that is not a CUDA build fails the image build (`comfyui`) or the
+# env build on the volume (`runpod`).
 ARG BASE_IMAGE=python:3.12-slim
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG TORCH_VERSION=2.11.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.2
 
 FROM ${UV_IMAGE} AS uv
@@ -84,11 +88,12 @@ RUN apt-get update && \
 FROM system AS base
 
 ARG TORCH_INDEX_URL
+ARG TORCH_VERSION
 
 # torch first, from the CUDA index above, so requirements.txt (which lists
 # torch unpinned) finds it already satisfied instead of pulling PyPI's default.
 RUN python -m pip install --upgrade pip && \
-    python -m pip install --index-url "${TORCH_INDEX_URL}" torch torchvision torchaudio
+    python -m pip install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}" torchvision torchaudio
 
 COPY requirements.txt manager_requirements.txt ./
 # The assert runs after requirements.txt so a dependency that swaps torch for
@@ -100,6 +105,7 @@ RUN python -m pip install -r requirements.txt && \
 FROM system AS runpod
 
 ARG TORCH_INDEX_URL
+ARG TORCH_VERSION
 
 # Only the static uv binary (not uvx): it builds the env on the first boot.
 COPY --from=uv /uv /usr/local/bin/uv
@@ -112,10 +118,10 @@ COPY . .
 # that only changed code reuses the existing one. docker/env-inputs.sh prints
 # the hashed text (the entrypoint runs the same script at boot for code that
 # docker/runpod-bootstrap.sh fetched, so both keys agree); docker/env-inputs
-# keeps it, and the entrypoint reads the torch index from it.
+# keeps it, and the entrypoint reads the torch index and version from it.
 RUN mkdir -p input output temp user models api_server/workflows && \
     chmod +x docker/entrypoint.sh docker/env-inputs.sh docker/runpod-bootstrap.sh && \
-    TORCH_INDEX_URL="${TORCH_INDEX_URL}" docker/env-inputs.sh > docker/env-inputs && \
+    TORCH_INDEX_URL="${TORCH_INDEX_URL}" TORCH_VERSION="${TORCH_VERSION}" docker/env-inputs.sh > docker/env-inputs && \
     sha256sum docker/env-inputs | cut -c1-16 > docker/env-key && \
     cat docker/env-inputs docker/env-key
 

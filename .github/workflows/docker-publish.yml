@@ -147,10 +147,12 @@ jobs:
           cache-from: ${{ needs.mode.outputs.login == 'true' && format('type=registry,ref=docker.io/{0}:buildcache', env.IMAGE) || '' }}
           provenance: false
 
+      # CUDA 13 or newer: below it comfy/quant_ops.py turns off comfy-kitchen's
+      # CUDA kernels and H3 samples about 2x slower.
       - name: "Smoke test: torch and CUDA build"
         run: |
           docker run --rm --entrypoint python "$SMOKE_TAG" -c \
-            "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda, 'CPU-only torch in the image'"
+            "import torch, torchvision, torchaudio; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.version.cuda, 'CPU-only torch in the image'; assert int(torch.version.cuda.split('.')[0]) >= 13, 'torch CUDA %s: comfy-kitchen needs CUDA 13' % torch.version.cuda"
 
       - name: "Smoke test: model prefetch resolves every wrapper checkpoint"
         run: docker run --rm "$SMOKE_TAG" prefetch --dry-run
@@ -218,7 +220,7 @@ jobs:
     timeout-minutes: 90
     steps:
       # The image is small, but its smoke test builds the real CUDA env (torch
-      # cu128 + requirements, ~8 GB, plus uv's cache while installing) on a
+      # cu130 + requirements, ~8 GB, plus uv's cache while installing) on a
       # docker volume, exactly as the first pod on a network volume does.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
