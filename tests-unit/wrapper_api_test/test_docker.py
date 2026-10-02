@@ -597,17 +597,26 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
                         "followers must not inherit the bucket or tunnel credentials")
         self.assertLess(call, self.script.index("exec python main.py"))
 
-    def run_block(self, gpus=4, setting=None, extra_env=None, rank1_exits=None, comfyui_args="--verbose INFO"):
-        """The block in a bash harness with stand-in nvidia-smi and python; returns (exit code, log, launches)."""
+    def run_block(self, gpus=4, setting=None, extra_env=None, rank1_exits=None, comfyui_args="--verbose INFO",
+                  selftest="exit 0"):
+        """The block in a bash harness with stand-in nvidia-smi and python; returns (exit code, log, launches).
+
+        `selftest` is what the stand-in does as docker/sp_selftest.py; its runs land in self.selftests.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = os.path.join(tmp, "bin")
             os.mkdir(bin_dir)
             launched = os.path.join(tmp, "launched")
+            selftests = os.path.join(tmp, "selftests")
             if gpus is not None:
                 with open(os.path.join(bin_dir, "nvidia-smi"), "w") as f:
                     f.write("#!/bin/sh\n" + "".join(f"echo {i}\n" for i in range(gpus)))
             with open(os.path.join(bin_dir, "python"), "w") as f:
                 f.write("#!/bin/bash\n"
+                        'if [[ "$1" == */docker/sp_selftest.py ]]; then\n'
+                        f'  echo "$COMFY_SP_RANK $CUDA_VISIBLE_DEVICES $COMFY_SP_WORLD $COMFY_SP_PORT $NCCL_P2P_DISABLE" >> {selftests}\n'
+                        f"  {selftest}\n"
+                        "fi\n"
                         f'echo "$COMFY_SP_RANK $CUDA_VISIBLE_DEVICES $COMFY_SP_WORLD ${{*:2}}" >> {launched}\n'
                         + (f'[ "$COMFY_SP_RANK" = 1 ] && exit {rank1_exits}\n' if rank1_exits is not None else "")
                         + "sleep 20\n")
@@ -618,6 +627,7 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
                        "args=(--listen 0.0.0.0 --fast-disk)\nread -r -a extra <<<\"$COMFYUI_ARGS\"\n"
                        + self.block + 'start_sequence_parallel "$@"\n'
                        'echo "rank0 ${COMFY_SP_WORLD:-1} ${CUDA_VISIBLE_DEVICES:-unset}"\n'
+                       'echo "nccl ${NCCL_P2P_DISABLE:-unset}"\n'
                        + ("sleep 5\necho STILL_RUNNING\n" if rank1_exits is not None else ""))
             env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "COMFYUI_ARGS": comfyui_args, **(extra_env or {})}
             if setting is not None:
@@ -638,6 +648,7 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
             while len(launches()) < expected and time.monotonic() < deadline:
                 time.sleep(0.1)
             subprocess.run(["pkill", "-f", bin_dir], capture_output=True)
+            self.selftests = sorted(open(selftests).read().splitlines()) if os.path.exists(selftests) else []
             return result.returncode, output, sorted(launches())
 
     def test_group_size_follows_the_gpus_and_the_setting(self):
@@ -679,6 +690,47 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
         self.assertEqual(code, 0, log)
         self.assertIn("STILL_RUNNING", log)
         self.assertNotIn("stopping ComfyUI", log)
+
+    def test_nccl_uses_shared_memory_unless_told_otherwise(self):
+        _, log, _ = self.run_block(gpus=2)
+        self.assertIn("nccl 1", log)
+        self.assertIn("NCCL_P2P_DISABLE=1", log)
+        _, log, _ = self.run_block(gpus=2, extra_env={"NCCL_P2P_DISABLE": "0"})
+        self.assertIn("nccl 0", log)
+        self.assertEqual(self.selftests, ["0 0 2 29512 0", "1 1 2 29512 0"], "the self-test runs as the group will")
+        _, log, _ = self.run_block(gpus=1)
+        self.assertIn("nccl unset", log, "one GPU: NCCL is not involved")
+
+    def test_the_selftest_runs_one_process_per_gpu_before_the_group(self):
+        _, log, launched = self.run_block(gpus=8, extra_env={"CUDA_VISIBLE_DEVICES": "3,1,6,7", "COMFY_SP_PORT": "30000"})
+        self.assertEqual(self.selftests, ["0 3 4 30001 1", "1 1 4 30001 1", "2 6 4 30001 1", "3 7 4 30001 1"])
+        self.assertIn("rank0 4 3", log)
+        self.assertEqual(len(launched), 3)
+        self.assertRegex(log, r"testing 4 GPUs \(NCCL_P2P_DISABLE=1, /dev/shm \d+ MiB\)")
+
+    def test_a_failed_selftest_means_one_gpu(self):
+        started = time.monotonic()
+        # Rank 1 fails while rank 0 would wait for it: no need to wait out the limit.
+        _, log, launched = self.run_block(gpus=2, selftest='[ "$COMFY_SP_RANK" = 1 ] && exit 1; exec sleep 30')
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("rank0 1 unset", log)
+        self.assertIn("WARNING: the sequence-parallel self-test failed on GPUs 0 1; rendering on one GPU", log)
+        self.assertNotIn("still running", log)
+        self.assertEqual(launched, [])
+
+    def test_a_hung_selftest_is_killed_and_means_one_gpu(self):
+        started = time.monotonic()
+        _, log, launched = self.run_block(gpus=4, selftest="exec sleep 30", extra_env={"COMFY_SP_SELFTEST_SECONDS": "2"})
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("sequence-parallel self-test: 4 of 4 ranks still running after 2s", log)
+        self.assertIn("rank0 1 unset", log)
+        self.assertEqual(launched, [])
+
+    def test_the_selftest_can_be_skipped(self):
+        _, log, launched = self.run_block(gpus=2, selftest="exit 1", extra_env={"COMFY_SP_SELFTEST_SECONDS": "0"})
+        self.assertEqual(self.selftests, [])
+        self.assertIn("rank0 2 0", log)
+        self.assertEqual(len(launched), 1)
 
 
 @unittest.skipIf(sys.platform == "win32", "bash scripts")

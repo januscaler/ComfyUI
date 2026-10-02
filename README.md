@@ -168,6 +168,8 @@ Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu130** whe
 | `VRAM_HEADROOM_GB`, `CACHE_RAM_GB`, `ASYNC_OFFLOAD_STREAMS`, `FAST_DISK` | `2`, `2 8`, `0`, `1` | Memory tuning, as in `.env.example`. |
 | `COMFYUI_ARGS` | empty | Extra ComfyUI flags. |
 | `COMFY_SEQUENCE_PARALLEL_GPUS` | `auto` | Several GPUs: how many split each MiniMax H3 forward (see below). `auto` takes the largest group the box has (8, 7, 4 or 2), `1` turns it off, `N` asks for exactly N. |
+| `COMFY_SP_SELFTEST_SECONDS` | `90` | Several GPUs: how long the transport self-test may take before the container gives up on the group and renders on one GPU (see below). `0` skips it. |
+| `NCCL_P2P_DISABLE` | `1` with several GPUs | The group's NCCL traffic goes through shared memory; `0` lets NCCL use peer-to-peer copies where the GPUs offer them. |
 | `COMFY_HF_DOWNLOAD_MODE` | `direct` with a data dir, else `cache` | `direct` downloads Hugging Face weights next to the models dir and moves them in (one copy). `cache` keeps the HF cache plus a copy, which is useful when the HF cache is shared between projects. |
 | `MIMO_API_KEY`, `HF_TOKEN` | unset | H3 prompt rewrite; gated FLUX.2 [klein] weights. |
 | `COMFY_ENV_WAIT_SECONDS` | `1800` | Runpod image: how long a pod waits for another pod that is building the env before it gives up. |
@@ -274,6 +276,7 @@ Given the same inputs the split DiT's output is bit-identical to one GPU's. Whol
 How it runs:
 
 - The entrypoint gives ComfyUI the first GPU and starts one follower per other GPU ([`docker/sp_follower.py`](docker/sp_follower.py), with ComfyUI's own flags and only its own GPU visible). H3 has 56 attention heads, so a group is 8, 7, 4 or 2 GPUs; `COMFY_SEQUENCE_PARALLEL_GPUS` overrides the size (`1` turns it off).
+- First, [`docker/sp_selftest.py`](docker/sp_selftest.py) runs on every GPU, laid out as the group is: a broadcast the size of one forward's inputs, an all-to-all and an all-gather, each checked for the right values. Unless every rank passes within `COMFY_SP_SELFTEST_SECONDS` (90 s), renders use one GPU. On a RunPod 2× RTX PRO 6000 worker the group's first broadcast never completed over NCCL's peer-to-peer transport (both ranks waited the 600 s collective timeout and the render was lost), so the entrypoint sets `NCCL_P2P_DISABLE=1`: shared memory, which the 4× 5090 runs used anyway. The startup log shows the setting and the size of `/dev/shm`, which NCCL's shared-memory buffers live in.
 - When ComfyUI loads an H3 diffusion model it opens the group on `127.0.0.1:29511` (`COMFY_SP_PORT`), and the followers load the same file the first time a forward needs it.
 - Each step, ComfyUI posts the forward's arguments on that TCP store and broadcasts their tensors over NCCL. Every GPU runs 1/N of the packed sequence; attention exchanges heads for rows with two all-to-alls; the last block gathers the whole output.
 - A forward the followers could not reproduce exactly runs on the first GPU alone: weight patches (a LoRA), another diffusion-model wrapper, block or attention patches, an attention override.

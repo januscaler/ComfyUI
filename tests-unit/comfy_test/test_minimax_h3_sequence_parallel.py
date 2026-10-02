@@ -184,3 +184,20 @@ def test_without_followers_renders_stay_on_one_gpu(tiny_checkpoint):
     assert checks["forward"]["diff"] == 0.0 and checks["forward"]["posted"] == 0
     assert checks["forward"]["malloc_graph_ends"] == 0
     assert "did not join" in stderr
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_transport_selftest_passes_on_a_working_group(world):
+    # docker/sp_selftest.py, one process per rank as docker/entrypoint.sh runs it.
+    env = {**os.environ, "COMFY_SP_WORLD": str(world), "COMFY_SP_PORT": str(_free_port()), "COMFY_SP_BACKEND": "gloo"}
+    procs = [subprocess.Popen([sys.executable, os.path.join(ROOT, "docker", "sp_selftest.py")],
+                              env={**env, "COMFY_SP_RANK": str(rank)}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True) for rank in range(world)]
+    try:
+        outputs = [p.communicate(timeout=120)[0] for p in procs]
+    finally:
+        for p in procs:
+            p.kill()
+    for rank, (p, out) in enumerate(zip(procs, outputs)):
+        assert p.returncode == 0, out
+        assert f"sp-selftest {rank}/{world}: ok (gloo" in out

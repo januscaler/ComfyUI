@@ -521,6 +521,16 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN CF_TUNNEL_TOKEN 
 # A follower exits 0 when ComfyUI is gone, or when the group could not start, in
 # which case ComfyUI renders on one GPU. Off with --cpu and where there is no
 # nvidia-smi (one GPU, as before).
+# NCCL moves the group's data through shared memory: where GPUs offer peer-to-peer
+# copies NCCL would pick those, and on a RunPod 2x RTX PRO 6000 worker (2026-10-02)
+# the group's first broadcast then never completed. Shared memory is what the
+# 4x 5090 runs used (those cards have no peer-to-peer). NCCL_P2P_DISABLE=0 lets
+# NCCL choose again.
+# Before ComfyUI starts, docker/sp_selftest.py sends the group's traffic in
+# miniature, laid out as the group is (one process per GPU, each seeing only its
+# own), and is killed after COMFY_SP_SELFTEST_SECONDS (default 90; 0 skips it).
+# Unless every rank passes in time, ComfyUI renders on one GPU instead of hanging
+# inside a customer's render.
 SP_GROUP_SIZES=(8 7 4 2)
 # The group size for $1 usable GPUs, from COMFY_SEQUENCE_PARALLEL_GPUS.
 sp_world() {
@@ -548,9 +558,45 @@ sp_world() {
 	log "WARNING: COMFY_SEQUENCE_PARALLEL_GPUS=$setting is not 1, auto, or one of ${SP_GROUP_SIZES[*]} GPUs within the $count here; using one GPU"
 	echo 1
 }
+# True when docker/sp_selftest.py passes on every rank of a $1-GPU group on ${gpus[@]}.
+sp_selftest() {
+	local world=$1 limit=${COMFY_SP_SELFTEST_SECONDS:-90} port=${COMFY_SP_SELFTEST_PORT:-$((COMFY_SP_PORT + 1))}
+	local rank pid deadline failed=0
+	local -a pids=() left
+	((limit > 0)) || return 0
+	deadline=$((SECONDS + limit))
+	for ((rank = 0; rank < world; rank++)); do
+		CUDA_VISIBLE_DEVICES=${gpus[rank]} COMFY_SP_RANK=$rank COMFY_SP_WORLD=$world COMFY_SP_PORT=$port \
+			NCCL_DEBUG=${NCCL_DEBUG:-WARN} python "$COMFY_ROOT/docker/sp_selftest.py" &
+		pids+=("$!")
+	done
+	# Until every rank is done, one has failed (the rest would wait for it), or time is up.
+	while ((${#pids[@]} > 0 && failed == 0 && SECONDS < deadline)); do
+		sleep 1
+		left=()
+		for pid in "${pids[@]}"; do
+			if kill -0 "$pid" 2>/dev/null; then
+				left+=("$pid")
+			elif ! wait "$pid"; then
+				failed=1
+			fi
+		done
+		# ${left[@]+...}: bash 3.2 (macOS) calls an empty array unbound under set -u.
+		pids=(${left[@]+"${left[@]}"})
+	done
+	if ((${#pids[@]} > 0)); then
+		((failed)) || log "sequence-parallel self-test: ${#pids[@]} of $world ranks still running after ${limit}s"
+		kill -KILL "${pids[@]}" 2>/dev/null || true
+		for pid in "${pids[@]}"; do
+			wait "$pid" 2>/dev/null || true
+		done
+		failed=1
+	fi
+	((failed == 0))
+}
 start_sequence_parallel() {
 	local -a gpus
-	local world rank main=$$
+	local world rank shm main=$$
 	[[ " ${COMFYUI_ARGS:-} $* " == *" --cpu "* ]] && return 0
 	command -v nvidia-smi >/dev/null || return 0
 	if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -560,7 +606,14 @@ start_sequence_parallel() {
 	fi
 	world=$(sp_world "${#gpus[@]}")
 	((world >= 2)) || return 0
-	export COMFY_SP_WORLD=$world COMFY_SP_PORT=${COMFY_SP_PORT:-29511}
+	export COMFY_SP_PORT=${COMFY_SP_PORT:-29511} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+	read -r _ shm _ <<<"$(df -Pk /dev/shm 2>/dev/null | tail -n 1)" || true
+	log "sequence parallelism: testing $world GPUs (NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE, /dev/shm $((${shm:-0} / 1024)) MiB)"
+	if ! sp_selftest "$world"; then
+		log "WARNING: the sequence-parallel self-test failed on GPUs ${gpus[*]:0:world}; rendering on one GPU"
+		return 0
+	fi
+	export COMFY_SP_WORLD=$world
 	# Each follower runs in the foreground of its own subshell, which notices when
 	# it fails (after the exec below, ComfyUI would never reap it) and stops ComfyUI.
 	for ((rank = 1; rank < world; rank++)); do
