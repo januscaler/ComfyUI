@@ -260,7 +260,16 @@ On a box with several GPUs, each MiniMax H3 forward is split over all of them wi
 | 720p, 5 s (26.6k tokens) | 7.40 s/step | 4.23 | 2.24 (3.3x) |
 | 720p, 15 s (76.4k tokens) | 47.7 s/step | 25.8 | 13.4 (3.6x) |
 
-The outputs were bit-identical to one GPU. Each GPU holds the whole DiT (22–26 GB peak per GPU at those shapes). Measured on a PCIe 5.0 x16 host without P2P; boards with slower links scale worse.
+Whole renders through the wrapper (`POST /api/wrapper/minimaxh3/text/generate`, int8, 20 steps, the image's entrypoint on a vast.ai 4x RTX 5090 host, 2026-10-02):
+
+| Render | 1 GPU | 4 GPUs |
+|---|---|---|
+| 720p, 5 s | 164.1 s (7.50 s/step) | 57.5 s (2.19 s/step): 2.85x |
+| 720p, 15 s | about 16 min (47.7 s/step, the DiT benchmark) | 298.9 s (13.27 s/step) |
+
+The text encoder and VAE decode took about 14 s (5 s clip) and 33 s (15 s clip) of those totals, on the first GPU either way. Each GPU holds the whole DiT: at 720p 15 s the first GPU peaked at 28.2 GB and the followers at 26.6–28.0 GB, and the host used 62 GB of RAM. Measured on PCIe 5.0 x16 boards without P2P; boards with slower links scale worse.
+
+Given the same inputs the split DiT's output is bit-identical to one GPU's. Whole renders are not bit-identical run to run even on one GPU (repeats differ by about 41 dB PSNR, or not at all), and one-GPU against four-GPU renders fall in the same range; the audio came out identical.
 
 How it runs:
 
@@ -268,7 +277,8 @@ How it runs:
 - When ComfyUI loads an H3 diffusion model it opens the group on `127.0.0.1:29511` (`COMFY_SP_PORT`), and the followers load the same file the first time a forward needs it.
 - Each step, ComfyUI posts the forward's arguments on that TCP store and broadcasts their tensors over NCCL. Every GPU runs 1/N of the packed sequence; attention exchanges heads for rows with two all-to-alls; the last block gathers the whole output.
 - A forward the followers could not reproduce exactly runs on the first GPU alone: weight patches (a LoRA), another diffusion-model wrapper, block or attention patches, an attention override.
-- A cancel waits for the current step to finish (the GPUs run each forward in lockstep).
+- A cancel waits for the current step to finish (the GPUs run each forward in lockstep): a cancel at step 8 of 20 returned 3 s later, and the next render ran split again.
+- A split forward runs outside ComfyUI's allocation compiler (the comfy_aimdo malloc graph), which cannot plan its first and last blocks.
 - A follower that exits stops ComfyUI too, and the container restarts with a fresh group. If the followers never join (`COMFY_SP_JOIN_SECONDS`, 300 s), renders use one GPU.
 
 To time one DiT step on 1 against N GPUs without ComfyUI, with seeded inputs (`--compare` reports how far apart two runs' outputs are):

@@ -55,6 +55,7 @@ import torch
 import torch.distributed as dist
 
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.patcher_extension
 import comfy.quant_ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
@@ -474,6 +475,12 @@ def _wrapper(executor, x, timestep, context, transformer_options, **kwargs):
         # too, so a cancel waits for the end of the step (the sampler checks again).
         with comfy.model_management.defer_processing_interrupt():
             try:
+                # ComfyUI's allocation compiler (the comfy_aimdo malloc graph) replays one
+                # plan per block, and a split forward allocates differently in its first
+                # and last blocks (slice, gather) and around the collectives: it fails to
+                # compile ("aimdo memory compile error"). This forward runs outside it, as
+                # the followers' always do.
+                comfy.model_prefetch.malloc_graph_end()
                 seq = group.send_forward(info.key, packed)
                 local = dict(transformer_options)
                 local["patches_replace"] = info.sequence_parallel.patches()

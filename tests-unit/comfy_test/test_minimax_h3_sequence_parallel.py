@@ -165,6 +165,8 @@ def test_two_processes_split_a_forward_with_the_dense_output(tiny_checkpoint):
     # 1 load + 3 forwards reached the follower; the outputs match the dense model's.
     assert checks["forward"]["posted"] == 4
     assert checks["forward"]["diff"] <= 1e-5
+    # Each split forward left the allocation compiler: on CUDA it fails to compile the split blocks.
+    assert checks["forward"]["malloc_graph_ends"] == 3
     assert checks["masked"]["diff"] <= 1e-5, "per-token mod rows (a denoise mask) split with their rows"
     # A LoRA'd model renders on rank 0 alone, and nothing is posted.
     assert checks["patched"] == {"check": "patched", "diff": 0.0, "posted": 0}
@@ -180,4 +182,5 @@ def test_without_followers_renders_stay_on_one_gpu(tiny_checkpoint):
     checks, _, stderr = _run(tiny_checkpoint, followers=0, join_seconds="2")
     assert checks["attached"] == {"check": "attached", "active": False, "wrappers": 0}
     assert checks["forward"]["diff"] == 0.0 and checks["forward"]["posted"] == 0
+    assert checks["forward"]["malloc_graph_ends"] == 0
     assert "did not join" in stderr

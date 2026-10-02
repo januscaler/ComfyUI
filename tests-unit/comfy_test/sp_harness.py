@@ -90,9 +90,17 @@ def run(ckpt):
     def diff(a, b):
         return max(float((x - y).abs().max()) for x, y in zip(a, b))
 
+    # A split forward leaves ComfyUI's allocation compiler (it cannot plan the split blocks).
+    import comfy.model_prefetch
+    ends = []
+    original_end = comfy.model_prefetch.malloc_graph_end
+    comfy.model_prefetch.malloc_graph_end = lambda: (ends.append(1), original_end())[1]
     sent = group.seq if group else 0
-    report("forward", diff=max(diff(forward(True, s), forward(False, s)) for s in (0.9, 0.5, 0.1)),
-           posted=(group.seq if group else 0) - sent)
+    split = [forward(True, s) for s in (0.9, 0.5, 0.1)]
+    graph_ends = len(ends)
+    comfy.model_prefetch.malloc_graph_end = original_end
+    report("forward", diff=max(diff(out, forward(False, s)) for out, s in zip(split, (0.9, 0.5, 0.1))),
+           posted=(group.seq if group else 0) - sent, malloc_graph_ends=graph_ends)
 
     report("masked", diff=diff(forward(True, 0.7, denoise_mask=mask), forward(False, 0.7, denoise_mask=mask)))
 
