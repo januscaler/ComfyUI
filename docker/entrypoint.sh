@@ -552,17 +552,26 @@ sp_world() {
 # a group over a GPU-to-GPU path that carries no data, and then hang in a render's
 # first collective (RunPod, 2x RTX PRO 6000). docker/sp_probe.py runs a split
 # forward's collectives on the group's GPUs ($@) within COMFY_SP_PROBE_SECONDS
-# (90 s). The first try leaves NCCL its own choice of path. Unless
-# NCCL_P2P_DISABLE is already set, a second try goes without PCIe peer-to-peer
-# (through host memory), and ComfyUI and the followers keep that setting.
-# Neither works = one GPU.
+# (90 s). The first try goes without PCIe peer-to-peer (NCCL_P2P_DISABLE=1,
+# through host memory), and ComfyUI and the followers keep that setting. On
+# PCIe cards it is about as fast: 4x RTX 5090 ran 3.3x faster through host
+# memory. A peer-to-peer path that drops writes (IOMMU/ACS on the host) hangs
+# instead of failing, so trying it first would cost the full 90 s on such hosts.
+# If host memory fails, the second try leaves NCCL its own choice of path.
+# Neither works = one GPU. An NCCL_P2P_DISABLE already set is the only one tried.
 #   COMFY_SP_PROBE   1 (default); 0: start the group without trying it
 sp_probe_group() {
 	[[ "${COMFY_SP_PROBE:-1}" == 0 ]] && return 0
-	python "$COMFY_ROOT/docker/sp_probe.py" "$@" && return 0
-	if [[ -z "${NCCL_P2P_DISABLE+set}" ]] && NCCL_P2P_DISABLE=1 python "$COMFY_ROOT/docker/sp_probe.py" "$@"; then
+	if [[ -n "${NCCL_P2P_DISABLE+set}" ]]; then
+		python "$COMFY_ROOT/docker/sp_probe.py" "$@"
+		return
+	fi
+	if NCCL_P2P_DISABLE=1 python "$COMFY_ROOT/docker/sp_probe.py" "$@"; then
 		export NCCL_P2P_DISABLE=1
-		log "sequence parallelism: GPU peer-to-peer does not work here; NCCL_P2P_DISABLE=1 for ComfyUI and the followers"
+		return 0
+	fi
+	if python "$COMFY_ROOT/docker/sp_probe.py" "$@"; then
+		log "sequence parallelism: NCCL_P2P_DISABLE=1 did not work here; ComfyUI and the followers use NCCL's own path"
 		return 0
 	fi
 	return 1
