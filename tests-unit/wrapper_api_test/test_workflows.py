@@ -224,7 +224,8 @@ class TestWorkflowRegistry(unittest.TestCase):
         self.assertEqual(sorted(entry["tasks"]), ["image", "reference", "text"])
         self.assertEqual(entry["output_type"], "video")
         self.assertIn("uploads", entry["tasks"]["reference"])
-        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_images"]["max"], 3)
+        # The node's own limit (Autogrow max=9), not the official workflow's 3.
+        self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_images"]["max"], 9)
         self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_videos"]["max"], 1)
         self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_video_audios"]["max"], 1)
         self.assertEqual(entry["tasks"]["reference"]["uploads"]["ref_audios"]["max"], 3)
@@ -451,6 +452,15 @@ class TestMiniMaxH3Graph(unittest.TestCase):
         for key in audios:
             node = graph[graph["6"]["inputs"][key][0]]
             self.assertEqual(node["class_type"], "LoadAudio")
+
+    def test_reference_to_video_wires_nine_images(self):
+        images = [f"wrapper/i{i}.png" for i in range(9)]
+        graph = wrapper_workflows.build_minimax_h3_reference_to_video(
+            prompt=" ".join(f"<Picture {i + 1}>" for i in range(9)), ref_images=images)
+        slots = {k: v for k, v in graph["6"]["inputs"].items() if k.startswith("ref_images.")}
+        self.assertEqual(sorted(slots), [f"ref_images.ref_image_{i}" for i in range(9)])
+        self.assertEqual([graph[slots[f"ref_images.ref_image_{i}"][0]]["inputs"]["image"]
+                          for i in range(9)], images)
 
     def test_reference_to_video_wires_refs(self):
         graph = wrapper_workflows.build_minimax_h3_reference_to_video(

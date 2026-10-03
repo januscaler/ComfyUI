@@ -672,8 +672,11 @@ def build_minimax_h3_reference_to_video(*, prompt, seed=0, steps=MINIMAX_H3_DEFA
     """MiniMax H3 reference-to-video (ref2va): reference images/videos/audio +
     prompt -> joint audio+video MP4. The prompt refers to references by tag
     (<Picture i> / <Video k> / <Audio j>) in the order they were provided.
-    Parity with the official ref2va workflow: up to 3 images, 1 reference video
-    (with its optional soundtrack), and 2 standalone audio refs.
+    Up to 9 images — the node's own limit (the official workflow wires 3) —
+    1 reference video (with its optional soundtrack), and 3 standalone audio
+    refs. Measured on the 5090 (480p, 5 s, 20 steps, int8): 3 images 90 s, 5
+    110 s, 7 120 s, 9 140 s; each image is its own reference latent, so every
+    one adds to every step.
 
     ``first_frame`` / ``last_frame`` pin exact pixels at the video's first and
     last frame (MiniMaxH3AddGuide) on top of the references — the reference
@@ -973,7 +976,8 @@ WORKFLOWS = {
             "reference": {
                 "title": "Reference to video (ref2va)",
                 "requires_image": False,
-                "uploads": {"ref_images": {"ext": "image", "max": 3},
+                # The node's own limit: nine reference images (each a <Picture i>).
+                "uploads": {"ref_images": {"ext": "image", "max": 9},
                              "ref_videos": {"ext": "video", "max": 1},
                              "ref_video_audios": {"ext": "audio", "max": 1},
                              # The node's own limit: three voice-timbre clips (a
