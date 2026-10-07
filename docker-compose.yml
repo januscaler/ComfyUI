@@ -60,6 +60,10 @@ services:
       - AUTO_DOWNLOAD_MODELS=${AUTO_DOWNLOAD_MODELS:-1}
       # Extra ComfyUI flags appended by the entrypoint.
       - COMFYUI_ARGS=${COMFYUI_ARGS:-}
+      # Stop ComfyUI after this many seconds without use, so the box's other
+      # apps get all of its VRAM back (even an idle ComfyUI holds ~0.8 GB);
+      # the next request starts it again in ~5 s. 0 = always running.
+      - COMFYUI_IDLE_STOP_SECONDS=${COMFYUI_IDLE_STOP_SECONDS:-120}
       # Hard caps on MiniMax H3 jobs, enforced by the wrapper API before a job
       # is queued: over-budget requests get a 400 instead of OOM-killing the
       # server. Frame count bites hardest (the video VAE tiles spatially but

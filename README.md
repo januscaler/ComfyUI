@@ -167,6 +167,7 @@ Both images are **CUDA only**: `python:3.12-slim` plus the PyTorch **cu130** whe
 | `AUTO_DOWNLOAD_MODELS` | `1` | Fetch a workflow's checkpoints on first use. |
 | `VRAM_HEADROOM_GB`, `CACHE_RAM_GB`, `ASYNC_OFFLOAD_STREAMS`, `FAST_DISK` | `2`, `2 8`, `0`, `1` | Memory tuning, as in `.env.example`. |
 | `COMFYUI_ARGS` | empty | Extra ComfyUI flags. |
+| `COMFYUI_IDLE_STOP_SECONDS` | `0` (compose: `120`) | Stop ComfyUI after this many seconds with an empty queue and no requests, so a GPU shared with other apps gets all its VRAM back (an idle ComfyUI still holds ~0.8 GB of CUDA context). `docker/idle_gate.py` then owns the port: it starts ComfyUI on the next request (~5 s) and answers the healthcheck, `/queue` and `/api/wrapper/workflows` without starting it. `0` keeps ComfyUI running. Not with sequence parallelism. |
 | `COMFY_SEQUENCE_PARALLEL_GPUS` | `auto` | Several GPUs: how many split each MiniMax H3 forward (see below). `auto` takes the largest group the box has (8, 7, 4 or 2), `1` turns it off, `N` asks for exactly N. |
 | `COMFY_SP_PROBE`, `COMFY_SP_PROBE_SECONDS` | `1`, `90` | Several GPUs: try the group's GPUs before it starts (see below). `0` skips the check. |
 | `COMFY_HF_DOWNLOAD_MODE` | `direct` with a data dir, else `cache` | `direct` downloads Hugging Face weights next to the models dir and moves them in (one copy). `cache` keeps the HF cache plus a copy, which is useful when the HF cache is shared between projects. |
