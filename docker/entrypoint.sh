@@ -610,5 +610,41 @@ start_sequence_parallel() {
 }
 start_sequence_parallel "$@"
 
+# --- Idle stop: no ComfyUI process, and so no VRAM, while nobody uses it ------
+# Unloading every model still leaves ComfyUI's CUDA context on the card (~0.8 GB
+# on an RTX 5090), and only the process exiting gives it back. On a box whose GPU
+# other apps share, docker/idle_gate.py owns the port instead: it starts ComfyUI
+# on the first request that needs it (~5 s) and stops it once the queue has been
+# empty and nothing has asked for COMFYUI_IDLE_STOP_SECONDS. The healthcheck and
+# voxmin-backend's worker probes (/queue, /api/wrapper/workflows) are answered
+# without starting it; /ws answers 503 until something real starts it.
+#   COMFYUI_IDLE_STOP_SECONDS   0 / unset (default): ComfyUI runs all the time
+#   COMFYUI_IDLE_GATE_PORT      ComfyUI's own port behind the gate (COMFYUI_PORT+1)
+# Not with sequence parallelism: its followers hold the other GPUs either way.
+start_idle_gate() {
+	local idle="${COMFYUI_IDLE_STOP_SECONDS:-0}"
+	{ is_uint "$idle" && ((idle > 0)); } || return 0
+	if [[ -n "${COMFY_SP_WORLD:-}" ]]; then
+		log "WARNING: COMFYUI_IDLE_STOP_SECONDS is ignored with sequence parallelism; ComfyUI runs all the time"
+		return 0
+	fi
+	local port="${COMFYUI_PORT:-8188}"
+	local inner="${COMFYUI_IDLE_GATE_PORT:-$((port + 1))}"
+	local queue='{"queue_running": [], "queue_pending": []}'
+	local stats='{"system": {"comfyui_running": false}, "devices": []}'
+	log "idle stop: ComfyUI starts on first use and stops after ${idle}s without use (gate on $port, ComfyUI on $inner)"
+	# ComfyUI's own --listen/--port go last, so they win over any in COMFYUI_ARGS.
+	exec python "$COMFY_ROOT/docker/idle_gate.py" \
+		--listen "${COMFYUI_LISTEN:-0.0.0.0}:$port" --upstream "127.0.0.1:$inner" \
+		--idle-seconds "$idle" --ready-path /queue --bearer-env WRAPPER_AUTH_TOKEN \
+		--busy "GET /queue queue_running,queue_pending" \
+		--stub "GET /queue 200 $queue" --stub "GET /api/queue 200 $queue" \
+		--stub "GET /system_stats 200 $stats" --stub "GET /api/system_stats 200 $stats" \
+		--stub "GET /ws 503" --stub "GET /api/ws 503" \
+		--cache "GET /api/wrapper/workflows" --cache "GET /wrapper/workflows" \
+		-- python main.py "${args[@]}" "${extra[@]}" "$@" --listen 127.0.0.1 --port "$inner"
+}
+start_idle_gate "$@"
+
 log "starting ComfyUI ($(command -v python), ${SECONDS}s after container start)"
 exec python main.py "${args[@]}" "${extra[@]}" "$@"

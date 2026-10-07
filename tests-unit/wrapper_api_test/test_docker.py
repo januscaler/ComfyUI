@@ -12,6 +12,7 @@ runs the same entrypoint on RunPod's own cached image, with this code fetched
 onto the volume.
 """
 
+import json
 import os
 import re
 import socket
@@ -745,6 +746,84 @@ class TestSequenceParallelEntrypoint(unittest.TestCase):
         self.assertEqual(self.probes, [])
         self.assertIn("rank0 2 0", log)
         self.assertEqual(len(launched), 1)
+
+
+@unittest.skipIf(sys.platform == "win32", "bash scripts")
+class TestIdleGateEntrypoint(unittest.TestCase):
+    """docker/entrypoint.sh puts docker/idle_gate.py in front of ComfyUI when COMFYUI_IDLE_STOP_SECONDS is set."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = read("docker", "entrypoint.sh")
+        cls.function = re.search(r"^start_idle_gate\(\) \{\n.*?^\}$", cls.script, re.MULTILINE | re.DOTALL).group(0)
+
+    def run_function(self, env):
+        """The function with a stand-in python that records its argv; returns (argv or None, stdout, stderr)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            record = os.path.join(tmp, "argv")
+            with open(os.path.join(tmp, "python"), "w") as f:
+                f.write(f'#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done > {record}\n')
+            os.chmod(os.path.join(tmp, "python"), 0o755)
+            harness = ('set -euo pipefail\nlog() { echo "entrypoint: $*" >&2; }\nis_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }\n'
+                       "COMFY_ROOT=/opt/ComfyUI\nargs=(--listen 0.0.0.0 --port 8188 --fast-disk)\nextra=(--verbose INFO)\n"
+                       f'{self.function}\nstart_idle_gate "$@"\necho "comfyui directly"')
+            result = subprocess.run(["bash", "-c", harness, "_"], env={"PATH": f"{tmp}:/usr/bin:/bin", **env},
+                                    capture_output=True, text=True, timeout=30)
+            argv = open(record).read().splitlines() if os.path.exists(record) else None
+            return argv, result.stdout, result.stderr
+
+    def test_off_by_default(self):
+        for env in ({}, {"COMFYUI_IDLE_STOP_SECONDS": "0"}, {"COMFYUI_IDLE_STOP_SECONDS": "soon"}):
+            argv, out, _ = self.run_function(env)
+            self.assertIsNone(argv, env)
+            self.assertIn("comfyui directly", out)
+
+    def test_the_gate_owns_the_port_and_comfyui_listens_behind_it(self):
+        argv, out, err = self.run_function({"COMFYUI_IDLE_STOP_SECONDS": "90"})
+        self.assertNotIn("comfyui directly", out, "the gate replaces the entrypoint (exec)")
+        self.assertIn("stops after 90s without use", err)
+        self.assertEqual(argv[0], "/opt/ComfyUI/docker/idle_gate.py")
+        gate, comfyui = argv[1:argv.index("--")], argv[argv.index("--") + 1:]
+        self.assertEqual(gate[gate.index("--listen") + 1], "0.0.0.0:8188")
+        self.assertEqual(gate[gate.index("--upstream") + 1], "127.0.0.1:8189")
+        self.assertEqual(gate[gate.index("--idle-seconds") + 1], "90")
+        self.assertEqual(comfyui[:2], ["python", "main.py"])
+        self.assertIn("--fast-disk", comfyui)
+        self.assertIn("--verbose", comfyui)
+        self.assertEqual(comfyui[-4:], ["--listen", "127.0.0.1", "--port", "8189"], "last, so they win over COMFYUI_ARGS")
+
+    def test_the_gate_accepts_the_entrypoint_flags(self):
+        argv, _, _ = self.run_function({"COMFYUI_IDLE_STOP_SECONDS": "90", "COMFYUI_PORT": "9000"})
+        sys.path.insert(0, os.path.join(ROOT, "docker"))
+        try:
+            import idle_gate
+        finally:
+            sys.path.pop(0)
+        args = idle_gate.parse_args(argv[1:])
+        self.assertEqual(args.upstream, ("127.0.0.1", 9001))
+        stubs = dict(args.stub)
+        self.assertEqual(json.loads(stubs[("GET", "/queue")][1]), {"queue_running": [], "queue_pending": []})
+        self.assertEqual(stubs[("GET", "/ws")][0], 503)
+        self.assertIn(("GET", "/system_stats"), stubs, "the healthcheck must not start ComfyUI")
+        self.assertIn(("GET", "/api/wrapper/workflows"), args.cache, "voxmin-backend's 10 s probe must not start it")
+        self.assertEqual(args.busy, (("GET", "/queue"), ["queue_running", "queue_pending"]))
+        self.assertEqual(args.bearer_env, "WRAPPER_AUTH_TOKEN")
+
+    def test_not_with_sequence_parallelism(self):
+        argv, out, err = self.run_function({"COMFYUI_IDLE_STOP_SECONDS": "90", "COMFY_SP_WORLD": "2"})
+        self.assertIsNone(argv)
+        self.assertIn("comfyui directly", out)
+        self.assertIn("ignored with sequence parallelism", err)
+
+    def test_runs_after_sequence_parallelism_and_before_comfyui(self):
+        call = self.script.index('start_idle_gate "$@"\n')
+        self.assertLess(self.script.index('start_sequence_parallel "$@"\n'), call)
+        self.assertLess(call, self.script.index("exec python main.py"))
+
+    def test_compose_stops_an_idle_comfyui(self):
+        with open(os.path.join(ROOT, "docker-compose.yml")) as f:
+            env = yaml.safe_load(f)["services"]["comfyui"]["environment"]
+        self.assertIn("COMFYUI_IDLE_STOP_SECONDS=${COMFYUI_IDLE_STOP_SECONDS:-120}", env)
 
 
 @unittest.skipIf(sys.platform == "win32", "bash scripts")
