@@ -42,6 +42,26 @@ class TestCollectOutputFiles(unittest.TestCase):
         for path in (img, vid, aud, obj):
             os.remove(path)
 
+    def test_saved_output_wins_over_an_upload_preview(self):
+        """LoadVideo reports the upload itself (type "input") and runs before
+        SaveVideo; the response must be the saved video, not the upload."""
+        import folder_paths
+
+        upload = self._touch(folder_paths.get_input_directory(), "wrapper", "job", "upload.mp4")
+        saved = self._touch(folder_paths.get_output_directory(), "wrapper", "job", "fx-interp_00001_.mp4")
+        entry = {
+            "outputs": {
+                "1": {"images": [{"filename": "upload.mp4", "subfolder": "wrapper/job", "type": "input"}]},
+                "6": {"images": [{"filename": "fx-interp_00001_.mp4", "subfolder": "wrapper/job", "type": "output"}]},
+            }
+        }
+        try:
+            files = wrapper_routes._collect_output_files(entry)
+            self.assertEqual(files, [saved, upload])
+        finally:
+            os.remove(upload)
+            os.remove(saved)
+
     def test_skips_missing_and_foreign_keys(self):
         entry = {
             "outputs": {
@@ -245,6 +265,82 @@ class TestQwenImage21SetupContract(unittest.TestCase):
             with self.assertRaises(wrapper_routes._SetupError):
                 asyncio.run(wrapper_routes._setup_qwenimage21_edit(fields, []))
         self.assertEqual(self.requested, [])
+
+
+class TestFxInterpSetup(unittest.TestCase):
+    """fx-interp probes the upload (mocked here: no real video or model) and
+    refuses bad params and over-budget clips before anything is downloaded."""
+
+    def setUp(self):
+        self._download_models = wrapper_routes._download_models
+        self._probe_video = wrapper_routes._probe_video
+        self.requested = []
+        self.probe = (1280, 720, 61, 30.0)
+
+        async def no_download(models, downloaded):
+            self.requested.extend((m["folder"], m["filename"]) for m in models)
+            return []
+
+        wrapper_routes._download_models = no_download
+        wrapper_routes._probe_video = lambda path: self.probe
+
+    def tearDown(self):
+        wrapper_routes._download_models = self._download_models
+        wrapper_routes._probe_video = self._probe_video
+
+    def _setup(self, fields, refs=None):
+        refs = {"video": ["wrapper/job/clip.mp4"]} if refs is None else refs
+        return asyncio.run(wrapper_routes._setup_fx_interp(fields, [], refs))
+
+    def test_defaults_are_factor_2_with_film_and_build(self):
+        kwargs, note = self._setup({})
+        self.assertEqual(kwargs, {"factor": 2, "model_name": "film_net_fp16.safetensors", "frames": 61})
+        self.assertEqual(self.requested, [("frame_interpolation", "film_net_fp16.safetensors")])
+        self.assertIn("61 frames of 1280x720 -> 121 frames", note)
+        self.assertIn("30 fps (2x slower, no audio)", note)
+        graph = wrapper_workflows.build_fx_interp(video="wrapper/job/clip.mp4", **kwargs)
+        self.assertEqual(graph["4"]["inputs"]["multiplier"], 2)
+
+    def test_factor_4_with_rife(self):
+        kwargs, _ = self._setup({"factor": "4", "model": "RIFE"})
+        self.assertEqual((kwargs["factor"], kwargs["model_name"]), (4, "rife_v4.26.safetensors"))
+        self.assertEqual(self.requested, [("frame_interpolation", "rife_v4.26.safetensors")])
+
+    def test_bad_params_fail_before_any_download(self):
+        for fields in ({"factor": "3"}, {"factor": "8"}, {"factor": "two"}, {"model": "dain"}):
+            with self.assertRaises(wrapper_routes._SetupError):
+                self._setup(fields)
+        self.assertEqual(self.requested, [])
+
+    def test_unreadable_short_and_missing_videos_are_refused(self):
+        def broken(path):
+            raise ValueError("No video stream found")
+
+        wrapper_routes._probe_video = broken
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._setup({})
+        self.assertEqual(ctx.exception.message, "Unreadable video")
+        wrapper_routes._probe_video = lambda path: (640, 360, 1, 30.0)
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._setup({})
+        self.assertEqual(ctx.exception.message, "Video too short")
+        with self.assertRaises(wrapper_routes._SetupError):
+            self._setup({}, refs={})
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_clip_is_refused(self):
+        # 10 s of 1080p30 at 4x is ~1197 frames, ~2.5 gigapixel-frames.
+        self.probe = (1920, 1080, 300, 30.0)
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._setup({"factor": "4"})
+        self.assertIn("COMFY_FX_INTERP_MAX_PIXEL_FRAMES", ctx.exception.details)
+        self.assertEqual(self.requested, [])
+
+    def test_factor_shows_in_the_settings_header(self):
+        headers = wrapper_routes._resolution_headers(
+            {"factor": 4, "model_name": "rife_v4.26.safetensors", "frames": 61}, "n")
+        self.assertEqual(headers["X-Wrapper-Settings"], "factor=4")
+        self.assertEqual(headers["X-Wrapper-Models"], "rife_v4.26.safetensors")
 
 
 class TestPromptRewriteHook(unittest.TestCase):

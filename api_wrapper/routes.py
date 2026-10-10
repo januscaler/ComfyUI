@@ -164,7 +164,7 @@ def _job_provenance(build_kwargs, note, prompt_record):
         "models": [str(v) for k, v in sorted(build_kwargs.items(), key=lambda kv: order(kv[0]))
                    if k.endswith("_name") and isinstance(v, str)],
         "settings": {k: build_kwargs[k] for k in
-                     ("width", "height", "duration", "steps", "scheduler", "cfg", "megapixels")
+                     ("width", "height", "duration", "steps", "scheduler", "cfg", "megapixels", "factor")
                      if k in build_kwargs},
         "note": note,
     }
@@ -194,7 +194,7 @@ def _resolution_headers(build_kwargs, note):
               if k.endswith("_name") and isinstance(v, str)]
     if models:
         headers["X-Wrapper-Models"] = _header_value(", ".join(models))
-    settings = [f"{k}={build_kwargs[k]}" for k in ("width", "height", "duration", "steps", "scheduler", "seed")
+    settings = [f"{k}={build_kwargs[k]}" for k in ("width", "height", "duration", "steps", "scheduler", "seed", "factor")
                 if k in build_kwargs]
     if settings:
         headers["X-Wrapper-Settings"] = _header_value(" ".join(settings))
@@ -352,24 +352,32 @@ def _error_response(message, details="", missing=None, status=400):
 
 
 def _collect_output_files(history_entry):
-    """Resolve every output file a finished workflow saved to disk."""
+    """Resolve every output file a finished workflow saved to disk.
+
+    Saved outputs come first, then temp files, then input-folder entries: a
+    loader such as LoadVideo reports its *upload* as a UI preview (type
+    "input"), and it executes before the save node, so in execution order the
+    caller's own upload would otherwise be returned as the artifact."""
     output_dirs = {
         "output": folder_paths.get_output_directory(),
         "input": folder_paths.get_input_directory(),
         "temp": folder_paths.get_temp_directory(),
     }
-    paths = []
+    rank = {"output": 0, "temp": 1, "input": 2}
+    found = []
     for node_outputs in (history_entry.get("outputs") or {}).values():
         for key in OUTPUT_FILE_KEYS:
             for item in node_outputs.get(key, []):
                 filename = item.get("filename")
                 if not filename:
                     continue
-                base = output_dirs.get(item.get("type", "output"), output_dirs["output"])
+                kind = item.get("type", "output")
+                base = output_dirs.get(kind, output_dirs["output"])
                 path = os.path.join(base, item.get("subfolder", ""), filename)
                 if os.path.isfile(path):
-                    paths.append(path)
-    return paths
+                    found.append((rank.get(kind, 0), path))
+    # sorted() is stable: execution order holds within each kind.
+    return [path for _, path in sorted(found, key=lambda entry: entry[0])]
 
 
 async def _download_models(models, downloaded):
@@ -652,6 +660,53 @@ async def _setup_minimax_h3_reference(fields, downloaded):
     return await _setup_minimax_h3(fields, downloaded, ref2va=True)
 
 
+def _probe_video(path):
+    """(width, height, frame count, fps) of a video file, read from its
+    container metadata without decoding it into frames."""
+    from comfy_api.input_impl import VideoFromFile
+
+    video = VideoFromFile(path)
+    width, height = video.get_dimensions()
+    return width, height, video.get_frame_count(), float(video.get_frame_rate())
+
+
+async def _setup_fx_interp(fields, downloaded, upload_refs):
+    """Setup for fx-interp (slow motion): validate factor/model, probe the
+    uploaded video so an over-large job is refused before it can OOM-kill the
+    server, and fetch the (small) interpolation checkpoint."""
+    try:
+        factor = int(fields.get("factor", "2") or 2)
+    except ValueError:
+        raise _SetupError("Invalid factor", "factor must be 2 or 4.") from None
+    if factor not in wrapper_workflows.FX_INTERP_FACTORS:
+        raise _SetupError("Invalid factor", "factor must be 2 or 4.")
+    model = (fields.get("model") or wrapper_workflows.FX_INTERP_DEFAULT_MODEL).strip().lower()
+    if model not in wrapper_workflows.FX_INTERP_MODELS:
+        raise _SetupError("Invalid model", "model must be 'film' or 'rife'.")
+
+    video = (upload_refs.get("video") or [None])[0]
+    if video is None:
+        raise _SetupError("No video provided", "Send the clip to slow down in 'video'.")
+    try:
+        width, height, frames, fps = await asyncio.to_thread(_probe_video, _input_path(video))
+    except Exception as e:
+        raise _SetupError("Unreadable video", f"The uploaded video could not be read: {e}") from None
+    if frames < 2:
+        raise _SetupError("Video too short", "The video needs at least two frames to interpolate between.")
+    over_budget = wrapper_workflows.fx_interp_check_budget(width, height, frames, factor)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe frame interpolation budget",
+            f"{over_budget} The limit is set by COMFY_FX_INTERP_MAX_PIXEL_FRAMES.")
+
+    _raise_if_missing(await _download_models(wrapper_workflows.fx_interp_models(model), downloaded))
+    out_frames = wrapper_workflows.fx_interp_output_frames(frames, factor)
+    note = (f"{frames} frames of {width}x{height} -> {out_frames} frames with {model} at the source "
+            f"{fps:g} fps ({factor}x slower, no audio)")
+    return {"factor": factor, "model_name": wrapper_workflows.FX_INTERP_MODELS[model],
+            "frames": frames}, note
+
+
 _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "flux2klein9b-txt2img": _setup_flux2klein9b_txt2img,
                     "qwenimage21": _setup_qwenimage21_edit,
@@ -659,7 +714,8 @@ _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "ideogram4": _setup_ideogram4,
                     "minimaxh3": {"text": _setup_minimax_h3_text,
                                   "image": _setup_minimax_h3_image,
-                                  "reference": _setup_minimax_h3_reference}}
+                                  "reference": _setup_minimax_h3_reference},
+                    "fx-interp": _setup_fx_interp}
 
 
 def register_wrapper_routes(routes, prompt_server):
@@ -716,7 +772,7 @@ def register_wrapper_routes(routes, prompt_server):
         # written out and bypasses the rewrite.
         raw_prompt = fields.get("raw_prompt", "").strip()
         prompt = raw_prompt or fields.get("prompt", "")
-        if not prompt:
+        if not prompt and task.get("requires_prompt", True):
             required = ("The 'prompt' form field is required."
                         if not task.get("prompt_rewrite") else
                         "Send 'prompt' (plain description of the video you want, rewritten into an "
@@ -727,6 +783,10 @@ def register_wrapper_routes(routes, prompt_server):
             return _error_response(
                 "No image provided",
                 f"Send the input image in {' or '.join(repr(name) for name in image_fields)}.")
+        for name in task.get("required_uploads", ()):
+            if not uploads.get(name):
+                kind = task.get("uploads", {}).get(name, {}).get("ext", "file")
+                return _error_response(f"No {kind} provided", f"Send the input {kind} in '{name}'.")
 
         try:
             seed = int(fields["seed"]) if "seed" in fields else random.randrange(0, 2 ** 64)
@@ -780,7 +840,10 @@ def register_wrapper_routes(routes, prompt_server):
         setups = _WORKFLOW_SETUPS[workflow_name]
         setup = setups[task_name] if isinstance(setups, dict) else setups
         try:
-            build_kwargs, note = await setup(fields, downloaded)
+            if task.get("setup_uses_uploads"):
+                build_kwargs, note = await setup(fields, downloaded, upload_refs)
+            else:
+                build_kwargs, note = await setup(fields, downloaded)
         except _SetupError as e:
             return _error_response(e.message, e.details, missing=e.missing)
 
