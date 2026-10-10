@@ -14,8 +14,9 @@ The overall fraction weighs each node of the prompt by how much work it is:
 - every other node weighs 1 and counts fully once finished (a cached node is
   finished at once, so it counts fully too);
 - steps the prompt asks for (literal ``steps`` inputs, e.g. on the scheduler
-  node) that no node has reported yet are reserved up front, so the bar does
-  not race to 40% over the loaders and then crawl once the sampler starts.
+  node, or a node's ``_meta.expected_steps``) that no node has reported yet
+  are reserved up front, so the bar does not race to 40% over the loaders and
+  then crawl once the sampler starts.
 
 It never decreases for a job (the last value is remembered, bounded), stays
 below 100 while the job runs, and is 100 only once the job completed. Pure
@@ -54,11 +55,19 @@ def _number(value) -> float:
 
 
 def anticipated_steps(prompt) -> float:
-    """Sum of the literal integer ``steps`` inputs in the prompt (links are lists and are skipped)."""
+    """Sum of the literal integer ``steps`` inputs in the prompt (links are lists and are skipped).
+
+    A node with no ``steps`` input can declare its step total in
+    ``_meta.expected_steps`` instead (the wrapper sets it on FrameInterpolate,
+    whose pass count depends on the uploaded video's frame count)."""
     total = 0.0
     for node in (prompt or {}).values():
-        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
         steps = inputs.get("steps") if isinstance(inputs, dict) else None
+        if steps is None and isinstance(node.get("_meta"), dict):
+            steps = node["_meta"].get("expected_steps")
         if isinstance(steps, bool):
             continue
         if isinstance(steps, (int, float)) and steps > 0:

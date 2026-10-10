@@ -720,6 +720,83 @@ class TestIdeogram4Graph(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["vae_name"], wrapper_workflows.IDEOGRAM4_VAE)
 
 
+class TestFxInterpGraph(unittest.TestCase):
+    def test_structure_retimes_at_source_fps_without_audio(self):
+        graph = wrapper_workflows.build_fx_interp(video="wrapper/job/clip.mp4", factor=4)
+        self.assertEqual([graph[k]["class_type"] for k in sorted(graph, key=int)], [
+            "LoadVideo", "GetVideoComponents", "FrameInterpolationModelLoader",
+            "FrameInterpolate", "CreateVideo", "SaveVideo"])
+        self.assertEqual(graph["1"]["inputs"]["file"], "wrapper/job/clip.mp4")
+        self.assertEqual(graph["4"]["inputs"], {"interp_model": ["3", 0], "images": ["2", 0], "multiplier": 4})
+        create = graph["5"]["inputs"]
+        # fps is GetVideoComponents' fps output (index 2): the source rate, so
+        # factor x the frames play factor x slower.
+        self.assertEqual(create["fps"], ["2", 2])
+        self.assertEqual(create["images"], ["4", 0])
+        self.assertNotIn("audio", create)
+        self.assertEqual(graph["6"]["inputs"]["video"], ["5", 0])
+        for node_id, node in graph.items():
+            for value in node["inputs"].values():
+                if isinstance(value, list):
+                    self.assertIn(value[0], graph, f"{node_id} links to unknown node {value[0]}")
+
+    def test_default_model_is_film_and_rife_is_selectable(self):
+        graph = wrapper_workflows.build_fx_interp(video="v.mp4")
+        self.assertEqual(graph["3"]["inputs"]["model_name"], "film_net_fp16.safetensors")
+        self.assertEqual(graph["4"]["inputs"]["multiplier"], 2)
+        graph = wrapper_workflows.build_fx_interp(video="v.mp4", model_name="rife_v4.26.safetensors")
+        self.assertEqual(graph["3"]["inputs"]["model_name"], "rife_v4.26.safetensors")
+
+    def test_only_factors_2_and_4(self):
+        for factor in (1, 3, 8):
+            with self.assertRaises(ValueError):
+                wrapper_workflows.build_fx_interp(video="v.mp4", factor=factor)
+
+    def test_expected_steps_match_the_nodes_progress_total(self):
+        graph = wrapper_workflows.build_fx_interp(video="v.mp4", factor=4, frames=121)
+        self.assertEqual(graph["4"]["_meta"]["expected_steps"], 120 * 3)
+        self.assertNotIn("_meta", wrapper_workflows.build_fx_interp(video="v.mp4")["4"])
+
+    def test_models_come_from_the_blueprint_repo(self):
+        for model, filename in (("film", "film_net_fp16.safetensors"), ("rife", "rife_v4.26.safetensors")):
+            (entry,) = wrapper_workflows.fx_interp_models(model)
+            self.assertEqual(entry["folder"], "frame_interpolation")
+            self.assertEqual(entry["filename"], filename)
+            self.assertEqual(entry["url"], "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/"
+                                           f"frame_interpolation/{filename}")
+
+    def test_output_frames_and_budget(self):
+        self.assertEqual(wrapper_workflows.fx_interp_output_frames(121, 2), 241)
+        self.assertEqual(wrapper_workflows.fx_interp_output_frames(121, 4), 481)
+        self.assertEqual(wrapper_workflows.fx_interp_output_frames(1, 4), 1)
+        # 4 s of 1080p30 at 4x fits the default budget; 10 s does not.
+        self.assertIsNone(wrapper_workflows.fx_interp_check_budget(1920, 1080, 120, 4))
+        detail = wrapper_workflows.fx_interp_check_budget(1920, 1080, 300, 4)
+        self.assertIn("1197 frames", detail)
+        self.assertIn("factor 2", detail)
+
+    def test_registered_without_a_prompt(self):
+        entry = wrapper_workflows.WORKFLOWS["fx-interp"]
+        self.assertEqual(entry["output_type"], "video")
+        self.assertFalse(entry["requires_prompt"])
+        self.assertEqual(entry["required_uploads"], ["video"])
+        self.assertEqual(entry["uploads"], {"video": {"ext": "video", "max": 1}})
+        self.assertEqual(entry["uses"], [])
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_interp)
+
+    def test_openapi_documents_the_endpoint(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/fx-interp/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["video"])
+        self.assertNotIn("prompt", schema["properties"])
+        self.assertEqual(schema["properties"]["factor"]["enum"], [2, 4])
+        self.assertEqual(schema["properties"]["model"]["enum"], ["film", "rife"])
+        self.assertEqual(schema["properties"]["video"]["format"], "binary")
+        self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
+        self.assertEqual(op["operationId"], "generateFxInterp")
+
+
 try:
     import torch  # noqa: F401
 
@@ -947,6 +1024,44 @@ class TestGraphValidation(unittest.TestCase):
                     f"5c2d8e1f-{abs(hash(label)) % 100000:05d}-4a3b-9c8d-7e6f5a4b3c2d", graph, None))
                 self.assertTrue(valid, f"qwen {label} graph rejected: {error}\nnode_errors: {node_errors}")
                 self.assertTrue(outputs)
+        finally:
+            for path in placeholder_paths:
+                os.remove(path)
+
+    def test_fx_interp_graph_passes_core_validation(self):
+        _prepare_env_for_comfy_import()
+        import nodes  # noqa: F401
+        import api_wrapper.routes  # noqa: F401
+        import folder_paths
+
+        async def _init():
+            await nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+
+        asyncio.run(_init())
+
+        placeholder_paths = []
+        for model in ("film", "rife"):
+            (entry,) = wrapper_workflows.fx_interp_models(model)
+            path = os.path.join(folder_paths.get_folder_paths(entry["folder"])[0], entry["filename"])
+            if not os.path.exists(path):
+                with open(path, "wb") as f:
+                    f.write(b"placeholder")
+                placeholder_paths.append(path)
+        video = os.path.join(folder_paths.get_input_directory(), "wrapper", "test_input.mp4")
+        with open(video, "wb") as f:
+            f.write(b"placeholder")
+        placeholder_paths.append(video)
+        try:
+            import execution
+
+            for factor, model in ((2, "film"), (4, "rife")):
+                graph = wrapper_workflows.build_fx_interp(
+                    video="wrapper/test_input.mp4", factor=factor,
+                    model_name=wrapper_workflows.FX_INTERP_MODELS[model], frames=10)
+                valid, error, outputs, node_errors = asyncio.run(execution.validate_prompt(
+                    f"6d3e9f2a-{factor}{len(model):04d}-4b5c-8d9e-0f1a2b3c4d5e", graph, None))
+                self.assertTrue(valid, f"fx-interp {model} graph rejected: {error}\nnode_errors: {node_errors}")
+                self.assertEqual(outputs, ["6"])
         finally:
             for path in placeholder_paths:
                 os.remove(path)

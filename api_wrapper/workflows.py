@@ -837,6 +837,105 @@ QWEN_IMAGE_21_FORM_EXTRA = {
 }
 
 
+# Frame interpolation (slow motion) with the core FILM / RIFE nodes
+# (comfy_extras/nodes_frame_interpolation.py). The checkpoints are the ones the
+# shipped "Frame Interpolation" blueprint points at (Comfy-Org/frame_interpolation),
+# and they are small: FILM 69 MB, RIFE 4.26 23 MB, both in models/frame_interpolation/.
+FX_INTERP_BASE_URL = "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation"
+FX_INTERP_MODELS = {
+    # FILM is what the blueprint ships: slower, but it holds up on large motion.
+    "film": "film_net_fp16.safetensors",
+    # RIFE 4.26 is several times faster and close in quality on ordinary footage.
+    "rife": "rife_v4.26.safetensors",
+}
+FX_INTERP_DEFAULT_MODEL = "film"
+FX_INTERP_FACTORS = (2, 4)
+# FrameInterpolate keeps every output frame in host RAM as float32 (12 bytes
+# per pixel) on top of the decoded source, and a factor-4 1080p clip grows
+# fast: 5 s at 30 fps is ~600 output frames, ~15 GB. On the rig's 32 GB box an
+# over-large job would OOM-kill the server (and the queue with it), so the
+# wrapper refuses anything whose output frames * pixels pass this budget.
+# The default (1e9 pixel-frames, ~12 GB of output) is e.g. 4 s of 1080p30 at
+# 4x, 8 s at 2x, or 18 s of 720p30 at 2x.
+FX_INTERP_MAX_PIXEL_FRAMES = max(1, int(float(
+    os.environ.get("COMFY_FX_INTERP_MAX_PIXEL_FRAMES", "1000000000"))))
+
+
+def fx_interp_models(model):
+    """The one checkpoint an fx-interp job needs (``model`` is 'film' or 'rife')."""
+    filename = FX_INTERP_MODELS[model]
+    return [{"folder": "frame_interpolation", "filename": filename,
+             "url": f"{FX_INTERP_BASE_URL}/{filename}"}]
+
+
+def fx_interp_output_frames(frames, factor):
+    """Frames FrameInterpolate returns: ``factor`` per source gap plus the last."""
+    if frames < 2:
+        return frames
+    return (frames - 1) * factor + 1
+
+
+def fx_interp_check_budget(width, height, frames, factor):
+    """An error detail when the interpolated clip would not fit this host's
+    memory budget, else None."""
+    out_frames = fx_interp_output_frames(frames, factor)
+    used = width * height * out_frames
+    if used <= FX_INTERP_MAX_PIXEL_FRAMES:
+        return None
+    max_source = FX_INTERP_MAX_PIXEL_FRAMES // (width * height * factor) + 1
+    return (f"{frames} frames of {width}x{height} at {factor}x makes {out_frames} frames "
+            f"({used / 1e6:.0f} megapixel-frames), above this host's "
+            f"{FX_INTERP_MAX_PIXEL_FRAMES / 1e6:.0f} budget. Send at most about {max_source} "
+            f"source frames at this size and factor, a smaller video, or factor 2.")
+
+
+def build_fx_interp(*, video, factor=2, model_name=FX_INTERP_MODELS[FX_INTERP_DEFAULT_MODEL],
+                    frames=None, filename_prefix="wrapper/fx_interp"):
+    """Frame interpolation (slow motion): video -> MP4 with ``factor``x the
+    frames at the source frame rate, so it plays ``factor``x slower. No audio
+    (a slowed soundtrack would be pitched down; the caller keeps the original).
+
+    The source fps is linked straight from GetVideoComponents into CreateVideo,
+    so the output is retimed without the wrapper knowing the rate. ``frames``
+    (the source frame count, when the caller probed it) is recorded as the
+    interpolation node's expected step total, so the job's progress bar
+    reserves the interpolation passes from the start instead of racing over
+    the loaders (see api_wrapper/progress.py)."""
+    if factor not in FX_INTERP_FACTORS:
+        raise ValueError(f"factor must be one of {FX_INTERP_FACTORS}")
+    interpolate = {"class_type": "FrameInterpolate", "inputs": {
+        "interp_model": ["3", 0], "images": ["2", 0], "multiplier": factor}}
+    if frames and frames >= 2:
+        # FrameInterpolate's own ProgressBar total: (pairs) * (new frames per pair).
+        interpolate["_meta"] = {"expected_steps": (frames - 1) * (factor - 1)}
+    return {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": video}},
+        # outputs: images, audio, fps, bit_depth, color_space
+        "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+        "3": {"class_type": "FrameInterpolationModelLoader", "inputs": {"model_name": model_name}},
+        "4": interpolate,
+        # The source fps, not fps * factor: that is what makes it slow motion.
+        # No audio input, so the MP4 has no audio track.
+        "5": {"class_type": "CreateVideo", "inputs": {"images": ["4", 0], "fps": ["2", 2], "bit_depth": 8}},
+        "6": {"class_type": "SaveVideo", "inputs": {
+            "video": ["5", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
+    }
+
+
+FX_INTERP_FORM_EXTRA = {
+    "video": {"type": "string", "format": "binary",
+              "description": "The clip to slow down (mp4, webm, mov, mkv, avi or gif). Its audio is "
+                             "dropped. The output keeps its size and frame rate."},
+    "factor": {"type": "integer", "enum": list(FX_INTERP_FACTORS), "default": 2,
+               "description": "Frames made per source frame: 2 or 4. The output has (frames-1)*factor+1 "
+                              "frames played at the source fps, so it runs factor times slower."},
+    "model": {"type": "string", "enum": list(FX_INTERP_MODELS), "default": FX_INTERP_DEFAULT_MODEL,
+              "description": "Interpolation model: 'film' (FILM, the ComfyUI blueprint's choice; best on "
+                             "large motion) or 'rife' (RIFE 4.26; several times faster). Downloaded on "
+                             "first use (69 MB / 23 MB)."},
+}
+
+
 """The wrapper API's workflow registry.
 
 Each entry describes one dedicated workflow API: ``build`` constructs the
@@ -848,6 +947,11 @@ variants) to get one endpoint per task under /api/wrapper/{name}/{task}.
 Route-level setup (model downloads, quantization) lives in ``api_wrapper.
 routes`` keyed by the same names. Adding a new workflow = adding one entry
 here plus one setup handler.
+
+A workflow that takes no prompt sets ``requires_prompt: False``;
+``required_uploads`` names upload fields that must be present (any kind, not
+just images); ``setup_uses_uploads`` hands the saved upload refs to the setup
+handler (e.g. to probe an uploaded video before queueing).
 """
 
 WORKFLOWS = {
@@ -1000,5 +1104,18 @@ WORKFLOWS = {
                 "build": build_minimax_h3_reference_to_video,
             },
         },
+    },
+    "fx-interp": {
+        "title": "Frame interpolation (slow motion, FILM/RIFE)",
+        "output_type": "video",
+        "requires_image": False,
+        "requires_prompt": False,
+        "required_uploads": ["video"],
+        "setup_uses_uploads": True,
+        "uploads": {"video": {"ext": "video", "max": 1}},
+        "uses": [],
+        "form": ["video", "factor", "model"],
+        "extra_form_properties": FX_INTERP_FORM_EXTRA,
+        "build": build_fx_interp,
     },
 }
