@@ -107,6 +107,25 @@ class TestOverallFraction:
         nodes["4"] = node(State.Running, 45, 90)
         assert wp.overall_fraction(prompt, nodes) == pytest.approx(48 / 95)
 
+    def test_fx_bgremove_reserves_one_step_per_frame(self):
+        # RemoveBackground reports one step per frame (comfy/bg_removal_model.py).
+        from api_wrapper import workflows
+
+        prompt = workflows.build_fx_bgremove(video="wrapper/x.mp4", frames=120)
+        assert wp.anticipated_steps(prompt) == 120
+        nodes = {"1": node(State.Finished), "2": node(State.Finished), "3": node(State.Finished)}
+        # 3 of 7 unit nodes done, 120 frames reserved: 3 / (7 + 120).
+        assert wp.overall_fraction(prompt, nodes) == pytest.approx(3 / 127)
+        nodes["4"] = node(State.Running, 60, 120)
+        assert wp.overall_fraction(prompt, nodes) == pytest.approx(63 / 126)
+
+    def test_fx_upscale_esrgan_reserves_frames_times_tiles(self):
+        from api_wrapper import workflows
+
+        prompt = workflows.build_fx_upscale(video="wrapper/x.mp4", width=1920, height=1080,
+                                            frames=50, source_size=(640, 360))
+        assert wp.anticipated_steps(prompt) == 100
+
 
 class TestJobProgress:
     def test_in_progress_reports_fraction_percent_node_and_step(self):

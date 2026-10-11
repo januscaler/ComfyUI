@@ -670,6 +670,18 @@ def _probe_video(path):
     return width, height, video.get_frame_count(), float(video.get_frame_rate())
 
 
+async def _probe_upload(upload_refs, missing_hint):
+    """Probe the job's uploaded 'video' (see _probe_video), refusing a missing
+    or unreadable one."""
+    video = (upload_refs.get("video") or [None])[0]
+    if video is None:
+        raise _SetupError("No video provided", missing_hint)
+    try:
+        return await asyncio.to_thread(_probe_video, _input_path(video))
+    except Exception as e:
+        raise _SetupError("Unreadable video", f"The uploaded video could not be read: {e}") from None
+
+
 async def _setup_fx_interp(fields, downloaded, upload_refs):
     """Setup for fx-interp (slow motion): validate factor/model, probe the
     uploaded video so an over-large job is refused before it can OOM-kill the
@@ -684,13 +696,7 @@ async def _setup_fx_interp(fields, downloaded, upload_refs):
     if model not in wrapper_workflows.FX_INTERP_MODELS:
         raise _SetupError("Invalid model", "model must be 'film' or 'rife'.")
 
-    video = (upload_refs.get("video") or [None])[0]
-    if video is None:
-        raise _SetupError("No video provided", "Send the clip to slow down in 'video'.")
-    try:
-        width, height, frames, fps = await asyncio.to_thread(_probe_video, _input_path(video))
-    except Exception as e:
-        raise _SetupError("Unreadable video", f"The uploaded video could not be read: {e}") from None
+    width, height, frames, fps = await _probe_upload(upload_refs, "Send the clip to slow down in 'video'.")
     if frames < 2:
         raise _SetupError("Video too short", "The video needs at least two frames to interpolate between.")
     over_budget = wrapper_workflows.fx_interp_check_budget(width, height, frames, factor)
@@ -707,6 +713,79 @@ async def _setup_fx_interp(fields, downloaded, upload_refs):
             "frames": frames}, note
 
 
+async def _setup_fx_bgremove(fields, downloaded, upload_refs):
+    """Setup for fx-bgremove (matte): validate the model, probe the upload
+    against the memory budget, and fetch the BiRefNet checkpoint."""
+    model = (fields.get("model") or wrapper_workflows.FX_BGREMOVE_DEFAULT_MODEL).strip().lower()
+    if model not in wrapper_workflows.FX_BGREMOVE_MODELS:
+        raise _SetupError("Invalid model", "model must be 'birefnet' or 'lucida'.")
+
+    width, height, frames, fps = await _probe_upload(upload_refs, "Send the clip to cut out in 'video'.")
+    if frames < 1:
+        raise _SetupError("Video too short", "The video has no frames.")
+    if width % 2 or height % 2:
+        # The matte must match the source pixel for pixel, and H.264 4:2:0 can't
+        # encode an odd side.
+        raise _SetupError("Unsupported video size",
+                          f"The video is {width}x{height}; the matte needs an even width and height.")
+    over_budget = wrapper_workflows.fx_bgremove_check_budget(width, height, frames)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe background removal budget",
+            f"{over_budget} The limit is set by COMFY_FX_BGREMOVE_MAX_PIXEL_FRAMES.")
+
+    _raise_if_missing(await _download_models(wrapper_workflows.fx_bgremove_models(model), downloaded))
+    note = (f"{frames} frames of {width}x{height} -> grayscale matte (white = subject) with {model} "
+            f"at the source {fps:g} fps, no audio")
+    return {"model_name": wrapper_workflows.FX_BGREMOVE_MODELS[model], "frames": frames}, note
+
+
+async def _setup_fx_upscale(fields, downloaded, upload_refs):
+    """Setup for fx-upscale: validate model/target_short_side, probe the upload
+    for the output size and the memory budget, and fetch the model files."""
+    model = (fields.get("model") or wrapper_workflows.FX_UPSCALE_DEFAULT_MODEL).strip().lower()
+    if model not in wrapper_workflows.FX_UPSCALE_MODELS:
+        raise _SetupError("Invalid model", "model must be 'esrgan' or 'seedvr2'.")
+    limit = wrapper_workflows.FX_UPSCALE_MAX_SHORT_SIDE
+    try:
+        target = int(fields.get("target_short_side") or wrapper_workflows.FX_UPSCALE_DEFAULT_SHORT_SIDE)
+    except ValueError:
+        target = 0
+    if not 16 <= target <= limit:
+        raise _SetupError("Invalid target_short_side", f"target_short_side must be a whole number from 16 to {limit}.")
+
+    width, height, frames, fps = await _probe_upload(upload_refs, "Send the clip to upscale in 'video'.")
+    if frames < 1:
+        raise _SetupError("Video too short", "The video has no frames.")
+    out_width, out_height, factor = wrapper_workflows.fx_upscale_size(width, height, target)
+    over_budget = wrapper_workflows.fx_upscale_check_budget(
+        model, width, height, frames, out_width, out_height, factor)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe upscale budget",
+            f"{over_budget} The limit is set by COMFY_FX_UPSCALE_MAX_PIXEL_FRAMES.")
+
+    models = wrapper_workflows.fx_upscale_models(model, factor)
+    _raise_if_missing(await _download_models(models, downloaded))
+    kwargs = {"model": model, "width": out_width, "height": out_height, "frames": frames}
+    if model == "esrgan":
+        kwargs["upscale_model_name"] = models[0]["filename"]
+        kwargs["source_size"] = (width, height)
+        how = f"esrgan x{wrapper_workflows.fx_upscale_esrgan_scale(factor)}"
+    else:
+        kwargs["unet_name"] = wrapper_workflows.FX_UPSCALE_SEEDVR2_UNET
+        kwargs["vae_name"] = wrapper_workflows.FX_UPSCALE_SEEDVR2_VAE
+        # Only seedvr2 samples, so only it takes (and reports) a seed; the
+        # handler has already checked that a sent one is a number.
+        kwargs["seed"] = int(fields["seed"]) if "seed" in fields else random.randrange(0, 2 ** 64)
+        how = "seedvr2"
+    note = (f"{frames} frames of {width}x{height} -> {out_width}x{out_height} ({factor:.2f}x) with {how} "
+            f"at the source {fps:g} fps, no audio")
+    if min(out_width, out_height) < target:
+        note += f"; capped at {wrapper_workflows.FX_UPSCALE_MAX_FACTOR}x, short of {target}"
+    return kwargs, note
+
+
 _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "flux2klein9b-txt2img": _setup_flux2klein9b_txt2img,
                     "qwenimage21": _setup_qwenimage21_edit,
@@ -715,7 +794,9 @@ _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "minimaxh3": {"text": _setup_minimax_h3_text,
                                   "image": _setup_minimax_h3_image,
                                   "reference": _setup_minimax_h3_reference},
-                    "fx-interp": _setup_fx_interp}
+                    "fx-interp": _setup_fx_interp,
+                    "fx-bgremove": _setup_fx_bgremove,
+                    "fx-upscale": _setup_fx_upscale}
 
 
 def register_wrapper_routes(routes, prompt_server):
