@@ -5,6 +5,7 @@ and the graph structure is easy to audit. It builds ComfyUI API-format prompt
 graphs (as accepted by POST /prompt) and declares the models a workflow needs.
 """
 
+import math
 import os
 
 from api_wrapper.prompt_rewriter import MODEL_OPTIONS as MINIMAX_H3_LLM_MODELS
@@ -837,6 +838,357 @@ QWEN_IMAGE_21_FORM_EXTRA = {
 }
 
 
+# Frame interpolation (slow motion) with the core FILM / RIFE nodes
+# (comfy_extras/nodes_frame_interpolation.py). The checkpoints are the ones the
+# shipped "Frame Interpolation" blueprint points at (Comfy-Org/frame_interpolation),
+# and they are small: FILM 69 MB, RIFE 4.26 23 MB, both in models/frame_interpolation/.
+FX_INTERP_BASE_URL = "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/frame_interpolation"
+FX_INTERP_MODELS = {
+    # FILM is what the blueprint ships: slower, but it holds up on large motion.
+    "film": "film_net_fp16.safetensors",
+    # RIFE 4.26 is several times faster and close in quality on ordinary footage.
+    "rife": "rife_v4.26.safetensors",
+}
+FX_INTERP_DEFAULT_MODEL = "film"
+FX_INTERP_FACTORS = (2, 4)
+# FrameInterpolate keeps every output frame in host RAM as float32 (12 bytes
+# per pixel) on top of the decoded source, and a factor-4 1080p clip grows
+# fast: 5 s at 30 fps is ~600 output frames, ~15 GB. On the rig's 32 GB box an
+# over-large job would OOM-kill the server (and the queue with it), so the
+# wrapper refuses anything whose output frames * pixels pass this budget.
+# The default (1e9 pixel-frames, ~12 GB of output) is e.g. 4 s of 1080p30 at
+# 4x, 8 s at 2x, or 18 s of 720p30 at 2x.
+FX_INTERP_MAX_PIXEL_FRAMES = max(1, int(float(
+    os.environ.get("COMFY_FX_INTERP_MAX_PIXEL_FRAMES", "1000000000"))))
+
+
+def fx_interp_models(model):
+    """The one checkpoint an fx-interp job needs (``model`` is 'film' or 'rife')."""
+    filename = FX_INTERP_MODELS[model]
+    return [{"folder": "frame_interpolation", "filename": filename,
+             "url": f"{FX_INTERP_BASE_URL}/{filename}"}]
+
+
+def fx_interp_output_frames(frames, factor):
+    """Frames FrameInterpolate returns: ``factor`` per source gap plus the last."""
+    if frames < 2:
+        return frames
+    return (frames - 1) * factor + 1
+
+
+def fx_interp_check_budget(width, height, frames, factor):
+    """An error detail when the interpolated clip would not fit this host's
+    memory budget, else None."""
+    out_frames = fx_interp_output_frames(frames, factor)
+    used = width * height * out_frames
+    if used <= FX_INTERP_MAX_PIXEL_FRAMES:
+        return None
+    max_source = FX_INTERP_MAX_PIXEL_FRAMES // (width * height * factor) + 1
+    return (f"{frames} frames of {width}x{height} at {factor}x makes {out_frames} frames "
+            f"({used / 1e6:.0f} megapixel-frames), above this host's "
+            f"{FX_INTERP_MAX_PIXEL_FRAMES / 1e6:.0f} budget. Send at most about {max_source} "
+            f"source frames at this size and factor, a smaller video, or factor 2.")
+
+
+def build_fx_interp(*, video, factor=2, model_name=FX_INTERP_MODELS[FX_INTERP_DEFAULT_MODEL],
+                    frames=None, filename_prefix="wrapper/fx_interp"):
+    """Frame interpolation (slow motion): video -> MP4 with ``factor``x the
+    frames at the source frame rate, so it plays ``factor``x slower. No audio
+    (a slowed soundtrack would be pitched down; the caller keeps the original).
+
+    The source fps is linked straight from GetVideoComponents into CreateVideo,
+    so the output is retimed without the wrapper knowing the rate. ``frames``
+    (the source frame count, when the caller probed it) is recorded as the
+    interpolation node's expected step total, so the job's progress bar
+    reserves the interpolation passes from the start instead of racing over
+    the loaders (see api_wrapper/progress.py)."""
+    if factor not in FX_INTERP_FACTORS:
+        raise ValueError(f"factor must be one of {FX_INTERP_FACTORS}")
+    interpolate = {"class_type": "FrameInterpolate", "inputs": {
+        "interp_model": ["3", 0], "images": ["2", 0], "multiplier": factor}}
+    if frames and frames >= 2:
+        # FrameInterpolate's own ProgressBar total: (pairs) * (new frames per pair).
+        interpolate["_meta"] = {"expected_steps": (frames - 1) * (factor - 1)}
+    return {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": video}},
+        # outputs: images, audio, fps, bit_depth, color_space
+        "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+        "3": {"class_type": "FrameInterpolationModelLoader", "inputs": {"model_name": model_name}},
+        "4": interpolate,
+        # The source fps, not fps * factor: that is what makes it slow motion.
+        # No audio input, so the MP4 has no audio track.
+        "5": {"class_type": "CreateVideo", "inputs": {"images": ["4", 0], "fps": ["2", 2], "bit_depth": 8}},
+        "6": {"class_type": "SaveVideo", "inputs": {
+            "video": ["5", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
+    }
+
+
+FX_INTERP_FORM_EXTRA = {
+    "video": {"type": "string", "format": "binary",
+              "description": "The clip to slow down (mp4, webm, mov, mkv, avi or gif). Its audio is "
+                             "dropped. The output keeps its size and frame rate."},
+    "factor": {"type": "integer", "enum": list(FX_INTERP_FACTORS), "default": 2,
+               "description": "Frames made per source frame: 2 or 4. The output has (frames-1)*factor+1 "
+                              "frames played at the source fps, so it runs factor times slower."},
+    "model": {"type": "string", "enum": list(FX_INTERP_MODELS), "default": FX_INTERP_DEFAULT_MODEL,
+              "description": "Interpolation model: 'film' (FILM, the ComfyUI blueprint's choice; best on "
+                             "large motion) or 'rife' (RIFE 4.26; several times faster). Downloaded on "
+                             "first use (69 MB / 23 MB)."},
+}
+
+
+# Background removal for FloStudio's "Remove background": the core BiRefNet
+# nodes (comfy_extras/nodes_bg_removal.py) turn every frame into a foreground
+# mask, and the masks are encoded as a grayscale matte video (white = subject)
+# that Flow composites itself. The checkpoints are the ones the shipped
+# "Remove Background (BiRefNet)" blueprint points at (Comfy-Org/BiRefNet, MIT).
+FX_BGREMOVE_BASE_URL = "https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/background_removal"
+FX_BGREMOVE_MODELS = {
+    # BiRefNet (ZhengPeng7/BiRefNet, MIT), 444 MB: the blueprint's model, general subjects.
+    "birefnet": "birefnet.safetensors",
+    # Lucida (egeorcun/lucida, MIT), 885 MB: a BiRefNet_HR fine-tune that keeps
+    # fine text, illustration edges and camouflaged subjects.
+    "lucida": "lucida.safetensors",
+}
+FX_BGREMOVE_DEFAULT_MODEL = "birefnet"
+# The whole clip sits in host RAM as float32 three times over: the decoded
+# frames (12 bytes per pixel), their masks (4) and the masks as RGB frames for
+# the encoder (12), ~28 bytes per pixel-frame. The default budget (1e9
+# pixel-frames, ~28 GB) is e.g. 16 s of 1080p30 or 36 s of 720p30.
+FX_BGREMOVE_MAX_PIXEL_FRAMES = max(1, int(float(
+    os.environ.get("COMFY_FX_BGREMOVE_MAX_PIXEL_FRAMES", "1000000000"))))
+
+
+def fx_bgremove_models(model):
+    """The one checkpoint an fx-bgremove job needs (``model`` is 'birefnet' or 'lucida')."""
+    filename = FX_BGREMOVE_MODELS[model]
+    return [{"folder": "background_removal", "filename": filename,
+             "url": f"{FX_BGREMOVE_BASE_URL}/{filename}"}]
+
+
+def fx_bgremove_check_budget(width, height, frames):
+    """An error detail when the clip would not fit this host's memory budget, else None."""
+    used = width * height * frames
+    if used <= FX_BGREMOVE_MAX_PIXEL_FRAMES:
+        return None
+    return (f"{frames} frames of {width}x{height} is {used / 1e6:.0f} megapixel-frames, above this "
+            f"host's {FX_BGREMOVE_MAX_PIXEL_FRAMES / 1e6:.0f} budget. Send at most about "
+            f"{FX_BGREMOVE_MAX_PIXEL_FRAMES // (width * height)} frames at this size, or a smaller video.")
+
+
+def build_fx_bgremove(*, video, model_name=FX_BGREMOVE_MODELS[FX_BGREMOVE_DEFAULT_MODEL],
+                      frames=None, filename_prefix="wrapper/fx_bgremove"):
+    """Background removal: video -> grayscale matte MP4 (white = subject) with
+    the source's frames, size and frame rate, no audio.
+
+    ``frames`` (the probed source frame count) is recorded as RemoveBackground's
+    expected step total, one per frame, so the progress bar reserves the model
+    passes from the start (see api_wrapper/progress.py)."""
+    remove = {"class_type": "RemoveBackground", "inputs": {"bg_removal_model": ["3", 0], "image": ["2", 0]}}
+    if frames and frames >= 2:
+        remove["_meta"] = {"expected_steps": frames}
+    return {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": video}},
+        # outputs: images, audio, fps, bit_depth, color_space
+        "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+        "3": {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": model_name}},
+        "4": remove,
+        "5": {"class_type": "MaskToImage", "inputs": {"mask": ["4", 0]}},
+        "6": {"class_type": "CreateVideo", "inputs": {"images": ["5", 0], "fps": ["2", 2], "bit_depth": 8}},
+        "7": {"class_type": "SaveVideo", "inputs": {
+            "video": ["6", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
+    }
+
+
+FX_BGREMOVE_FORM_EXTRA = {
+    "video": {"type": "string", "format": "binary",
+              "description": "The clip to cut out (mp4, webm, mov, mkv, avi or gif), with an even width "
+                             "and height."},
+    "model": {"type": "string", "enum": list(FX_BGREMOVE_MODELS), "default": FX_BGREMOVE_DEFAULT_MODEL,
+              "description": "Segmentation model: 'birefnet' (BiRefNet, the ComfyUI blueprint's choice) or "
+                             "'lucida' (a BiRefNet_HR fine-tune for fine text, illustration and camouflage). "
+                             "Downloaded on first use (444 MB / 885 MB)."},
+}
+
+
+# Upscale for FloStudio's "Enhance resolution", to a short side of at least
+# ``target_short_side`` and at most 4x the source.
+# - esrgan: Real-ESRGAN (xinntao/Real-ESRGAN, BSD-3-Clause) through the core
+#   upscale-model nodes (comfy_extras/nodes_upscale_model.py). The x2 model
+#   runs when the job needs at most 2x and the x4 one above that, and the
+#   result is area-scaled to the exact size. x4plus is the repackaged file the
+#   shipped "Video Upscale(GAN x4)" blueprint uses; x2plus has no repackaged
+#   copy, so it comes from the official release (a weights-only .pth).
+# - seedvr2: the SeedVR2 3B one-step video restorer (ByteDance-Seed/SeedVR2,
+#   Apache-2.0) through comfy_extras/nodes_seedvr.py, wired like the shipped
+#   "Upscale Video (SeedVR2 3B Int8)" blueprint: lanczos-resize to the target,
+#   then restore detail at that size. The latent is split into overlapping
+#   temporal chunks sized to the free VRAM.
+FX_UPSCALE_MODELS = ("esrgan", "seedvr2")
+FX_UPSCALE_DEFAULT_MODEL = "esrgan"
+FX_UPSCALE_MAX_FACTOR = 4
+FX_UPSCALE_DEFAULT_SHORT_SIDE = 1080
+FX_UPSCALE_MAX_SHORT_SIDE = 4320
+FX_UPSCALE_ESRGAN = {
+    2: {"folder": "upscale_models", "filename": "RealESRGAN_x2plus.pth",
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"},
+    4: {"folder": "upscale_models", "filename": "RealESRGAN_x4plus.safetensors",
+        "url": "https://huggingface.co/Comfy-Org/Real-ESRGAN_repackaged/resolve/main/RealESRGAN_x4plus.safetensors"},
+}
+FX_UPSCALE_SEEDVR2_UNET = "seedvr2_3b_int8_convrot.safetensors"
+FX_UPSCALE_SEEDVR2_VAE = "seedvr2_ema_vae_fp16.safetensors"
+FX_UPSCALE_SEEDVR2_MODELS = [
+    {"folder": "diffusion_models", "filename": FX_UPSCALE_SEEDVR2_UNET,
+     "url": f"https://huggingface.co/Comfy-Org/SeedVR2/resolve/main/diffusion_models/{FX_UPSCALE_SEEDVR2_UNET}"},
+    {"folder": "vae", "filename": FX_UPSCALE_SEEDVR2_VAE,
+     "url": f"https://huggingface.co/Comfy-Org/SeedVR2/resolve/main/vae/{FX_UPSCALE_SEEDVR2_VAE}"},
+]
+# Latent frames (4 pixel frames each) shared and crossfaded between SeedVR2's
+# temporal chunks, so chunk seams don't pop.
+FX_UPSCALE_SEEDVR2_TEMPORAL_OVERLAP = 2
+# ImageUpscaleWithModel's tiling (comfy_extras/nodes_upscale_model.py), for its progress total.
+FX_UPSCALE_TILE = 512
+FX_UPSCALE_TILE_OVERLAP = 32
+# Host RAM: esrgan holds the model's full-scale output as float32 (12 bytes per
+# pixel) and briefly a clamped copy of it, so its cost is the model-scale
+# pixel-frames; seedvr2 holds about four float32 copies of the clip at the
+# target size (resized, padded, decoded, colour-corrected), counted as two
+# pixel-frames per output pixel-frame. The default budget (1.5e9, ~18 GB per
+# copy) is e.g. 13 s of 360p30 or 720p30 to 1080p with esrgan, 24 s of 540p30,
+# or 12 s of anything to 1080p30 with seedvr2.
+FX_UPSCALE_MAX_PIXEL_FRAMES = max(1, int(float(
+    os.environ.get("COMFY_FX_UPSCALE_MAX_PIXEL_FRAMES", "1500000000"))))
+
+
+def fx_upscale_size(width, height, target_short_side):
+    """(out_width, out_height, factor) for a source upscaled until its short
+    side reaches ``target_short_side``, by at least 1x and at most 4x. Output
+    sides are even (H.264 4:2:0); the short side is rounded up so it never
+    falls below the target."""
+    short, long = min(width, height), max(width, height)
+    factor = min(float(FX_UPSCALE_MAX_FACTOR), max(1.0, target_short_side / short))
+    out_short = 2 * math.ceil(short * factor / 2)
+    out_long = 2 * round(long * factor / 2)
+    if width <= height:
+        return out_short, out_long, factor
+    return out_long, out_short, factor
+
+
+def fx_upscale_esrgan_scale(factor):
+    """The Real-ESRGAN model scale (2 or 4) for an upscale of ``factor``."""
+    return 2 if factor <= 2 else 4
+
+
+def fx_upscale_models(model, factor):
+    """The checkpoints an fx-upscale job needs."""
+    if model == "seedvr2":
+        return list(FX_UPSCALE_SEEDVR2_MODELS)
+    return [FX_UPSCALE_ESRGAN[fx_upscale_esrgan_scale(factor)]]
+
+
+def fx_upscale_check_budget(model, width, height, frames, out_width, out_height, factor):
+    """An error detail when the upscale would not fit this host's memory budget, else None."""
+    if model == "seedvr2":
+        per_frame = 2 * out_width * out_height
+        work = f"seedvr2 at {out_width}x{out_height}"
+    else:
+        scale = fx_upscale_esrgan_scale(factor)
+        per_frame = width * scale * height * scale
+        work = f"the esrgan x{scale} model ({width * scale}x{height * scale} before scaling)"
+    used = per_frame * frames
+    if used <= FX_UPSCALE_MAX_PIXEL_FRAMES:
+        return None
+    return (f"{frames} frames of {width}x{height} through {work} is {used / 1e6:.0f} megapixel-frames, "
+            f"above this host's {FX_UPSCALE_MAX_PIXEL_FRAMES / 1e6:.0f} budget. Send at most about "
+            f"{FX_UPSCALE_MAX_PIXEL_FRAMES // per_frame} frames at this size, a smaller video, or a lower "
+            f"target_short_side.")
+
+
+def fx_upscale_tile_steps(width, height):
+    """ImageUpscaleWithModel's progress total per frame (comfy.utils.get_tiled_scale_steps)."""
+    step = FX_UPSCALE_TILE - FX_UPSCALE_TILE_OVERLAP
+    rows = 1 if height <= FX_UPSCALE_TILE else math.ceil((height - FX_UPSCALE_TILE_OVERLAP) / step)
+    cols = 1 if width <= FX_UPSCALE_TILE else math.ceil((width - FX_UPSCALE_TILE_OVERLAP) / step)
+    return rows * cols
+
+
+def build_fx_upscale(*, video, width, height, model=FX_UPSCALE_DEFAULT_MODEL,
+                     upscale_model_name=FX_UPSCALE_ESRGAN[4]["filename"],
+                     unet_name=FX_UPSCALE_SEEDVR2_UNET, vae_name=FX_UPSCALE_SEEDVR2_VAE,
+                     seed=0, frames=None, source_size=None, filename_prefix="wrapper/fx_upscale"):
+    """Upscale: video -> H.264 MP4 of exactly ``width`` x ``height`` with the
+    source's frames and frame rate, no audio.
+
+    esrgan runs ``upscale_model_name`` and area-scales its output to the size;
+    seedvr2 resizes to the size and restores it with ``unet_name`` /
+    ``vae_name`` (``seed`` drives its one sampling step). ``frames`` and
+    ``source_size`` (the probe) give esrgan's upscale node its expected step
+    total, frames x tiles, for the progress bar."""
+    if model not in FX_UPSCALE_MODELS:
+        raise ValueError(f"model must be one of {FX_UPSCALE_MODELS}")
+    graph = {
+        "1": {"class_type": "LoadVideo", "inputs": {"file": video}},
+        # outputs: images, audio, fps, bit_depth, color_space
+        "2": {"class_type": "GetVideoComponents", "inputs": {"video": ["1", 0]}},
+    }
+    if model == "esrgan":
+        upscale = {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["3", 0], "image": ["2", 0]}}
+        if frames and source_size:
+            upscale["_meta"] = {"expected_steps": frames * fx_upscale_tile_steps(*source_size)}
+        graph.update({
+            "3": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": upscale_model_name}},
+            "4": upscale,
+            "5": {"class_type": "ImageScale", "inputs": {
+                "image": ["4", 0], "upscale_method": "area", "width": width, "height": height, "crop": "disabled"}},
+        })
+        images = ["5", 0]
+    else:
+        tiled = {"tile_size": 512, "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}
+        graph.update({
+            "3": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
+            "4": {"class_type": "VAELoader", "inputs": {"vae_name": vae_name}},
+            "5": {"class_type": "ImageScale", "inputs": {
+                "image": ["2", 0], "upscale_method": "lanczos", "width": width, "height": height, "crop": "disabled"}},
+            # Pads to a multiple of 16 and to 4n+1 frames; post-processing crops both back.
+            "6": {"class_type": "SeedVR2Preprocess", "inputs": {"resized_images": ["5", 0]}},
+            "7": {"class_type": "VAEEncodeTiled", "inputs": {"pixels": ["6", 0], "vae": ["4", 0], **tiled}},
+            # A list of latent chunks: conditioning and sampling run once per chunk.
+            "8": {"class_type": "SeedVR2TemporalChunk", "inputs": {
+                "latent": ["7", 0], "temporal_overlap": FX_UPSCALE_SEEDVR2_TEMPORAL_OVERLAP,
+                "chunking_mode": "auto"}},
+            "9": {"class_type": "SeedVR2Conditioning", "inputs": {"model": ["3", 0], "vae_conditioning": ["8", 0]}},
+            "10": {"class_type": "KSampler", "inputs": {
+                "model": ["3", 0], "positive": ["9", 0], "negative": ["9", 1], "latent_image": ["8", 0],
+                "seed": seed, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+                "denoise": 1.0}},
+            "11": {"class_type": "SeedVR2TemporalMerge", "inputs": {"latents": ["10", 0], "temporal_overlap": ["8", 1]}},
+            "12": {"class_type": "VAEDecodeTiled", "inputs": {"samples": ["11", 0], "vae": ["4", 0], **tiled}},
+            "13": {"class_type": "SeedVR2PostProcessing", "inputs": {
+                "images": ["12", 0], "original_resized_images": ["5", 0], "color_correction_method": "lab"}},
+        })
+        images = ["13", 0]
+    create, save = str(len(graph) + 1), str(len(graph) + 2)
+    graph[create] = {"class_type": "CreateVideo", "inputs": {"images": images, "fps": ["2", 2], "bit_depth": 8}}
+    graph[save] = {"class_type": "SaveVideo", "inputs": {
+        "video": [create, 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}}
+    return graph
+
+
+FX_UPSCALE_FORM_EXTRA = {
+    "video": {"type": "string", "format": "binary",
+              "description": "The clip to upscale (mp4, webm, mov, mkv, avi or gif). Its audio is dropped."},
+    "model": {"type": "string", "enum": list(FX_UPSCALE_MODELS), "default": FX_UPSCALE_DEFAULT_MODEL,
+              "description": "'esrgan' (Real-ESRGAN x2/x4, fast; 67 MB each) or 'seedvr2' (SeedVR2 3B int8 "
+                             "video restoration, slower and much sharper on real footage; 3.5 GB + 0.5 GB "
+                             "VAE). Downloaded on first use."},
+    "target_short_side": {"type": "integer", "minimum": 16, "maximum": FX_UPSCALE_MAX_SHORT_SIDE,
+                          "default": FX_UPSCALE_DEFAULT_SHORT_SIDE,
+                          "description": "Upscale until the short side is at least this many pixels (e.g. "
+                                         "the project canvas's short side), by at least 1x and at most 4x. "
+                                         "Output sides are even."},
+}
+
+
 """The wrapper API's workflow registry.
 
 Each entry describes one dedicated workflow API: ``build`` constructs the
@@ -848,6 +1200,11 @@ variants) to get one endpoint per task under /api/wrapper/{name}/{task}.
 Route-level setup (model downloads, quantization) lives in ``api_wrapper.
 routes`` keyed by the same names. Adding a new workflow = adding one entry
 here plus one setup handler.
+
+A workflow that takes no prompt sets ``requires_prompt: False``;
+``required_uploads`` names upload fields that must be present (any kind, not
+just images); ``setup_uses_uploads`` hands the saved upload refs to the setup
+handler (e.g. to probe an uploaded video before queueing).
 """
 
 WORKFLOWS = {
@@ -1000,5 +1357,45 @@ WORKFLOWS = {
                 "build": build_minimax_h3_reference_to_video,
             },
         },
+    },
+    "fx-interp": {
+        "title": "Frame interpolation (slow motion, FILM/RIFE)",
+        "output_type": "video",
+        "requires_image": False,
+        "requires_prompt": False,
+        "required_uploads": ["video"],
+        "setup_uses_uploads": True,
+        "uploads": {"video": {"ext": "video", "max": 1}},
+        "uses": [],
+        "form": ["video", "factor", "model"],
+        "extra_form_properties": FX_INTERP_FORM_EXTRA,
+        "build": build_fx_interp,
+    },
+    "fx-bgremove": {
+        "title": "Background removal matte (BiRefNet)",
+        "output_type": "video",
+        "requires_image": False,
+        "requires_prompt": False,
+        "required_uploads": ["video"],
+        "setup_uses_uploads": True,
+        "uploads": {"video": {"ext": "video", "max": 1}},
+        "uses": [],
+        "form": ["video", "model"],
+        "extra_form_properties": FX_BGREMOVE_FORM_EXTRA,
+        "build": build_fx_bgremove,
+    },
+    "fx-upscale": {
+        "title": "Video upscale (Real-ESRGAN / SeedVR2)",
+        "output_type": "video",
+        "requires_image": False,
+        "requires_prompt": False,
+        "required_uploads": ["video"],
+        "setup_uses_uploads": True,
+        "uploads": {"video": {"ext": "video", "max": 1}},
+        # The setup adds a seed for seedvr2 only (esrgan doesn't sample).
+        "uses": [],
+        "form": ["video", "model", "target_short_side", "seed"],
+        "extra_form_properties": FX_UPSCALE_FORM_EXTRA,
+        "build": build_fx_upscale,
     },
 }

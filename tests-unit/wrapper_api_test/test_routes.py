@@ -42,6 +42,26 @@ class TestCollectOutputFiles(unittest.TestCase):
         for path in (img, vid, aud, obj):
             os.remove(path)
 
+    def test_saved_output_wins_over_an_upload_preview(self):
+        """LoadVideo reports the upload itself (type "input") and runs before
+        SaveVideo; the response must be the saved video, not the upload."""
+        import folder_paths
+
+        upload = self._touch(folder_paths.get_input_directory(), "wrapper", "job", "upload.mp4")
+        saved = self._touch(folder_paths.get_output_directory(), "wrapper", "job", "fx-interp_00001_.mp4")
+        entry = {
+            "outputs": {
+                "1": {"images": [{"filename": "upload.mp4", "subfolder": "wrapper/job", "type": "input"}]},
+                "6": {"images": [{"filename": "fx-interp_00001_.mp4", "subfolder": "wrapper/job", "type": "output"}]},
+            }
+        }
+        try:
+            files = wrapper_routes._collect_output_files(entry)
+            self.assertEqual(files, [saved, upload])
+        finally:
+            os.remove(upload)
+            os.remove(saved)
+
     def test_skips_missing_and_foreign_keys(self):
         entry = {
             "outputs": {
@@ -244,6 +264,224 @@ class TestQwenImage21SetupContract(unittest.TestCase):
         for fields in ({"quantization": "fp8"}, {"resolution": "5000"}, {"width": "10", "height": "10"}):
             with self.assertRaises(wrapper_routes._SetupError):
                 asyncio.run(wrapper_routes._setup_qwenimage21_edit(fields, []))
+        self.assertEqual(self.requested, [])
+
+
+class TestFxInterpSetup(unittest.TestCase):
+    """fx-interp probes the upload (mocked here: no real video or model) and
+    refuses bad params and over-budget clips before anything is downloaded."""
+
+    def setUp(self):
+        self._download_models = wrapper_routes._download_models
+        self._probe_video = wrapper_routes._probe_video
+        self.requested = []
+        self.probe = (1280, 720, 61, 30.0)
+
+        async def no_download(models, downloaded):
+            self.requested.extend((m["folder"], m["filename"]) for m in models)
+            return []
+
+        wrapper_routes._download_models = no_download
+        wrapper_routes._probe_video = lambda path: self.probe
+
+    def tearDown(self):
+        wrapper_routes._download_models = self._download_models
+        wrapper_routes._probe_video = self._probe_video
+
+    def _setup(self, fields, refs=None):
+        refs = {"video": ["wrapper/job/clip.mp4"]} if refs is None else refs
+        return asyncio.run(wrapper_routes._setup_fx_interp(fields, [], refs))
+
+    def test_defaults_are_factor_2_with_film_and_build(self):
+        kwargs, note = self._setup({})
+        self.assertEqual(kwargs, {"factor": 2, "model_name": "film_net_fp16.safetensors", "frames": 61})
+        self.assertEqual(self.requested, [("frame_interpolation", "film_net_fp16.safetensors")])
+        self.assertIn("61 frames of 1280x720 -> 121 frames", note)
+        self.assertIn("30 fps (2x slower, no audio)", note)
+        graph = wrapper_workflows.build_fx_interp(video="wrapper/job/clip.mp4", **kwargs)
+        self.assertEqual(graph["4"]["inputs"]["multiplier"], 2)
+
+    def test_factor_4_with_rife(self):
+        kwargs, _ = self._setup({"factor": "4", "model": "RIFE"})
+        self.assertEqual((kwargs["factor"], kwargs["model_name"]), (4, "rife_v4.26.safetensors"))
+        self.assertEqual(self.requested, [("frame_interpolation", "rife_v4.26.safetensors")])
+
+    def test_bad_params_fail_before_any_download(self):
+        for fields in ({"factor": "3"}, {"factor": "8"}, {"factor": "two"}, {"model": "dain"}):
+            with self.assertRaises(wrapper_routes._SetupError):
+                self._setup(fields)
+        self.assertEqual(self.requested, [])
+
+    def test_unreadable_short_and_missing_videos_are_refused(self):
+        def broken(path):
+            raise ValueError("No video stream found")
+
+        wrapper_routes._probe_video = broken
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._setup({})
+        self.assertEqual(ctx.exception.message, "Unreadable video")
+        wrapper_routes._probe_video = lambda path: (640, 360, 1, 30.0)
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._setup({})
+        self.assertEqual(ctx.exception.message, "Video too short")
+        with self.assertRaises(wrapper_routes._SetupError):
+            self._setup({}, refs={})
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_clip_is_refused(self):
+        # 10 s of 1080p30 at 4x is ~1197 frames, ~2.5 gigapixel-frames.
+        self.probe = (1920, 1080, 300, 30.0)
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._setup({"factor": "4"})
+        self.assertIn("COMFY_FX_INTERP_MAX_PIXEL_FRAMES", ctx.exception.details)
+        self.assertEqual(self.requested, [])
+
+    def test_factor_shows_in_the_settings_header(self):
+        headers = wrapper_routes._resolution_headers(
+            {"factor": 4, "model_name": "rife_v4.26.safetensors", "frames": 61}, "n")
+        self.assertEqual(headers["X-Wrapper-Settings"], "factor=4")
+        self.assertEqual(headers["X-Wrapper-Models"], "rife_v4.26.safetensors")
+
+
+class _ProbedVideoSetup(unittest.TestCase):
+    """Setup handlers that probe the uploaded video: the probe and the
+    downloads are mocked (no real video or model)."""
+
+    probe = (1280, 720, 61, 30.0)
+
+    def setUp(self):
+        self._download_models = wrapper_routes._download_models
+        self._probe_video = wrapper_routes._probe_video
+        self.requested = []
+
+        async def no_download(models, downloaded):
+            self.requested.extend((m["folder"], m["filename"]) for m in models)
+            return []
+
+        wrapper_routes._download_models = no_download
+        wrapper_routes._probe_video = lambda path: self.probe
+
+    def tearDown(self):
+        wrapper_routes._download_models = self._download_models
+        wrapper_routes._probe_video = self._probe_video
+
+    def _run(self, setup, fields, refs=None):
+        refs = {"video": ["wrapper/job/clip.mp4"]} if refs is None else refs
+        return asyncio.run(setup(fields, [], refs))
+
+    def _refused(self, setup, fields, refs=None):
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._run(setup, fields, refs)
+        return ctx.exception
+
+
+class TestFxBgRemoveSetup(_ProbedVideoSetup):
+    def _setup(self, fields, refs=None):
+        return self._run(wrapper_routes._setup_fx_bgremove, fields, refs)
+
+    def test_defaults_to_birefnet_and_builds(self):
+        kwargs, note = self._setup({})
+        self.assertEqual(kwargs, {"model_name": "birefnet.safetensors", "frames": 61})
+        self.assertEqual(self.requested, [("background_removal", "birefnet.safetensors")])
+        self.assertIn("61 frames of 1280x720 -> grayscale matte (white = subject) with birefnet", note)
+        self.assertIn("30 fps, no audio", note)
+        graph = wrapper_workflows.build_fx_bgremove(video="wrapper/job/clip.mp4", **kwargs)
+        self.assertEqual(graph["4"]["_meta"]["expected_steps"], 61)
+        headers = wrapper_routes._resolution_headers(kwargs, note)
+        self.assertEqual(headers["X-Wrapper-Models"], "birefnet.safetensors")
+
+    def test_lucida(self):
+        kwargs, _ = self._setup({"model": " Lucida "})
+        self.assertEqual(kwargs["model_name"], "lucida.safetensors")
+        self.assertEqual(self.requested, [("background_removal", "lucida.safetensors")])
+
+    def test_refusals_happen_before_any_download(self):
+        self.assertEqual(self._refused(wrapper_routes._setup_fx_bgremove, {"model": "u2net"}).message, "Invalid model")
+        self.assertEqual(self._refused(wrapper_routes._setup_fx_bgremove, {}, refs={}).message, "No video provided")
+        self.probe = (641, 360, 30, 30.0)
+        self.assertEqual(self._refused(wrapper_routes._setup_fx_bgremove, {}).message, "Unsupported video size")
+        self.probe = (640, 360, 0, 30.0)
+        self.assertEqual(self._refused(wrapper_routes._setup_fx_bgremove, {}).message, "Video too short")
+
+        def broken(path):
+            raise ValueError("No video stream found")
+
+        wrapper_routes._probe_video = broken
+        self.assertEqual(self._refused(wrapper_routes._setup_fx_bgremove, {}).message, "Unreadable video")
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_clip_is_refused(self):
+        # 30 s of 1080p30.
+        self.probe = (1920, 1080, 900, 30.0)
+        error = self._refused(wrapper_routes._setup_fx_bgremove, {})
+        self.assertIn("COMFY_FX_BGREMOVE_MAX_PIXEL_FRAMES", error.details)
+        self.assertEqual(self.requested, [])
+
+
+class TestFxUpscaleSetup(_ProbedVideoSetup):
+    probe = (640, 360, 61, 30.0)
+
+    def _setup(self, fields, refs=None):
+        return self._run(wrapper_routes._setup_fx_upscale, fields, refs)
+
+    def test_defaults_are_esrgan_to_1080(self):
+        kwargs, note = self._setup({})
+        self.assertEqual(kwargs, {"model": "esrgan", "width": 1920, "height": 1080, "frames": 61,
+                                  "upscale_model_name": "RealESRGAN_x4plus.safetensors",
+                                  "source_size": (640, 360)})
+        self.assertEqual(self.requested, [("upscale_models", "RealESRGAN_x4plus.safetensors")])
+        self.assertIn("61 frames of 640x360 -> 1920x1080 (3.00x) with esrgan x4 at the source 30 fps", note)
+        graph = wrapper_workflows.build_fx_upscale(video="wrapper/job/clip.mp4", **kwargs)
+        self.assertEqual(graph["5"]["inputs"]["width"], 1920)
+        headers = wrapper_routes._resolution_headers(kwargs, note)
+        self.assertEqual(headers["X-Wrapper-Models"], "RealESRGAN_x4plus.safetensors")
+        self.assertEqual(headers["X-Wrapper-Settings"], "width=1920 height=1080")
+
+    def test_small_factor_uses_the_x2_model(self):
+        self.probe = (1280, 720, 61, 25.0)
+        kwargs, note = self._setup({"target_short_side": "1080"})
+        self.assertEqual(kwargs["upscale_model_name"], "RealESRGAN_x2plus.pth")
+        self.assertEqual(self.requested, [("upscale_models", "RealESRGAN_x2plus.pth")])
+        self.assertIn("(1.50x) with esrgan x2", note)
+
+    def test_seedvr2(self):
+        kwargs, note = self._setup({"model": "SeedVR2", "target_short_side": "720", "seed": "42"})
+        self.assertEqual(kwargs, {"model": "seedvr2", "width": 1280, "height": 720, "frames": 61,
+                                  "unet_name": "seedvr2_3b_int8_convrot.safetensors",
+                                  "vae_name": "seedvr2_ema_vae_fp16.safetensors", "seed": 42})
+        self.assertEqual(self.requested, [("diffusion_models", "seedvr2_3b_int8_convrot.safetensors"),
+                                          ("vae", "seedvr2_ema_vae_fp16.safetensors")])
+        self.assertIn("with seedvr2", note)
+        headers = wrapper_routes._resolution_headers(kwargs, note)
+        self.assertEqual(headers["X-Wrapper-Settings"], "width=1280 height=720 seed=42")
+        # Without one, a random seed.
+        self.assertIsInstance(self._setup({"model": "seedvr2"})[0]["seed"], int)
+        self.assertEqual(headers["X-Wrapper-Models"], "seedvr2_3b_int8_convrot.safetensors, "
+                                                      "seedvr2_ema_vae_fp16.safetensors")
+
+    def test_capped_at_4x_says_so(self):
+        self.probe = (320, 180, 61, 30.0)
+        kwargs, note = self._setup({"target_short_side": "1080"})
+        self.assertEqual((kwargs["width"], kwargs["height"]), (1280, 720))
+        self.assertIn("capped at 4x, short of 1080", note)
+
+    def test_refusals_happen_before_any_download(self):
+        setup = wrapper_routes._setup_fx_upscale
+        self.assertEqual(self._refused(setup, {"model": "waifu2x"}).message, "Invalid model")
+        for target in ("0", "15", "5000", "big", "1080.5"):
+            self.assertEqual(self._refused(setup, {"target_short_side": target}).message,
+                             "Invalid target_short_side")
+        self.assertEqual(self._refused(setup, {}, refs={}).message, "No video provided")
+        self.probe = (640, 360, 0, 30.0)
+        self.assertEqual(self._refused(setup, {}).message, "Video too short")
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_clip_is_refused(self):
+        # 30 s of 360p30 to 1080p through the x4 model is 3.3e9 pixel-frames.
+        self.probe = (640, 360, 900, 30.0)
+        for model in ("esrgan", "seedvr2"):
+            error = self._refused(wrapper_routes._setup_fx_upscale, {"model": model})
+            self.assertIn("COMFY_FX_UPSCALE_MAX_PIXEL_FRAMES", error.details)
         self.assertEqual(self.requested, [])
 
 

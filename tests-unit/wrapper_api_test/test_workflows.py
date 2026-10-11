@@ -720,6 +720,272 @@ class TestIdeogram4Graph(unittest.TestCase):
         self.assertEqual(graph["4"]["inputs"]["vae_name"], wrapper_workflows.IDEOGRAM4_VAE)
 
 
+class TestFxInterpGraph(unittest.TestCase):
+    def test_structure_retimes_at_source_fps_without_audio(self):
+        graph = wrapper_workflows.build_fx_interp(video="wrapper/job/clip.mp4", factor=4)
+        self.assertEqual([graph[k]["class_type"] for k in sorted(graph, key=int)], [
+            "LoadVideo", "GetVideoComponents", "FrameInterpolationModelLoader",
+            "FrameInterpolate", "CreateVideo", "SaveVideo"])
+        self.assertEqual(graph["1"]["inputs"]["file"], "wrapper/job/clip.mp4")
+        self.assertEqual(graph["4"]["inputs"], {"interp_model": ["3", 0], "images": ["2", 0], "multiplier": 4})
+        create = graph["5"]["inputs"]
+        # fps is GetVideoComponents' fps output (index 2): the source rate, so
+        # factor x the frames play factor x slower.
+        self.assertEqual(create["fps"], ["2", 2])
+        self.assertEqual(create["images"], ["4", 0])
+        self.assertNotIn("audio", create)
+        self.assertEqual(graph["6"]["inputs"]["video"], ["5", 0])
+        for node_id, node in graph.items():
+            for value in node["inputs"].values():
+                if isinstance(value, list):
+                    self.assertIn(value[0], graph, f"{node_id} links to unknown node {value[0]}")
+
+    def test_default_model_is_film_and_rife_is_selectable(self):
+        graph = wrapper_workflows.build_fx_interp(video="v.mp4")
+        self.assertEqual(graph["3"]["inputs"]["model_name"], "film_net_fp16.safetensors")
+        self.assertEqual(graph["4"]["inputs"]["multiplier"], 2)
+        graph = wrapper_workflows.build_fx_interp(video="v.mp4", model_name="rife_v4.26.safetensors")
+        self.assertEqual(graph["3"]["inputs"]["model_name"], "rife_v4.26.safetensors")
+
+    def test_only_factors_2_and_4(self):
+        for factor in (1, 3, 8):
+            with self.assertRaises(ValueError):
+                wrapper_workflows.build_fx_interp(video="v.mp4", factor=factor)
+
+    def test_expected_steps_match_the_nodes_progress_total(self):
+        graph = wrapper_workflows.build_fx_interp(video="v.mp4", factor=4, frames=121)
+        self.assertEqual(graph["4"]["_meta"]["expected_steps"], 120 * 3)
+        self.assertNotIn("_meta", wrapper_workflows.build_fx_interp(video="v.mp4")["4"])
+
+    def test_models_come_from_the_blueprint_repo(self):
+        for model, filename in (("film", "film_net_fp16.safetensors"), ("rife", "rife_v4.26.safetensors")):
+            (entry,) = wrapper_workflows.fx_interp_models(model)
+            self.assertEqual(entry["folder"], "frame_interpolation")
+            self.assertEqual(entry["filename"], filename)
+            self.assertEqual(entry["url"], "https://huggingface.co/Comfy-Org/frame_interpolation/resolve/main/"
+                                           f"frame_interpolation/{filename}")
+
+    def test_output_frames_and_budget(self):
+        self.assertEqual(wrapper_workflows.fx_interp_output_frames(121, 2), 241)
+        self.assertEqual(wrapper_workflows.fx_interp_output_frames(121, 4), 481)
+        self.assertEqual(wrapper_workflows.fx_interp_output_frames(1, 4), 1)
+        # 4 s of 1080p30 at 4x fits the default budget; 10 s does not.
+        self.assertIsNone(wrapper_workflows.fx_interp_check_budget(1920, 1080, 120, 4))
+        detail = wrapper_workflows.fx_interp_check_budget(1920, 1080, 300, 4)
+        self.assertIn("1197 frames", detail)
+        self.assertIn("factor 2", detail)
+
+    def test_registered_without_a_prompt(self):
+        entry = wrapper_workflows.WORKFLOWS["fx-interp"]
+        self.assertEqual(entry["output_type"], "video")
+        self.assertFalse(entry["requires_prompt"])
+        self.assertEqual(entry["required_uploads"], ["video"])
+        self.assertEqual(entry["uploads"], {"video": {"ext": "video", "max": 1}})
+        self.assertEqual(entry["uses"], [])
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_interp)
+
+    def test_openapi_documents_the_endpoint(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/fx-interp/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["video"])
+        self.assertNotIn("prompt", schema["properties"])
+        self.assertEqual(schema["properties"]["factor"]["enum"], [2, 4])
+        self.assertEqual(schema["properties"]["model"]["enum"], ["film", "rife"])
+        self.assertEqual(schema["properties"]["video"]["format"], "binary")
+        self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
+        self.assertEqual(op["operationId"], "generateFxInterp")
+
+
+def _assert_links_resolve(test, graph):
+    for node_id, node in graph.items():
+        for value in node["inputs"].values():
+            if isinstance(value, list):
+                test.assertIn(value[0], graph, f"{node_id} links to unknown node {value[0]}")
+
+
+class TestFxBgRemoveGraph(unittest.TestCase):
+    def test_structure_is_a_matte_at_source_fps_without_audio(self):
+        graph = wrapper_workflows.build_fx_bgremove(video="wrapper/job/clip.mp4")
+        self.assertEqual([graph[k]["class_type"] for k in sorted(graph, key=int)], [
+            "LoadVideo", "GetVideoComponents", "LoadBackgroundRemovalModel", "RemoveBackground",
+            "MaskToImage", "CreateVideo", "SaveVideo"])
+        self.assertEqual(graph["1"]["inputs"]["file"], "wrapper/job/clip.mp4")
+        self.assertEqual(graph["3"]["inputs"]["bg_removal_name"], "birefnet.safetensors")
+        self.assertEqual(graph["4"]["inputs"], {"bg_removal_model": ["3", 0], "image": ["2", 0]})
+        # The mask itself, white = subject (no InvertMask, unlike the blueprint's cut-out).
+        self.assertEqual(graph["5"]["inputs"], {"mask": ["4", 0]})
+        create = graph["6"]["inputs"]
+        self.assertEqual(create["images"], ["5", 0])
+        self.assertEqual(create["fps"], ["2", 2])
+        self.assertNotIn("audio", create)
+        self.assertEqual(graph["7"]["inputs"]["video"], ["6", 0])
+        _assert_links_resolve(self, graph)
+
+    def test_lucida_is_selectable(self):
+        graph = wrapper_workflows.build_fx_bgremove(video="v.mp4", model_name="lucida.safetensors")
+        self.assertEqual(graph["3"]["inputs"]["bg_removal_name"], "lucida.safetensors")
+
+    def test_expected_steps_are_one_per_frame(self):
+        graph = wrapper_workflows.build_fx_bgremove(video="v.mp4", frames=90)
+        self.assertEqual(graph["4"]["_meta"]["expected_steps"], 90)
+        self.assertNotIn("_meta", wrapper_workflows.build_fx_bgremove(video="v.mp4")["4"])
+
+    def test_models_come_from_the_blueprint_repo(self):
+        for model, filename in (("birefnet", "birefnet.safetensors"), ("lucida", "lucida.safetensors")):
+            (entry,) = wrapper_workflows.fx_bgremove_models(model)
+            self.assertEqual(entry["folder"], "background_removal")
+            self.assertEqual(entry["filename"], filename)
+            self.assertEqual(entry["url"], "https://huggingface.co/Comfy-Org/BiRefNet/resolve/main/"
+                                           f"background_removal/{filename}")
+
+    def test_budget(self):
+        # 15 s of 1080p30 fits the default budget; 20 s does not.
+        self.assertIsNone(wrapper_workflows.fx_bgremove_check_budget(1920, 1080, 450))
+        detail = wrapper_workflows.fx_bgremove_check_budget(1920, 1080, 600)
+        self.assertIn("600 frames of 1920x1080", detail)
+        self.assertIn("at most about 482 frames", detail)
+
+    def test_registered_without_a_prompt(self):
+        entry = wrapper_workflows.WORKFLOWS["fx-bgremove"]
+        self.assertEqual(entry["output_type"], "video")
+        self.assertFalse(entry["requires_prompt"])
+        self.assertEqual(entry["required_uploads"], ["video"])
+        self.assertTrue(entry["setup_uses_uploads"])
+        self.assertEqual(entry["uses"], [])
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_bgremove)
+
+    def test_openapi_documents_the_endpoint(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/fx-bgremove/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["video"])
+        self.assertNotIn("prompt", schema["properties"])
+        self.assertEqual(schema["properties"]["model"]["enum"], ["birefnet", "lucida"])
+        self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
+        self.assertEqual(op["operationId"], "generateFxBgremove")
+
+
+class TestFxUpscaleGraph(unittest.TestCase):
+    def test_size_reaches_the_target_short_side_within_1x_to_4x(self):
+        size = wrapper_workflows.fx_upscale_size
+        self.assertEqual(size(640, 360, 1080), (1920, 1080, 3.0))
+        self.assertEqual(size(1280, 720, 1080), (1920, 1080, 1.5))
+        self.assertEqual(size(360, 640, 1080), (1080, 1920, 3.0))  # portrait
+        # Capped at 4x: short of the target.
+        self.assertEqual(size(320, 180, 1080), (1280, 720, 4.0))
+        # Already big enough: same size (still enhanced, never downscaled).
+        self.assertEqual(size(1920, 1080, 720), (1920, 1080, 1.0))
+        # Odd-ratio sources: even sides, the short side rounded up past the target.
+        width, height, _ = size(853, 481, 1080)
+        self.assertEqual((width % 2, height % 2), (0, 0))
+        self.assertGreaterEqual(height, 1080)
+
+    def test_esrgan_picks_x2_up_to_2x_and_x4_above(self):
+        self.assertEqual(wrapper_workflows.fx_upscale_esrgan_scale(1.0), 2)
+        self.assertEqual(wrapper_workflows.fx_upscale_esrgan_scale(2.0), 2)
+        self.assertEqual(wrapper_workflows.fx_upscale_esrgan_scale(2.25), 4)
+        (x2,) = wrapper_workflows.fx_upscale_models("esrgan", 1.5)
+        self.assertEqual((x2["folder"], x2["filename"]), ("upscale_models", "RealESRGAN_x2plus.pth"))
+        self.assertTrue(x2["url"].startswith("https://github.com/xinntao/Real-ESRGAN/releases/download/"))
+        (x4,) = wrapper_workflows.fx_upscale_models("esrgan", 3.0)
+        self.assertEqual(x4["url"], "https://huggingface.co/Comfy-Org/Real-ESRGAN_repackaged/resolve/main/"
+                                    "RealESRGAN_x4plus.safetensors")
+        self.assertEqual([(m["folder"], m["filename"]) for m in wrapper_workflows.fx_upscale_models("seedvr2", 3.0)],
+                         [("diffusion_models", "seedvr2_3b_int8_convrot.safetensors"),
+                          ("vae", "seedvr2_ema_vae_fp16.safetensors")])
+
+    def test_esrgan_graph_upscales_then_scales_to_the_exact_size(self):
+        graph = wrapper_workflows.build_fx_upscale(
+            video="wrapper/job/clip.mp4", width=1920, height=1080, upscale_model_name="RealESRGAN_x4plus.safetensors",
+            frames=31, source_size=(640, 360))
+        self.assertEqual([graph[k]["class_type"] for k in sorted(graph, key=int)], [
+            "LoadVideo", "GetVideoComponents", "UpscaleModelLoader", "ImageUpscaleWithModel", "ImageScale",
+            "CreateVideo", "SaveVideo"])
+        self.assertEqual(graph["3"]["inputs"]["model_name"], "RealESRGAN_x4plus.safetensors")
+        self.assertEqual(graph["4"]["inputs"], {"upscale_model": ["3", 0], "image": ["2", 0]})
+        # 640x360 is 2x1 tiles of 512 with 32 overlap: 2 steps per frame.
+        self.assertEqual(graph["4"]["_meta"]["expected_steps"], 62)
+        self.assertEqual(graph["5"]["inputs"], {"image": ["4", 0], "upscale_method": "area",
+                                                "width": 1920, "height": 1080, "crop": "disabled"})
+        create = graph["6"]["inputs"]
+        self.assertEqual((create["images"], create["fps"]), (["5", 0], ["2", 2]))
+        self.assertNotIn("audio", create)
+        self.assertEqual(graph["7"]["inputs"]["video"], ["6", 0])
+        _assert_links_resolve(self, graph)
+
+    def test_seedvr2_graph_follows_the_blueprint_with_temporal_chunks(self):
+        graph = wrapper_workflows.build_fx_upscale(
+            video="wrapper/job/clip.mp4", width=1920, height=1080, model="seedvr2", seed=7)
+        self.assertEqual([graph[k]["class_type"] for k in sorted(graph, key=int)], [
+            "LoadVideo", "GetVideoComponents", "UNETLoader", "VAELoader", "ImageScale", "SeedVR2Preprocess",
+            "VAEEncodeTiled", "SeedVR2TemporalChunk", "SeedVR2Conditioning", "KSampler", "SeedVR2TemporalMerge",
+            "VAEDecodeTiled", "SeedVR2PostProcessing", "CreateVideo", "SaveVideo"])
+        self.assertEqual(graph["3"]["inputs"]["unet_name"], "seedvr2_3b_int8_convrot.safetensors")
+        self.assertEqual(graph["4"]["inputs"]["vae_name"], "seedvr2_ema_vae_fp16.safetensors")
+        self.assertEqual((graph["5"]["inputs"]["width"], graph["5"]["inputs"]["height"]), (1920, 1080))
+        self.assertEqual(graph["8"]["inputs"]["chunking_mode"], "auto")
+        sampler = graph["10"]["inputs"]
+        # Conditioning and the sampler both take the chunk list; the merge gets
+        # the chunker's effective overlap.
+        self.assertEqual(graph["9"]["inputs"]["vae_conditioning"], ["8", 0])
+        self.assertEqual(sampler["latent_image"], ["8", 0])
+        self.assertEqual((sampler["positive"], sampler["negative"]), (["9", 0], ["9", 1]))
+        self.assertEqual((sampler["seed"], sampler["steps"], sampler["cfg"]), (7, 1, 1.0))
+        self.assertEqual(graph["11"]["inputs"], {"latents": ["10", 0], "temporal_overlap": ["8", 1]})
+        # Post-processing crops back to the resized frames (size and frame count).
+        self.assertEqual(graph["13"]["inputs"]["original_resized_images"], ["5", 0])
+        create = graph["14"]["inputs"]
+        self.assertEqual((create["images"], create["fps"]), (["13", 0], ["2", 2]))
+        self.assertNotIn("audio", create)
+        self.assertEqual(graph["15"]["inputs"]["video"], ["14", 0])
+        _assert_links_resolve(self, graph)
+
+    def test_unknown_model_is_refused(self):
+        with self.assertRaises(ValueError):
+            wrapper_workflows.build_fx_upscale(video="v.mp4", width=64, height=64, model="waifu2x")
+
+    def test_tile_steps_match_comfy(self):
+        try:
+            from comfy.utils import get_tiled_scale_steps
+        except ImportError:
+            self.skipTest("comfy (torch) not importable")
+
+        for width, height in ((320, 180), (640, 360), (1280, 720), (1920, 1080), (513, 2000)):
+            self.assertEqual(wrapper_workflows.fx_upscale_tile_steps(width, height),
+                             get_tiled_scale_steps(width, height, 512, 512, 32))
+
+    def test_budget_counts_the_model_scale_or_seedvr2_copies(self):
+        check = wrapper_workflows.fx_upscale_check_budget
+        # 10 s of 360p30 to 1080p: esrgan x4 makes 1440p frames (1.1e9) and fits.
+        self.assertIsNone(check("esrgan", 640, 360, 300, 1920, 1080, 3.0))
+        detail = check("esrgan", 640, 360, 500, 1920, 1080, 3.0)
+        self.assertIn("esrgan x4 model (2560x1440", detail)
+        self.assertIn("at most about 406 frames", detail)
+        # seedvr2 weighs two pixel-frames per output pixel-frame.
+        self.assertIsNone(check("seedvr2", 640, 360, 300, 1920, 1080, 3.0))
+        self.assertIn("seedvr2 at 1920x1080", check("seedvr2", 640, 360, 400, 1920, 1080, 3.0))
+
+    def test_registered_without_a_prompt(self):
+        entry = wrapper_workflows.WORKFLOWS["fx-upscale"]
+        self.assertFalse(entry["requires_prompt"])
+        self.assertEqual(entry["required_uploads"], ["video"])
+        self.assertTrue(entry["setup_uses_uploads"])
+        self.assertEqual(entry["uses"], [])
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_upscale)
+
+    def test_openapi_documents_the_endpoint(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/fx-upscale/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["video"])
+        self.assertNotIn("prompt", schema["properties"])
+        self.assertEqual(schema["properties"]["model"]["enum"], ["esrgan", "seedvr2"])
+        self.assertEqual(schema["properties"]["target_short_side"]["default"], 1080)
+        self.assertIn("seed", schema["properties"])
+        self.assertEqual(op["operationId"], "generateFxUpscale")
+
+
 try:
     import torch  # noqa: F401
 
@@ -950,6 +1216,100 @@ class TestGraphValidation(unittest.TestCase):
         finally:
             for path in placeholder_paths:
                 os.remove(path)
+
+    def test_fx_interp_graph_passes_core_validation(self):
+        _prepare_env_for_comfy_import()
+        import nodes  # noqa: F401
+        import api_wrapper.routes  # noqa: F401
+        import folder_paths
+
+        async def _init():
+            await nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+
+        asyncio.run(_init())
+
+        placeholder_paths = []
+        for model in ("film", "rife"):
+            (entry,) = wrapper_workflows.fx_interp_models(model)
+            path = os.path.join(folder_paths.get_folder_paths(entry["folder"])[0], entry["filename"])
+            if not os.path.exists(path):
+                with open(path, "wb") as f:
+                    f.write(b"placeholder")
+                placeholder_paths.append(path)
+        video = os.path.join(folder_paths.get_input_directory(), "wrapper", "test_input.mp4")
+        with open(video, "wb") as f:
+            f.write(b"placeholder")
+        placeholder_paths.append(video)
+        try:
+            import execution
+
+            for factor, model in ((2, "film"), (4, "rife")):
+                graph = wrapper_workflows.build_fx_interp(
+                    video="wrapper/test_input.mp4", factor=factor,
+                    model_name=wrapper_workflows.FX_INTERP_MODELS[model], frames=10)
+                valid, error, outputs, node_errors = asyncio.run(execution.validate_prompt(
+                    f"6d3e9f2a-{factor}{len(model):04d}-4b5c-8d9e-0f1a2b3c4d5e", graph, None))
+                self.assertTrue(valid, f"fx-interp {model} graph rejected: {error}\nnode_errors: {node_errors}")
+                self.assertEqual(outputs, ["6"])
+        finally:
+            for path in placeholder_paths:
+                os.remove(path)
+
+    def _validate_with_placeholders(self, models, graphs):
+        """Core validate_prompt on each (label, graph, expected outputs), with
+        placeholder files for ``models`` and the input video."""
+        _prepare_env_for_comfy_import()
+        import nodes  # noqa: F401
+        import api_wrapper.routes  # noqa: F401
+        import folder_paths
+
+        async def _init():
+            await nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+
+        asyncio.run(_init())
+
+        placeholder_paths = []
+        for entry in models:
+            path = os.path.join(folder_paths.get_folder_paths(entry["folder"])[0], entry["filename"])
+            if not os.path.exists(path):
+                with open(path, "wb") as f:
+                    f.write(b"placeholder")
+                placeholder_paths.append(path)
+        video = os.path.join(folder_paths.get_input_directory(), "wrapper", "test_input.mp4")
+        with open(video, "wb") as f:
+            f.write(b"placeholder")
+        placeholder_paths.append(video)
+        try:
+            import execution
+
+            for index, (label, graph, expected) in enumerate(graphs):
+                valid, error, outputs, node_errors = asyncio.run(execution.validate_prompt(
+                    f"5c2d8e1f-{index:04d}-4a6b-9c7d-8e9f0a1b2c3d", graph, None))
+                self.assertTrue(valid, f"{label} graph rejected: {error}\nnode_errors: {node_errors}")
+                self.assertEqual(outputs, expected)
+        finally:
+            for path in placeholder_paths:
+                os.remove(path)
+
+    def test_fx_bgremove_graph_passes_core_validation(self):
+        models = [m for name in wrapper_workflows.FX_BGREMOVE_MODELS for m in wrapper_workflows.fx_bgremove_models(name)]
+        self._validate_with_placeholders(models, [
+            (f"fx-bgremove {name}", wrapper_workflows.build_fx_bgremove(
+                video="wrapper/test_input.mp4", model_name=filename, frames=10), ["7"])
+            for name, filename in wrapper_workflows.FX_BGREMOVE_MODELS.items()])
+
+    def test_fx_upscale_graphs_pass_core_validation(self):
+        models = (wrapper_workflows.fx_upscale_models("esrgan", 2) + wrapper_workflows.fx_upscale_models("esrgan", 4)
+                  + wrapper_workflows.fx_upscale_models("seedvr2", 4))
+        self._validate_with_placeholders(models, [
+            ("fx-upscale esrgan x2", wrapper_workflows.build_fx_upscale(
+                video="wrapper/test_input.mp4", width=1920, height=1080,
+                upscale_model_name="RealESRGAN_x2plus.pth", frames=10, source_size=(1280, 720)), ["7"]),
+            ("fx-upscale esrgan x4", wrapper_workflows.build_fx_upscale(
+                video="wrapper/test_input.mp4", width=1920, height=1080), ["7"]),
+            ("fx-upscale seedvr2", wrapper_workflows.build_fx_upscale(
+                video="wrapper/test_input.mp4", width=1920, height=1080, model="seedvr2", seed=2 ** 63), ["15"]),
+        ])
 
     def test_qwen_image_21_edit_images_reach_the_node(self):
         _prepare_env_for_comfy_import()

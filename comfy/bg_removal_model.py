@@ -8,6 +8,7 @@ import comfy.ops
 import comfy.model_patcher
 import comfy.model_management
 import comfy.storage
+import comfy.utils
 import comfy.clip_model
 import comfy.background_removal.birefnet
 
@@ -44,19 +45,18 @@ class BackgroundRemovalModel():
     def encode_image(self, image):
         comfy.model_management.load_model_gpu(self.patcher)
         H, W = image.shape[1], image.shape[2]
-        pixel_values = comfy.clip_model.clip_preprocess(image.to(self.load_device), size=self.image_size, mean=self.image_mean, std=self.image_std, crop=False)
-
-        if pixel_values.shape[0] > 1:
-            out = torch.cat([
-                self.model(pixel_values=pixel_values[i:i+1])
-                for i in range(pixel_values.shape[0])
-            ], dim=0)
-        else:
+        # One frame at a time: a video is a large batch, and moving all of its
+        # frames (and their full-size masks) to the device at once can run it
+        # out of memory.
+        pbar = comfy.utils.ProgressBar(image.shape[0])
+        masks = []
+        for i in range(image.shape[0]):
+            pixel_values = comfy.clip_model.clip_preprocess(image[i:i+1].to(self.load_device), size=self.image_size, mean=self.image_mean, std=self.image_std, crop=False)
             out = self.model(pixel_values=pixel_values)
-        out = torch.nn.functional.interpolate(out, size=(H, W), mode="bicubic", antialias=False)
-
-        mask = out.sigmoid().to(device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
-        return mask.squeeze(1)  # (B, 1, H, W) -> (B, H, W)
+            out = torch.nn.functional.interpolate(out, size=(H, W), mode="bicubic", antialias=False)
+            masks.append(out.sigmoid().to(device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype()))
+            pbar.update(1)
+        return torch.cat(masks, dim=0).squeeze(1)  # (B, 1, H, W) -> (B, H, W)
 
 
 def load_background_removal_model(sd):

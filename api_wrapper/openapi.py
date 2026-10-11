@@ -321,8 +321,12 @@ def _expanded_operation(template_operation, workflow, task, operation_suffix):
         # Likewise an image the task accepts in more than one field (image or
         # ref_images) is "one of", so only a single field can be required.
         image_fields = task.get("image_fields", ["image"])
-        schema["required"] = ([] if task.get("prompt_rewrite") else ["prompt"]) + (
-            image_fields if task.get("requires_image") and len(image_fields) == 1 else [])
+        # A workflow without a prompt (requires_prompt False) only requires its
+        # uploads.
+        prompt_required = not task.get("prompt_rewrite") and task.get("requires_prompt", True)
+        schema["required"] = (["prompt"] if prompt_required else []) + (
+            image_fields if task.get("requires_image") and len(image_fields) == 1 else []) + [
+            name for name in task.get("required_uploads", ()) if name not in image_fields]
         if task.get("quantization_options"):
             schema["properties"]["quantization"]["enum"] = task["quantization_options"]
     if task.get("prompt_rewrite") and "prompt" in schema["properties"]:
