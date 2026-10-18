@@ -485,6 +485,124 @@ class TestFxUpscaleSetup(_ProbedVideoSetup):
         self.assertEqual(self.requested, [])
 
 
+class TestProbeImage(unittest.TestCase):
+    def test_exif_orientation_turns_the_size(self):
+        """LoadImage applies EXIF orientation, so coordinates and masks use the upright size."""
+        import tempfile
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "photo.jpg")
+            exif = Image.Exif()
+            exif[0x0112] = 6  # rotate 90 degrees clockwise
+            Image.new("RGB", (40, 30)).save(path, exif=exif)
+            self.assertEqual(wrapper_routes._probe_image(path), (30, 40))
+            Image.new("RGB", (40, 30)).save(path)
+            self.assertEqual(wrapper_routes._probe_image(path), (40, 30))
+
+
+class _ProbedImageSetup(unittest.TestCase):
+    """Setup handlers that probe the uploaded still: the probe and the
+    downloads are mocked (no real image or model)."""
+
+    probe = (1024, 768)
+
+    def setUp(self):
+        self._download_models = wrapper_routes._download_models
+        self._probe_image = wrapper_routes._probe_image
+        self.requested = []
+
+        async def no_download(models, downloaded):
+            self.requested.extend((m["folder"], m["filename"]) for m in models)
+            return []
+
+        wrapper_routes._download_models = no_download
+        wrapper_routes._probe_image = lambda path: self.probe
+
+    def tearDown(self):
+        wrapper_routes._download_models = self._download_models
+        wrapper_routes._probe_image = self._probe_image
+
+    def _run(self, fields, refs=None):
+        refs = {"image": ["wrapper/job/in.png"]} if refs is None else refs
+        return asyncio.run(self.setup(fields, [], refs))
+
+    def _refused(self, fields, refs=None):
+        with self.assertRaises(wrapper_routes._SetupError) as ctx:
+            self._run(fields, refs)
+        return ctx.exception
+
+
+class TestImageSegmentSetup(_ProbedImageSetup):
+    setup = staticmethod(wrapper_routes._setup_image_segment)
+
+    def test_phrase_fetches_sam3_and_builds(self):
+        kwargs, note = self._run({"prompt": "the sky"})
+        self.assertEqual(self.requested, [("checkpoints", "sam3.1_multiplex_fp16.safetensors")])
+        self.assertEqual((kwargs["width"], kwargs["height"], kwargs["ckpt_name"]),
+                         (1024, 768, "sam3.1_multiplex_fp16.safetensors"))
+        self.assertEqual(kwargs["request"]["text"], "the sky:8")
+        self.assertEqual(note, "1024x768 segmented by 'the sky:8'; saves the union mask")
+        graph = wrapper_workflows.build_image_segment(image="wrapper/job/in.png", **kwargs)
+        self.assertEqual(graph["4"]["inputs"]["text"], "the sky:8")
+        headers = wrapper_routes._resolution_headers(kwargs, note)
+        self.assertEqual(headers["X-Wrapper-Models"], "sam3.1_multiplex_fp16.safetensors")
+        self.assertEqual(headers["X-Wrapper-Settings"], "width=1024 height=768")
+
+    def test_boxes_are_checked_against_the_probed_size(self):
+        kwargs, _ = self._run({"boxes": "[[1000, 700, 100, 100]]"})
+        self.assertEqual(kwargs["request"]["boxes"], [{"x": 1000.0, "y": 700.0, "width": 24.0, "height": 68.0}])
+        self.probe = (64, 64)
+        error = self._refused({"boxes": "[[100, 100, 10, 10]]"})
+        self.assertEqual(error.message, "Invalid segment request")
+        self.assertIn("64x64", error.details)
+
+    def test_refusals_happen_before_any_download(self):
+        self.assertEqual(self._refused({}).message, "Invalid segment request")
+        self.assertEqual(self._refused({"prompt": "sky", "boxes": "[[0,0,1,1]]"}).message, "Invalid segment request")
+        self.assertEqual(self._refused({"prompt": "sky"}, refs={}).message, "No image provided")
+
+        def broken(path):
+            raise OSError("cannot identify image file")
+
+        wrapper_routes._probe_image = broken
+        error = self._refused({"prompt": "sky"})
+        self.assertEqual(error.message, "Unreadable image")
+        self.assertIn("cannot identify image file", error.details)
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_masks_are_refused(self):
+        self.probe = (8000, 6000)  # 48 MP: fine for the union, not for 1 + 32 masks
+        self._run({"prompt": "sky"})
+        error = self._refused({"prompt": "sky", "individual_masks": "true", "max_objects": "32"})
+        self.assertIn("COMFY_IMAGE_SEGMENT_MAX_PIXEL_MASKS", error.details)
+
+
+class TestImageDescribeSetup(_ProbedImageSetup):
+    setup = staticmethod(wrapper_routes._setup_image_describe)
+
+    def test_defaults_reuse_the_qwen_image_21_encoder(self):
+        kwargs, note = self._run({})
+        self.assertEqual(kwargs, {"task": "both", "max_length": 1024, "megapixels": 0.75,
+                                  "clip_name": wrapper_workflows.QWEN_IMAGE_21_CLIP})
+        self.assertEqual(self.requested, [("text_encoders", wrapper_workflows.QWEN_IMAGE_21_CLIP)])
+        self.assertEqual(note, "1024x768 described (both) at 0.75 MP")
+        graph = wrapper_workflows.build_image_describe(image="wrapper/job/in.png", **kwargs)
+        self.assertEqual(graph["5"]["inputs"]["max_length"], 1024)
+
+    def test_large_stills_are_scaled_down(self):
+        self.probe = (4000, 3000)
+        kwargs, _ = self._run({"task": "caption", "max_length": "200"})
+        self.assertEqual((kwargs["task"], kwargs["max_length"], kwargs["megapixels"]), ("caption", 200, 1.0))
+
+    def test_refusals_happen_before_any_download(self):
+        self.assertEqual(self._refused({"task": "tags"}).message, "Invalid describe request")
+        self.assertEqual(self._refused({"max_length": "0"}).message, "Invalid describe request")
+        self.assertEqual(self._refused({}, refs={}).message, "No image provided")
+        self.assertEqual(self.requested, [])
+
+
 class TestPromptRewriteHook(unittest.TestCase):
     """The glue between an incoming request and the rewriter: which mode it
     reports, which labels it declares, and which upload it uses for visual

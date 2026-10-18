@@ -168,6 +168,27 @@ WRAPPER_OPENAPI_SPEC = {
                 },
             },
         },
+        "/api/wrapper/jobs/{job_id}/text": {
+            "get": {
+                "summary": "Get the JSON answer of a completed job",
+                "description": (
+                    "For workflows that answer with data: image-describe's caption and objects (the same JSON its "
+                    "generate call returns), and image-segment's detections with the URLs of its masks. Use it "
+                    "after polling a job whose generate call timed out (504)."),
+                "operationId": "getJobText",
+                "parameters": [
+                    {"name": "job_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}},
+                ],
+                "responses": {
+                    "200": {"description": "The job's answer.", "content": {"application/json": {"schema": {
+                        "oneOf": [{"$ref": "#/components/schemas/ImageDescribeResult"},
+                                  {"$ref": "#/components/schemas/ImageSegmentResult"}]}}}},
+                    "400": {"description": "job_id is not a canonical UUID.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+                    "404": {"description": "Unknown job id, or a workflow that answers only with files.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+                    "409": {"description": "Job has not completed yet.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+                },
+            },
+        },
     },
     "components": {
         "schemas": {
@@ -274,6 +295,40 @@ WRAPPER_OPENAPI_SPEC = {
                     "queue_position": {"type": "integer", "nullable": True, "description": "1-based place among pending jobs (1 runs next); null once running."},
                 },
             },
+            "ImageDescribeResult": {
+                "type": "object",
+                "properties": {
+                    "caption": {"type": "string", "nullable": True, "description": "One or two sentences on the whole picture; null when task=objects."},
+                    "objects": {
+                        "type": "array",
+                        "description": "Things in the picture, empty when task=caption.",
+                        "items": {"type": "object", "properties": {
+                            "label": {"type": "string", "description": "A short noun phrase, e.g. 'man in red jacket'."},
+                            "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                                     "description": "[x, y, w, h] as fractions (0-1) of the picture's width and height."},
+                        }},
+                    },
+                },
+            },
+            "ImageSegmentResult": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["prompt", "boxes", "points"]},
+                    "width": {"type": "integer", "description": "The picture's upright width; the masks' size."},
+                    "height": {"type": "integer"},
+                    "mask": {"type": "string", "description": "URL of the union mask (the generate response body)."},
+                    "objects": {
+                        "type": "array",
+                        "description": "A phrase's detections, best first; for boxes, one per box; none for points.",
+                        "items": {"type": "object", "properties": {
+                            "score": {"type": "number", "nullable": True, "description": "Detection confidence; null for a box."},
+                            "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                                     "description": "[x, y, w, h] in pixels."},
+                            "mask": {"type": "string", "description": "URL of this object's own mask (individual_masks only)."},
+                        }},
+                    },
+                },
+            },
             "Error": {
                 "type": "object",
                 "properties": {
@@ -289,7 +344,7 @@ WRAPPER_OPENAPI_SPEC = {
     },
 }
 
-OUTPUT_MEDIA_TYPES = {"video": "video/mp4", "audio": "audio/wav"}
+OUTPUT_MEDIA_TYPES = {"video": "video/mp4", "audio": "audio/wav", "json": "application/json"}
 
 
 def _expanded_operation(template_operation, workflow, task, operation_suffix):
@@ -358,6 +413,13 @@ def _expanded_operation(template_operation, workflow, task, operation_suffix):
             description=f"{schema['properties'][target]['description']} Example:"
                         f"\n\n{task['example_prompt']}")
     media_type = OUTPUT_MEDIA_TYPES.get(workflow.get("output_type"), "image/png")
+    if media_type == "application/json":
+        # A data answer, not a file: the same JSON as GET /jobs/{job_id}/text.
+        operation["responses"]["200"]["description"] = "The workflow's JSON answer."
+        schema = ({"$ref": f"#/components/schemas/{workflow['result_schema']}"}
+                  if workflow.get("result_schema") else {"type": "object"})
+        operation["responses"]["200"]["content"] = {media_type: {"schema": schema}}
+        return operation
     operation["responses"]["200"]["content"] = {
         media_type: {"schema": {"type": "string", "format": "binary"}},
         "application/octet-stream": {"schema": {"type": "string", "format": "binary"}},

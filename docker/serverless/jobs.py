@@ -154,7 +154,10 @@ class Wrapper:
         return response.json()
 
     def output(self, job_id: str) -> requests.Response:
+        """The job's file, or the JSON answer of a workflow that saves none (image-describe)."""
         response = self.session.get(f"{self.base_url}/api/wrapper/jobs/{job_id}/image", timeout=300)
+        if response.status_code == 404:
+            response = self.session.get(f"{self.base_url}/api/wrapper/jobs/{job_id}/text", timeout=30)
         if response.status_code != 200:
             raise JobError(f"could not read the output (HTTP {response.status_code}: {error_text(response)})")
         return response

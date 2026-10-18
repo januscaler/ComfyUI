@@ -5,10 +5,14 @@ and the graph structure is easy to audit. It builds ComfyUI API-format prompt
 graphs (as accepted by POST /prompt) and declares the models a workflow needs.
 """
 
+import json
 import math
 import os
 
+from api_wrapper import describe as image_describe
+from api_wrapper import segment as image_segment
 from api_wrapper.prompt_rewriter import MODEL_OPTIONS as MINIMAX_H3_LLM_MODELS
+from api_wrapper.results import tag_result
 
 # Models required by the FLUX.2 [klein] 9B image edit workflow, with the exact
 # files expected by the loaders in the graph below. The URLs match the
@@ -1189,6 +1193,153 @@ FX_UPSCALE_FORM_EXTRA = {
 }
 
 
+def upright_size(width, height, orientation):
+    """A still's (width, height) once its EXIF orientation is applied, the way
+    LoadImage (ImageOps.exif_transpose) hands it to the graph: orientations 5-8
+    turn it a quarter, which swaps the sides."""
+    return (height, width) if orientation in (5, 6, 7, 8) else (width, height)
+
+
+def _first_frame(image):
+    """LoadImage + the first frame only: a GIF loads as a batch of frames, and
+    these workflows answer for one picture."""
+    return {
+        "2": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "3": {"class_type": "ImageFromBatch", "inputs": {"image": ["2", 0], "batch_index": 0, "length": 1}},
+    }
+
+
+# Image Studio's "select by name": SAM 3.1 (facebook/sam3.1, SAM License)
+# repackaged as one checkpoint -- detector, tracker and its own CLIP text
+# encoder -- the one the shipped "Image Segmentation (SAM3)" blueprint loads.
+IMAGE_SEGMENT_CKPT = "sam3.1_multiplex_fp16.safetensors"
+IMAGE_SEGMENT_MODELS = [
+    {"folder": "checkpoints", "filename": IMAGE_SEGMENT_CKPT,
+     "url": f"https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/{IMAGE_SEGMENT_CKPT}"},
+]
+# SAM3_Detect's own default: decoder refinement passes per mask.
+IMAGE_SEGMENT_REFINE_ITERATIONS = 2
+
+
+def build_image_segment(*, image, request, width, height, ckpt_name=IMAGE_SEGMENT_CKPT,
+                        filename_prefix="wrapper/image_segment"):
+    """Image segmentation: still + a phrase, boxes or points -> grayscale PNG
+    mask(s) at the still's upright size, white = selected.
+
+    ``request`` is api_wrapper.segment.segment_request()'s output. The PNGs
+    are one batch: the union of everything selected first, then (with
+    individual_masks) one per object. SAM3_Detect gives either the union or
+    the per-object masks, not both, so that case runs it twice -- the second
+    pass is a fraction of a second -- and batches the union in front, which
+    also keeps a request that finds nothing a single black mask rather than
+    no file. The detections reach the job's history through a PreviewAny
+    tagged as the job's JSON answer (GET /wrapper/jobs/{job_id}/text)."""
+    detect = {"model": ["1", 0], "image": ["3", 0], "threshold": request["threshold"],
+              "refine_iterations": IMAGE_SEGMENT_REFINE_ITERATIONS, "individual_masks": False}
+    graph = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+             **_first_frame(image)}
+    mode = request["mode"]
+    tag = {"mode": mode, "width": width, "height": height, "individual_masks": request["individual_masks"]}
+    if mode == "prompt":
+        # SAM 3's own text encoder, from the checkpoint's CLIP output.
+        graph["4"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": request["text"]}}
+        detect["conditioning"] = ["4", 0]
+    elif mode == "boxes":
+        # Wrapped: a bare list is read as a link to another node.
+        detect["bboxes"] = {"__value__": request["boxes"]}
+        tag["boxes"] = [image_segment.box_xywh(box) for box in request["boxes"]]
+    else:
+        detect["positive_coords"] = json.dumps(request["positive"])
+        if request["negative"]:
+            detect["negative_coords"] = json.dumps(request["negative"])
+    graph["5"] = {"class_type": "SAM3_Detect", "inputs": detect}
+    masks, detections = ["5", 0], ["5", 1]
+    if request["individual_masks"]:
+        graph["6"] = {"class_type": "SAM3_Detect", "inputs": {**detect, "individual_masks": True}}
+        graph["7"] = {"class_type": "BatchMasksNode", "inputs": {"masks.mask0": ["5", 0], "masks.mask1": ["6", 0]}}
+        masks, detections = ["7", 0], ["6", 1]
+    graph["8"] = {"class_type": "MaskToImage", "inputs": {"mask": masks}}
+    graph["9"] = {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": filename_prefix}}
+    graph["10"] = tag_result({"class_type": "PreviewAny", "inputs": {"source": detections}}, "image-segment", **tag)
+    return graph
+
+
+IMAGE_SEGMENT_FORM_EXTRA = {
+    "image": {"type": "string", "format": "binary",
+              "description": "The picture (png, jpg, webp, bmp or gif; a GIF's first frame). Every coordinate "
+                             "below, and the masks, use its upright size: after its EXIF orientation."},
+    "prompt": {"type": "string",
+               "description": "What to select, as a short noun phrase: 'the sky', 'person', 'red car'. Commas "
+                              f"separate phrases (up to {image_segment.SEGMENT_MAX_PHRASES}), each found "
+                              "separately. SAM 3 finds every instance of a concept; it does not resolve "
+                              "relations like 'the person on the left' -- send that object's box instead. "
+                              "Send exactly one of prompt, boxes or positive_coords."},
+    "boxes": {"type": "string",
+              "description": "JSON list of pixel boxes [[x, y, w, h], ...] (up to "
+                             f"{image_segment.SEGMENT_MAX_OBJECTS}); each is segmented on its own. A box past "
+                             "the edge is clipped to the picture."},
+    "positive_coords": {"type": "string",
+                        "description": "JSON list of pixel points [[x, y], ...] on the thing to select "
+                                       "(tap-to-select). Points make one mask."},
+    "negative_coords": {"type": "string",
+                        "description": "JSON list of pixel points [[x, y], ...] to keep out of the selection; "
+                                       "only with positive_coords."},
+    "threshold": {"type": "number", "minimum": 0, "maximum": 1, "default": image_segment.SEGMENT_DEFAULT_THRESHOLD,
+                  "description": "Detection confidence a phrase's object needs to be selected."},
+    "max_objects": {"type": "integer", "minimum": 1, "maximum": image_segment.SEGMENT_MAX_OBJECTS,
+                    "default": image_segment.SEGMENT_DEFAULT_MAX_OBJECTS,
+                    "description": "Most objects kept per phrase, best first."},
+    "individual_masks": {"type": "boolean", "default": False,
+                         "description": "Also save one mask per object (phrases and boxes), after the union. "
+                                        "The response body stays the union; GET /api/wrapper/jobs/{job_id}/text "
+                                        "pairs each object with its mask's URL."},
+}
+
+
+# Image Studio's "look": the Qwen3-VL 8B text encoder Qwen Image 2.1 loads
+# (its int8_convrot file carries the language-model head), so describing a
+# picture needs no download of its own.
+IMAGE_DESCRIBE_CLIP = QWEN_IMAGE_21_CLIP
+IMAGE_DESCRIBE_MODELS = [m for m in qwen_image_21_models("int8") if m["folder"] == "text_encoders"]
+
+
+def build_image_describe(*, image, task=image_describe.DESCRIBE_DEFAULT_TASK,
+                         max_length=image_describe.DESCRIBE_DEFAULT_MAX_LENGTH,
+                         megapixels=image_describe.DESCRIBE_MEGAPIXELS, clip_name=IMAGE_DESCRIBE_CLIP,
+                         filename_prefix=None):
+    """Image description: still -> Qwen3-VL's JSON answer to a fixed prompt
+    (api_wrapper/describe.py), as the job's JSON answer. Nothing is saved to
+    disk, so ``filename_prefix`` is unused.
+
+    The CLIP loads as a plain Qwen3-VL ('stable_diffusion' type: no image
+    model's template around the prompt) and decodes greedily, so one picture
+    always gets the same answer. ``megapixels`` is the still's budget
+    (describe_megapixels: scaled down, never up)."""
+    return {
+        "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "stable_diffusion", "device": "default"}},
+        **_first_frame(image),
+        "4": {"class_type": "ImageScaleToTotalPixels", "inputs": {
+            "image": ["3", 0], "upscale_method": "area", "megapixels": megapixels, "resolution_steps": 1}},
+        "5": {"class_type": "TextGenerate", "inputs": {
+            "clip": ["1", 0], "prompt": image_describe.describe_prompt(task), "image": ["4", 0],
+            "max_length": max_length, "sampling_mode": "off"}},
+        "6": tag_result({"class_type": "PreviewAny", "inputs": {"source": ["5", 0]}}, "image-describe", task=task),
+    }
+
+
+IMAGE_DESCRIBE_FORM_EXTRA = {
+    "image": {"type": "string", "format": "binary",
+              "description": "The picture (png, jpg, webp, bmp or gif; a GIF's first frame)."},
+    "task": {"type": "string", "enum": list(image_describe.DESCRIBE_TASKS),
+             "default": image_describe.DESCRIBE_DEFAULT_TASK,
+             "description": "'caption' (one or two sentences), 'objects' (labels with boxes) or 'both'."},
+    "max_length": {"type": "integer", "minimum": 1, "maximum": image_describe.DESCRIBE_MAX_LENGTH,
+                   "default": image_describe.DESCRIBE_DEFAULT_MAX_LENGTH,
+                   "description": "Most tokens the model writes. An answer cut short keeps the objects "
+                                  "completed before the cut."},
+}
+
+
 """The wrapper API's workflow registry.
 
 Each entry describes one dedicated workflow API: ``build`` constructs the
@@ -1205,6 +1356,12 @@ A workflow that takes no prompt sets ``requires_prompt: False``;
 ``required_uploads`` names upload fields that must be present (any kind, not
 just images); ``setup_uses_uploads`` hands the saved upload refs to the setup
 handler (e.g. to probe an uploaded video before queueing).
+
+A workflow that answers with data declares ``text_result``, a pure parser
+``(text, tag, images) -> dict`` of the node its graph tags with
+api_wrapper.results.tag_result; GET /wrapper/jobs/{job_id}/text serves it.
+With ``output_type: "json"`` that answer is also the generate response body,
+for workflows that save no file.
 """
 
 WORKFLOWS = {
@@ -1397,5 +1554,33 @@ WORKFLOWS = {
         "form": ["video", "model", "target_short_side", "seed"],
         "extra_form_properties": FX_UPSCALE_FORM_EXTRA,
         "build": build_fx_upscale,
+    },
+    "image-segment": {
+        "title": "Image segmentation by phrase, box or point (SAM 3)",
+        "requires_image": True,
+        # The phrase is one of three ways to say what to select (setup checks).
+        "requires_prompt": False,
+        "setup_uses_uploads": True,
+        "uploads": {"image": {"ext": "image", "max": 1}},
+        "uses": [],
+        "form": ["image", "prompt", "boxes", "positive_coords", "negative_coords", "threshold",
+                 "max_objects", "individual_masks"],
+        "extra_form_properties": IMAGE_SEGMENT_FORM_EXTRA,
+        "text_result": image_segment.segment_result,
+        "build": build_image_segment,
+    },
+    "image-describe": {
+        "title": "Image caption and objects (Qwen3-VL)",
+        "output_type": "json",
+        "result_schema": "ImageDescribeResult",
+        "requires_image": True,
+        "requires_prompt": False,
+        "setup_uses_uploads": True,
+        "uploads": {"image": {"ext": "image", "max": 1}},
+        "uses": [],
+        "form": ["image", "task", "max_length"],
+        "extra_form_properties": IMAGE_DESCRIBE_FORM_EXTRA,
+        "text_result": image_describe.describe_result,
+        "build": build_image_describe,
     },
 }

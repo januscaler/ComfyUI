@@ -88,6 +88,7 @@ A simplified REST API on top of the regular ComfyUI API (`api_wrapper/`). It hid
 - `POST /api/wrapper/{workflow}/generate` — multipart form with `prompt` and `image` (optional `negative_prompt`, `seed`, `steps`, `cfg`, `megapixels`, `timeout`, `free_vram`, `quantization`). Runs the workflow to completion and returns the final file as a download (`Content-Disposition: attachment`). By default the request waits as long as the job takes; set `timeout` (5–86400 seconds) if you prefer a cap — the timeout response includes the `job_id` to pick the result up via `/jobs/{job_id}`. `GET /api/wrapper/workflows` lists the available `{workflow}` names.
 - `GET /api/wrapper/jobs/{job_id}` — job status (`pending` / `in_progress` / `completed` / `failed` / `cancelled`) with output image URLs; also useful to pick up a generate call that timed out (the timeout response includes the `job_id`).
 - `GET /api/wrapper/jobs/{job_id}/image` — redirects to the generated image.
+- `GET /api/wrapper/jobs/{job_id}/text` — the JSON answer of a workflow that answers with data (`image-describe`, `image-segment`; see below); 404 for workflows that only save files, 409 until the job completed.
 - `DELETE /api/wrapper/jobs/{job_id}` — worker cleanup once you have stored the result (or after a failure/cancel): deletes the job's output files, the uploads saved for it and its history entry, and answers `{"deleted": {"outputs": n, "inputs": m, "history": true|false}, "refused": 0}`. Idempotent (unknown job → zeros), `409` while the job is pending/running, and it never deletes anything outside ComfyUI's output/input/temp directories (real paths are checked; symlinks pointing out are refused). Each job's uploads and outputs live in their own `wrapper/<job_id>/` folder under `input/` and `output/`.
 - `POST /api/wrapper/free` — releases the GPU VRAM and RAM used by model execution (unloads all models, empties torch caches). When a job is running/queued the release happens automatically right after that job finishes.
 - `GET /api/wrapper/docs` — Swagger UI for the wrapper API (spec at `/api/wrapper/openapi.json`).
@@ -123,7 +124,7 @@ A rewrite takes 10–20 s (it is one call to a large model), so allow at least 6
 
 **Interactive docs:** with the server running, open `http://127.0.0.1:8188/api/wrapper/docs` in a browser to browse and try every endpoint (the "Try it out" button works — you can upload an image and generate right from the docs page). The raw OpenAPI spec is at `http://127.0.0.1:8188/api/wrapper/openapi.json` for code generation; swap the port if you started ComfyUI elsewhere.
 
-The first workflow shipped is `flux2klein9b`, a FLUX.2 [klein] 9B image edit: the input image is scaled to a megapixel budget, attached to the conditioning as a reference latent, and sampled with the flux2 custom sampler stack. `qwenimage21` is the Qwen Image 2.1 image edit and `qwenimage21-txt2img` its text-to-image variant, both built like the official Qwen Image 2.1 templates (int8_convrot UNET and text encoder, `quantization=bf16` for the full-precision pair; 25 steps, cfg 1): the edit takes `image` and/or up to 15 `ref_images`, named `<image1>`, `<image2>`, ... in the prompt, and edits image 1. `ideogram4` is a text-to-image workflow (no input image needed) using the Ideogram 4 dual-model CFG stack — it natively understands rich structured JSON prompts, e.g. `curl -F "prompt=$(cat prompt.json)"` with a JSON prompt describing composition, style and elements; the full example (with bounding boxes per element) is shown in the interactive docs. `minimaxh3` is an omni-modal video workflow with three task endpoints under `/api/wrapper/minimaxh3/{task}`: `text` (text-to-video), `image` (image-to-video, first/last frame uploads) and `reference` (ref2va: up to 9 reference images, 3 videos and 3 audio clips, referenced in the prompt as `<Picture i>` / `<Video k>` / `<Audio j>`); it returns a synchronized audio+video MP4. `fx-interp` (slow motion), `fx-bgremove` (background matte) and `fx-upscale` (video upscale) are FloStudio's AI video effects (see below): no prompt, just a `video` upload and a few options. To add another workflow (e.g. a 3D model generator), add its graph builder to the `WORKFLOWS` registry in `api_wrapper/workflows.py`, a model-setup handler in `api_wrapper/routes.py`, and it immediately gets its own `/api/wrapper/{name}/generate` endpoint — output files (video/audio/3D) are detected automatically by their node output type. All endpoints are also available without the `/api` prefix.
+The first workflow shipped is `flux2klein9b`, a FLUX.2 [klein] 9B image edit: the input image is scaled to a megapixel budget, attached to the conditioning as a reference latent, and sampled with the flux2 custom sampler stack. `qwenimage21` is the Qwen Image 2.1 image edit and `qwenimage21-txt2img` its text-to-image variant, both built like the official Qwen Image 2.1 templates (int8_convrot UNET and text encoder, `quantization=bf16` for the full-precision pair; 25 steps, cfg 1): the edit takes `image` and/or up to 15 `ref_images`, named `<image1>`, `<image2>`, ... in the prompt, and edits image 1. `ideogram4` is a text-to-image workflow (no input image needed) using the Ideogram 4 dual-model CFG stack — it natively understands rich structured JSON prompts, e.g. `curl -F "prompt=$(cat prompt.json)"` with a JSON prompt describing composition, style and elements; the full example (with bounding boxes per element) is shown in the interactive docs. `minimaxh3` is an omni-modal video workflow with three task endpoints under `/api/wrapper/minimaxh3/{task}`: `text` (text-to-video), `image` (image-to-video, first/last frame uploads) and `reference` (ref2va: up to 9 reference images, 3 videos and 3 audio clips, referenced in the prompt as `<Picture i>` / `<Video k>` / `<Audio j>`); it returns a synchronized audio+video MP4. `fx-interp` (slow motion), `fx-bgremove` (background matte) and `fx-upscale` (video upscale) are FloStudio's AI video effects (see below): no prompt, just a `video` upload and a few options. `image-segment` (SAM 3 masks by phrase, box or point) and `image-describe` (Qwen3-VL caption and objects as JSON) are Image Studio's picture analysis (see below). To add another workflow (e.g. a 3D model generator), add its graph builder to the `WORKFLOWS` registry in `api_wrapper/workflows.py`, a model-setup handler in `api_wrapper/routes.py`, and it immediately gets its own `/api/wrapper/{name}/generate` endpoint — output files (video/audio/3D) are detected automatically by their node output type. All endpoints are also available without the `/api` prefix.
 
 **Slow motion (`fx-interp`):** `POST /api/wrapper/fx-interp/generate` takes a `video` upload (mp4/webm/mov/mkv/avi/gif, no `prompt`) and two optional fields: `factor` (`2` or `4`, default `2`) and `model` (`film`, default, or `rife`). It runs the core FILM / RIFE frame interpolation nodes (`comfy_extras/nodes_frame_interpolation.py`) to make `factor` frames per source frame — `(frames-1)*factor+1` in all — and encodes them as an H.264 MP4 at the **source** frame rate, so the clip plays `factor`x slower at the same size. The output has no audio track (a slowed soundtrack would be pitched down; keep the original). `film` (FILM, `film_net_fp16.safetensors`, 69 MB) is what the shipped "Frame Interpolation" blueprint uses and holds up best on large motion; `rife` (RIFE 4.26, `rife_v4.26.safetensors`, 23 MB) is several times faster. Both come from [Comfy-Org/frame_interpolation](https://huggingface.co/Comfy-Org/frame_interpolation) into `models/frame_interpolation/` and are downloaded on first use like every other wrapper checkpoint. The `X-Wrapper-Note` header reports the probe (`61 frames of 1280x720 -> 121 frames with film at the source 30 fps (2x slower, no audio)`), and `GET /api/wrapper/jobs/{job_id}` reports `progress` per interpolation pass, reserved from the start. The interpolated frames are held in host RAM as float32, so the wrapper probes the upload first and refuses (400) a clip whose output frames × pixels pass `COMFY_FX_INTERP_MAX_PIXEL_FRAMES` (default 1e9, about 12 GB: e.g. 4 s of 1080p30 at 4x, 8 s at 2x, 18 s of 720p30 at 2x); set it in the container environment to change it.
 
@@ -147,6 +148,64 @@ The full-size frames sit in host RAM as float32, so the wrapper refuses (400) a 
 ```bash
 curl -o big.mp4 -X POST http://127.0.0.1:8188/api/wrapper/fx-upscale/generate \
   -F "video=@clip.mp4" -F "model=esrgan" -F "target_short_side=1080"
+```
+
+### Image Studio analysis (`image-segment`, `image-describe`)
+
+Image Studio's "select by name" and the assistant's "look". Both take one `image` upload (png/jpg/webp/bmp, or a GIF's first frame) and no generation prompt. Every pixel coordinate and every mask uses the picture's **upright** size, i.e. after its EXIF orientation (what LoadImage hands the graph). The `X-Wrapper-Job-Id` header names the job either way. A caller that sends `timeout` and gets a 504 polls `GET /api/wrapper/jobs/{job_id}`, then reads the masks from its `images` and the JSON from `GET /api/wrapper/jobs/{job_id}/text`.
+
+**`POST /api/wrapper/image-segment/generate`** runs SAM 3.1 (`SAM3_Detect`, `comfy_extras/nodes_sam3.py`) on the picture.
+- Send exactly one of:
+  - `prompt`: a short noun phrase (`the sky`, `person`, `red car`), or up to 8 separated by commas, each found separately. SAM 3 finds every instance of a concept. It does not resolve relations like "the person on the left": get that object's box from `image-describe` and send it as `boxes`.
+  - `boxes`: a JSON list of pixel boxes `[[x, y, w, h], ...]`, up to 32, each segmented on its own. A box past the edge is clipped.
+  - `positive_coords`: a JSON list of pixel points `[[x, y], ...]` (tap to select), with optional `negative_coords` to keep out. Points make one mask.
+- Options: `threshold` (0.5, a phrase's detection confidence), `max_objects` (8, objects kept per phrase, at most 32) and `individual_masks` (false).
+- **Response body:** the union mask as a PNG. It is the picture's upright size and 8-bit RGB with R=G=B: 255 is selected, 0 is not, with no soft edge. A request that finds nothing still answers 200, with an all-black mask.
+- With `individual_masks=true` the job also saves one mask per object (phrases and boxes) after the union. `GET /api/wrapper/jobs/{job_id}` lists them in `images`: index 0 is the union, then one per object.
+- `GET /api/wrapper/jobs/{job_id}/text` answers:
+
+  ```json
+  {"mode": "prompt", "width": 1024, "height": 768,
+   "mask": "/view?filename=image-segment_00001_.png&subfolder=wrapper/<job_id>&type=output",
+   "objects": [{"score": 0.94, "bbox": [0.0, 0.0, 1024.0, 310.5],
+                "mask": "/view?filename=image-segment_00002_.png&subfolder=wrapper/<job_id>&type=output"}]}
+  ```
+
+  - For a phrase, `objects` are SAM 3's detections, best first, with `bbox` = `[x, y, w, h]` in pixels.
+  - For boxes, `objects` are the clipped boxes with `score: null`.
+  - For points, `objects` is empty.
+  - Each object carries its own `mask` URL only with `individual_masks`.
+- **Model:** `sam3.1_multiplex_fp16.safetensors`, 1.7 GB in `models/checkpoints/`, from [Comfy-Org/sam3.1](https://huggingface.co/Comfy-Org/sam3.1). It is the "Image Segmentation (SAM3)" blueprint's file and is fetched on first use (`prefetch image-segment` fetches it ahead).
+- **Licence:** Meta's SAM License. It allows commercial use, with no non-commercial clause, user cap or fee. It forbids military/ITAR uses and use by anyone under trade sanctions, requires use that complies with privacy law, and requires shipping the licence with any redistributed weights (the image ships none).
+- **Memory:** every mask is held in host RAM as float32, twice. The wrapper refuses (400) a request whose pixels × possible masks pass `COMFY_IMAGE_SEGMENT_MAX_PIXEL_MASKS` (default 5e8, e.g. a 12 MP photo with 33 masks).
+
+**`POST /api/wrapper/image-describe/generate`** asks Qwen3-VL 8B for JSON, through `TextGenerate` with a fixed prompt. It uses Qwen Image 2.1's own `qwen3vl_8b_int8_convrot.safetensors` encoder, so it downloads nothing new.
+- Fields: `task` (`caption`, `objects` or `both`, the default) and `max_length` (1024 tokens).
+- The picture is scaled down (never up) to about 1 MP before the model sees it.
+- Decoding is greedy, so the same picture gets the same answer.
+- **Response body** (and `GET /api/wrapper/jobs/{job_id}/text`), `application/json`:
+
+  ```json
+  {"caption": "A lighthouse on a cliff at sunset.",
+   "objects": [{"label": "lighthouse", "bbox": [0.6, 0.2, 0.1, 0.6]}]}
+  ```
+
+  - `bbox` is `[x, y, w, h]` as fractions (0–1) of the picture's width and height.
+  - `caption` is `null` for `task=objects`.
+  - `objects` is empty for `task=caption`.
+- The model's answer is parsed tolerantly:
+  - prose or code fences around the JSON are ignored;
+  - boxes on Qwen3-VL's 0–1000 grounding scale or already in 0–1 are both handled; corners in either order are accepted, and boxes are clipped to the picture;
+  - an answer cut off by `max_length` keeps the objects completed before the cut;
+  - an answer with no JSON at all becomes the caption.
+- At most 32 objects are kept.
+
+Typical timings on the RTX 5090 rig (cold = the model loads first, warm = `free_vram=false` on the previous job): see the image-segment / image-describe PR (januscaler/ComfyUI) for the measured table.
+
+```bash
+curl -o sky.png -X POST http://127.0.0.1:8188/api/wrapper/image-segment/generate \
+  -F "image=@landscape.jpg" -F "prompt=the sky"
+curl -s -X POST http://127.0.0.1:8188/api/wrapper/image-describe/generate -F "image=@landscape.jpg"
 ```
 
 ### Authentication

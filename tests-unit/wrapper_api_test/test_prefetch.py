@@ -36,6 +36,13 @@ class TestPrefetchSpecs(unittest.TestCase):
         self.assertIn(wf.MINIMAX_H3_UNET_FP8, files)
         self.assertIn(wf.MINIMAX_H3_CLIP_NVFP4, files)
 
+    def test_image_studio_specs(self):
+        """Select-by-name is SAM 3.1's checkpoint; describe reuses Qwen Image 2.1's encoder."""
+        self.assertEqual(_prefetch().models_for("image-segment"), wf.IMAGE_SEGMENT_MODELS)
+        (describe,) = _prefetch().models_for("Image-Describe")
+        self.assertEqual((describe["folder"], describe["filename"]), ("text_encoders", wf.QWEN_IMAGE_21_CLIP))
+        self.assertIn(describe, _prefetch().models_for("qwenimage21"))
+
 
 if __name__ == "__main__":
     unittest.main()

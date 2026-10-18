@@ -94,7 +94,11 @@ class FakeWrapper(http.server.BaseHTTPRequestHandler):
             record = statuses.pop(0) if len(statuses) > 1 else statuses[0]
             return self._json(200, record)
         if self.path == f"/api/wrapper/jobs/{JOB_ID}/image":
+            if self.state.get("answer") is not None:  # a JSON-answer job (image-describe) saved no image
+                return self._json(404, {"error": {"message": "Job has no image output"}})
             return self._send(302, headers={"Location": "/view?filename=clip.mp4&subfolder=&type=output"})
+        if self.path == f"/api/wrapper/jobs/{JOB_ID}/text" and self.state.get("answer") is not None:
+            return self._json(200, self.state["answer"])
         if self.path.startswith("/view"):
             return self._send(200, VIDEO, {"Content-Type": "video/mp4"})
         if self.path == "/api/wrapper/workflows":
@@ -160,6 +164,17 @@ class TestRunJob(unittest.TestCase):
             {"status": "in_progress", "percent": 40, "step": 8, "node": "SamplerCustomAdvanced"},
         ])
         self.assertIn(("GET", "/view?filename=clip.mp4&subfolder=&type=output"), FakeWrapper.state["calls"])
+
+    def test_slow_json_answer_is_read_from_the_text_route(self):
+        """image-describe saves no file: after a 504 its answer comes from /text."""
+        answer = {"caption": "A beach.", "objects": []}
+        FakeWrapper.state.update(submit=(504, {"error": {"type": "timeout"}, "job_id": JOB_ID}), answer=answer,
+                                 statuses=[{"id": JOB_ID, "status": "completed", "images": []}])
+        result = self.run_job({"workflow": "image-describe"})
+        self.assertEqual(FakeWrapper.state["submits"][0]["path"], "/api/wrapper/image-describe/generate")
+        self.assertEqual(json.loads(base64.b64decode(result["base64"])), answer)
+        self.assertEqual((result["content_type"], result["filename"]), ("application/json", None))
+        self.assertIn(("GET", f"/api/wrapper/jobs/{JOB_ID}/text"), FakeWrapper.state["calls"])
 
     def test_rewrite_sends_prompt_and_a_given_workflow_has_no_default_task(self):
         self.run_job({"workflow": "flux2klein9b-txt2img", "prompt": "A red fox", "rewrite": True,
