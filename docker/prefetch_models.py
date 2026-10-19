@@ -15,6 +15,8 @@ Specs name a workflow and, for MiniMax H3 or Qwen Image 2.1, a quantization:
     minimaxh3-ref[:quant]  reference-to-video (ref2va) UNET + the same encoder/VAEs
     flux2klein9b           FLUX.2 [klein] 9B stills (gated on Hugging Face: HF_TOKEN)
     qwenimage21[:quant]    Qwen Image 2.1 stills: int8 (default) or bf16 UNET + encoder
+    image-segment          SAM 3.1 select-by-name masks (1.7 GB, Meta's SAM License)
+    image-describe         Qwen3-VL 8B captions/objects: Qwen Image 2.1's int8 encoder
 
 H3 quantizations are the wrapper's: nvfp4 (fp8 UNET), int8, fp8, bf16; they pick
 the UNET. The text encoder is always the one the wrapper loads at render time,
@@ -64,7 +66,12 @@ def models_for(spec: str) -> list[dict]:
         if quant not in wf.QWEN_IMAGE_21_QUANT_MODELS:
             raise SystemExit(f"prefetch: unknown quantization {quant!r} (one of {', '.join(wf.QWEN_IMAGE_21_QUANT_MODELS)})")
         return wf.qwen_image_21_models(quant)
-    raise SystemExit(f"prefetch: unknown spec {spec!r} (minimaxh3[:quant], minimaxh3-ref[:quant], flux2klein9b, qwenimage21[:quant])")
+    if name == "image-segment":
+        return list(wf.IMAGE_SEGMENT_MODELS)
+    if name == "image-describe":
+        return list(wf.IMAGE_DESCRIBE_MODELS)
+    raise SystemExit(f"prefetch: unknown spec {spec!r} (minimaxh3[:quant], minimaxh3-ref[:quant], flux2klein9b, "
+                     "qwenimage21[:quant], image-segment, image-describe)")
 
 
 def main(argv: list[str]) -> int:

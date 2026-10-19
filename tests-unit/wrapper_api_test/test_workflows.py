@@ -3,6 +3,7 @@ OpenAPI spec. The graph validation test at the end only runs when torch is
 available (it loads the real node registry)."""
 
 import asyncio
+import json
 import os
 import sys
 import unittest
@@ -986,6 +987,147 @@ class TestFxUpscaleGraph(unittest.TestCase):
         self.assertEqual(op["operationId"], "generateFxUpscale")
 
 
+def _segment_graph(width=640, height=480, **fields):
+    from api_wrapper import segment
+    request = segment.segment_request(fields, width, height)
+    return wrapper_workflows.build_image_segment(
+        image="wrapper/test_input.png", request=request, width=width, height=height,
+        filename_prefix="wrapper/job/image-segment")
+
+
+def _assert_links_resolve(case, graph):
+    for node_id, node in graph.items():
+        for name, value in node["inputs"].items():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                case.assertIn(value[0], graph, f"node {node_id}.{name} links to missing node {value[0]}")
+
+
+class TestImageSegmentGraph(unittest.TestCase):
+    def test_phrase_runs_sam3_on_its_own_text_encoder(self):
+        graph = _segment_graph(prompt="the sky")
+        self.assertEqual({k: v["class_type"] for k, v in graph.items()}, {
+            "1": "CheckpointLoaderSimple", "2": "LoadImage", "3": "ImageFromBatch", "4": "CLIPTextEncode",
+            "5": "SAM3_Detect", "8": "MaskToImage", "9": "SaveImage", "10": "PreviewAny"})
+        self.assertEqual(graph["1"]["inputs"]["ckpt_name"], "sam3.1_multiplex_fp16.safetensors")
+        self.assertEqual(graph["3"]["inputs"], {"image": ["2", 0], "batch_index": 0, "length": 1})
+        self.assertEqual(graph["4"]["inputs"], {"clip": ["1", 1], "text": "the sky:8"})
+        self.assertEqual(graph["5"]["inputs"], {
+            "model": ["1", 0], "image": ["3", 0], "conditioning": ["4", 0], "threshold": 0.5,
+            "refine_iterations": 2, "individual_masks": False})
+        self.assertEqual(graph["8"]["inputs"]["mask"], ["5", 0])
+        self.assertEqual(graph["9"]["inputs"]["filename_prefix"], "wrapper/job/image-segment")
+        self.assertEqual(graph["10"]["inputs"], {"source": ["5", 1]})
+        self.assertEqual(graph["10"]["_meta"], {"wrapper_result": {
+            "workflow": "image-segment", "mode": "prompt", "width": 640, "height": 480, "individual_masks": False}})
+        _assert_links_resolve(self, graph)
+
+    def test_individual_masks_batch_the_union_first(self):
+        graph = _segment_graph(prompt="person", individual_masks="true", max_objects="3", threshold="0.4")
+        self.assertEqual(graph["4"]["inputs"]["text"], "person:3")
+        self.assertEqual(graph["6"]["class_type"], "SAM3_Detect")
+        self.assertEqual(graph["6"]["inputs"], {**graph["5"]["inputs"], "individual_masks": True})
+        self.assertEqual(graph["5"]["inputs"]["threshold"], 0.4)
+        self.assertEqual(graph["7"], {"class_type": "BatchMasksNode",
+                                      "inputs": {"masks.mask0": ["5", 0], "masks.mask1": ["6", 0]}})
+        self.assertEqual(graph["8"]["inputs"]["mask"], ["7", 0])
+        # the detections come from the pass whose masks follow the union
+        self.assertEqual(graph["10"]["inputs"]["source"], ["6", 1])
+        self.assertTrue(graph["10"]["_meta"]["wrapper_result"]["individual_masks"])
+        _assert_links_resolve(self, graph)
+
+    def test_boxes_are_a_wrapped_literal(self):
+        """A bare list input is read as a link; {"__value__": ...} is a value."""
+        graph = _segment_graph(boxes="[[10, 20, 30, 40]]")
+        self.assertNotIn("4", graph)
+        self.assertNotIn("conditioning", graph["5"]["inputs"])
+        self.assertEqual(graph["5"]["inputs"]["bboxes"],
+                         {"__value__": [{"x": 10.0, "y": 20.0, "width": 30.0, "height": 40.0}]})
+        self.assertEqual(graph["10"]["_meta"]["wrapper_result"]["boxes"], [[10.0, 20.0, 30.0, 40.0]])
+
+    def test_points_are_the_nodes_json_strings(self):
+        graph = _segment_graph(positive_coords="[[1, 2]]")
+        self.assertEqual(json.loads(graph["5"]["inputs"]["positive_coords"]), [{"x": 1.0, "y": 2.0}])
+        self.assertNotIn("negative_coords", graph["5"]["inputs"])
+        graph = _segment_graph(positive_coords="[[1, 2]]", negative_coords="[[3, 4]]")
+        self.assertEqual(json.loads(graph["5"]["inputs"]["negative_coords"]), [{"x": 3.0, "y": 4.0}])
+
+    def test_upright_size_follows_exif_orientation(self):
+        self.assertEqual(wrapper_workflows.upright_size(4000, 3000, 6), (3000, 4000))
+        self.assertEqual(wrapper_workflows.upright_size(4000, 3000, 1), (4000, 3000))
+        self.assertEqual(wrapper_workflows.upright_size(4000, 3000, None), (4000, 3000))
+
+    def test_model_is_the_blueprints_sam31_checkpoint(self):
+        (model,) = wrapper_workflows.IMAGE_SEGMENT_MODELS
+        self.assertEqual(model["folder"], "checkpoints")
+        self.assertEqual(model["url"], "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/"
+                                       "sam3.1_multiplex_fp16.safetensors")
+
+    def test_registered_with_a_text_answer(self):
+        from api_wrapper import segment
+        entry = wrapper_workflows.WORKFLOWS["image-segment"]
+        self.assertNotIn("output_type", entry)  # the body is the union mask PNG
+        self.assertTrue(entry["requires_image"])
+        self.assertFalse(entry["requires_prompt"])
+        self.assertTrue(entry["setup_uses_uploads"])
+        self.assertEqual(entry["uses"], [])
+        self.assertIs(entry["text_result"], segment.segment_result)
+        self.assertIs(entry["build"], wrapper_workflows.build_image_segment)
+
+    def test_openapi_documents_the_endpoint_and_the_text_route(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/image-segment/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["image"])
+        for name in ("prompt", "boxes", "positive_coords", "negative_coords", "threshold", "max_objects",
+                     "individual_masks"):
+            self.assertIn(name, schema["properties"])
+        self.assertIn("the person on the left", schema["properties"]["prompt"]["description"])
+        self.assertEqual(list(op["responses"]["200"]["content"])[0], "image/png")
+        self.assertEqual(op["operationId"], "generateImageSegment")
+        text = spec["paths"]["/api/wrapper/jobs/{job_id}/text"]["get"]
+        self.assertEqual(text["operationId"], "getJobText")
+        self.assertIn("ImageSegmentResult", spec["components"]["schemas"])
+
+
+class TestImageDescribeGraph(unittest.TestCase):
+    def test_structure(self):
+        from api_wrapper import describe
+        graph = wrapper_workflows.build_image_describe(image="wrapper/test_input.png", task="objects",
+                                                       max_length=300, megapixels=0.5)
+        self.assertEqual(graph["1"]["inputs"], {"clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+                                                "type": "stable_diffusion", "device": "default"})
+        self.assertEqual(graph["3"]["class_type"], "ImageFromBatch")
+        self.assertEqual(graph["4"]["inputs"], {"image": ["3", 0], "upscale_method": "area",
+                                                "megapixels": 0.5, "resolution_steps": 1})
+        self.assertEqual(graph["5"], {"class_type": "TextGenerate", "inputs": {
+            "clip": ["1", 0], "prompt": describe.describe_prompt("objects"), "image": ["4", 0],
+            "max_length": 300, "sampling_mode": "off"}})
+        self.assertEqual(graph["6"]["inputs"], {"source": ["5", 0]})
+        self.assertEqual(graph["6"]["_meta"], {"wrapper_result": {"workflow": "image-describe", "task": "objects"}})
+        self.assertNotIn("SaveImage", {node["class_type"] for node in graph.values()})
+        _assert_links_resolve(self, graph)
+
+    def test_reuses_the_qwen_image_21_encoder(self):
+        self.assertEqual(wrapper_workflows.IMAGE_DESCRIBE_CLIP, wrapper_workflows.QWEN_IMAGE_21_CLIP)
+        self.assertEqual(wrapper_workflows.IMAGE_DESCRIBE_MODELS,
+                         [wrapper_workflows.qwen_image_21_models("int8")[1]])
+
+    def test_registered_as_a_json_answer(self):
+        from api_wrapper import describe
+        from api_wrapper.openapi import OUTPUT_MEDIA_TYPES
+        entry = wrapper_workflows.WORKFLOWS["image-describe"]
+        self.assertEqual(OUTPUT_MEDIA_TYPES[entry["output_type"]], "application/json")
+        self.assertIs(entry["text_result"], describe.describe_result)
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/image-describe/generate"]["post"]
+        self.assertEqual(op["responses"]["200"]["content"],
+                         {"application/json": {"schema": {"$ref": "#/components/schemas/ImageDescribeResult"}}})
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["image"])
+        self.assertEqual(schema["properties"]["task"]["enum"], ["caption", "objects", "both"])
+        self.assertIn("ImageDescribeResult", spec["components"]["schemas"])
+
+
 try:
     import torch  # noqa: F401
 
@@ -1286,10 +1428,50 @@ class TestGraphValidation(unittest.TestCase):
                 valid, error, outputs, node_errors = asyncio.run(execution.validate_prompt(
                     f"5c2d8e1f-{index:04d}-4a6b-9c7d-8e9f0a1b2c3d", graph, None))
                 self.assertTrue(valid, f"{label} graph rejected: {error}\nnode_errors: {node_errors}")
-                self.assertEqual(outputs, expected)
+                # validate_prompt collects the output nodes in a set.
+                self.assertEqual(sorted(outputs), sorted(expected))
         finally:
             for path in placeholder_paths:
                 os.remove(path)
+
+    def test_image_segment_graphs_pass_core_validation(self):
+        graphs = [
+            ("phrase", _segment_graph(prompt="the sky")),
+            ("phrase, individual masks", _segment_graph(prompt="person, dog", individual_masks="true")),
+            ("boxes, individual masks", _segment_graph(boxes="[[0, 0, 10, 10], [5, 5, 20, 20]]",
+                                                       individual_masks="true")),
+            ("points", _segment_graph(positive_coords="[[1, 1]]", negative_coords="[[5, 5]]")),
+        ]
+        self._validate_with_placeholders(wrapper_workflows.IMAGE_SEGMENT_MODELS,
+                                         [(f"image-segment {label}", graph, ["9", "10"]) for label, graph in graphs])
+        # Validation unwraps the literal boxes in place, which is what execution reads.
+        self.assertEqual(graphs[2][1]["5"]["inputs"]["bboxes"],
+                         [{"x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0},
+                          {"x": 5.0, "y": 5.0, "width": 20.0, "height": 20.0}])
+
+    def test_image_describe_graphs_pass_core_validation(self):
+        self._validate_with_placeholders(wrapper_workflows.IMAGE_DESCRIBE_MODELS, [
+            (f"image-describe {task}", wrapper_workflows.build_image_describe(
+                image="wrapper/test_input.png", task=task), ["6"])
+            for task in ("caption", "objects", "both")])
+
+    def test_image_segment_masks_reach_the_batch_node(self):
+        _prepare_env_for_comfy_import()
+        import nodes
+        from comfy_api.latest import _io
+
+        async def _init():
+            await nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+
+        asyncio.run(_init())
+
+        import execution
+
+        graph = _segment_graph(prompt="person", individual_masks="true")
+        node_class = nodes.NODE_CLASS_MAPPINGS[graph["7"]["class_type"]]
+        received, _missing, v3_data = execution.get_input_data(graph["7"]["inputs"], node_class, "7")
+        received = _io.build_nested_inputs(received, v3_data)
+        self.assertEqual(list(received["masks"]), ["mask0", "mask1"])
 
     def test_fx_bgremove_graph_passes_core_validation(self):
         models = [m for name in wrapper_workflows.FX_BGREMOVE_MODELS for m in wrapper_workflows.fx_bgremove_models(name)]

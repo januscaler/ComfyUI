@@ -11,6 +11,7 @@ audio, 3D asset, ...) as a downloadable file:
 - GET    /wrapper/workflows
 - GET    /wrapper/jobs/{job_id}          (also /api/wrapper/jobs/{job_id}; `progress` while it runs)
 - GET    /wrapper/jobs/{job_id}/image
+- GET    /wrapper/jobs/{job_id}/text     (the JSON answer of image-describe / image-segment)
 - DELETE /wrapper/jobs/{job_id}          (worker cleanup: the job's outputs, uploads and history)
 - POST   /wrapper/free
 - GET    /wrapper/openapi.json
@@ -36,8 +37,11 @@ from comfy_execution import jobs as comfy_jobs
 from comfy_execution.progress import get_progress_state
 
 from api_wrapper import cleanup as wrapper_cleanup
+from api_wrapper import describe as wrapper_describe
 from api_wrapper import progress as wrapper_progress
 from api_wrapper import prompt_rewriter
+from api_wrapper import results as wrapper_results
+from api_wrapper import segment as wrapper_segment
 from api_wrapper import workflows as wrapper_workflows
 from api_wrapper.openapi import WRAPPER_SWAGGER_HTML, spec_with_workflows
 from api_wrapper.quantize import convert_fp8_to_nvfp4, fp4_filename
@@ -670,16 +674,26 @@ def _probe_video(path):
     return width, height, video.get_frame_count(), float(video.get_frame_rate())
 
 
-async def _probe_upload(upload_refs, missing_hint):
-    """Probe the job's uploaded 'video' (see _probe_video), refusing a missing
-    or unreadable one."""
-    video = (upload_refs.get("video") or [None])[0]
-    if video is None:
-        raise _SetupError("No video provided", missing_hint)
+def _probe_image(path):
+    """(width, height) of a still as LoadImage hands it to the graph (EXIF
+    orientation applied), read from its header without decoding the pixels."""
+    from PIL import Image
+
+    with Image.open(path) as image:
+        return wrapper_workflows.upright_size(image.width, image.height, image.getexif().get(0x0112))
+
+
+async def _probe_upload(upload_refs, missing_hint, kind="video"):
+    """Probe the job's uploaded 'video' (see _probe_video) or 'image' (see
+    _probe_image), refusing a missing or unreadable one."""
+    ref = (upload_refs.get(kind) or [None])[0]
+    if ref is None:
+        raise _SetupError(f"No {kind} provided", missing_hint)
+    probe = _probe_image if kind == "image" else _probe_video
     try:
-        return await asyncio.to_thread(_probe_video, _input_path(video))
+        return await asyncio.to_thread(probe, _input_path(ref))
     except Exception as e:
-        raise _SetupError("Unreadable video", f"The uploaded video could not be read: {e}") from None
+        raise _SetupError(f"Unreadable {kind}", f"The uploaded {kind} could not be read: {e}") from None
 
 
 async def _setup_fx_interp(fields, downloaded, upload_refs):
@@ -786,6 +800,41 @@ async def _setup_fx_upscale(fields, downloaded, upload_refs):
     return kwargs, note
 
 
+async def _setup_image_segment(fields, downloaded, upload_refs):
+    """Setup for image-segment: probe the upload's upright size, check the
+    phrase / boxes / points against it and the masks against the memory
+    budget, and fetch the SAM 3 checkpoint."""
+    width, height = await _probe_upload(upload_refs, "Send the picture to segment in 'image'.", kind="image")
+    try:
+        request = wrapper_segment.segment_request(fields, width, height)
+    except ValueError as e:
+        raise _SetupError("Invalid segment request", str(e)) from None
+    over_budget = wrapper_segment.segment_check_budget(width, height, wrapper_segment.segment_mask_count(request))
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe segmentation budget",
+            f"{over_budget} The limit is set by COMFY_IMAGE_SEGMENT_MAX_PIXEL_MASKS.")
+    _raise_if_missing(await _download_models(wrapper_workflows.IMAGE_SEGMENT_MODELS, downloaded))
+    note = f"{width}x{height} segmented by {wrapper_segment.segment_summary(request)}"
+    return {"request": request, "width": width, "height": height,
+            "ckpt_name": wrapper_workflows.IMAGE_SEGMENT_CKPT}, note
+
+
+async def _setup_image_describe(fields, downloaded, upload_refs):
+    """Setup for image-describe: check task/max_length, probe the upload for
+    its scale-down budget, and make sure the Qwen3-VL encoder is present."""
+    try:
+        task, max_length = wrapper_describe.describe_request(fields)
+    except ValueError as e:
+        raise _SetupError("Invalid describe request", str(e)) from None
+    width, height = await _probe_upload(upload_refs, "Send the picture to describe in 'image'.", kind="image")
+    _raise_if_missing(await _download_models(wrapper_workflows.IMAGE_DESCRIBE_MODELS, downloaded))
+    megapixels = wrapper_describe.describe_megapixels(width, height)
+    note = f"{width}x{height} described ({task}) at {megapixels:g} MP"
+    return {"task": task, "max_length": max_length, "megapixels": megapixels,
+            "clip_name": wrapper_workflows.IMAGE_DESCRIBE_CLIP}, note
+
+
 _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "flux2klein9b-txt2img": _setup_flux2klein9b_txt2img,
                     "qwenimage21": _setup_qwenimage21_edit,
@@ -796,7 +845,9 @@ _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                                   "reference": _setup_minimax_h3_reference},
                     "fx-interp": _setup_fx_interp,
                     "fx-bgremove": _setup_fx_bgremove,
-                    "fx-upscale": _setup_fx_upscale}
+                    "fx-upscale": _setup_fx_upscale,
+                    "image-segment": _setup_image_segment,
+                    "image-describe": _setup_image_describe}
 
 
 def register_wrapper_routes(routes, prompt_server):
@@ -1054,6 +1105,15 @@ def register_wrapper_routes(routes, prompt_server):
                 "job_id": prompt_id,
             }, status=500)
 
+        if task.get("output_type") == "json":
+            # A data answer saves no file: the body is the same JSON that
+            # GET /wrapper/jobs/{job_id}/text serves to a caller that polled.
+            result = wrapper_results.text_result(graph, history_entry.get("outputs"), wrapper_workflows.WORKFLOWS)
+            if result is None:
+                return _error_response("No output produced", "The workflow finished without an answer.", status=500)
+            return web.json_response(result, headers={"X-Wrapper-Job-Id": prompt_id,
+                                                      **_resolution_headers(build_kwargs, note)})
+
         files = _collect_output_files(history_entry)
         if not files:
             return _error_response("No output produced", "The workflow finished without saving any file.", status=500)
@@ -1214,9 +1274,7 @@ def register_wrapper_routes(routes, prompt_server):
         for node_outputs in (job.get("outputs") or {}).values():
             images.extend(node_outputs.get("images", []))
         for image in images:
-            image["url"] = "/view?filename={}&subfolder={}&type={}".format(
-                image["filename"], image.get("subfolder", ""), image.get("type", "output")
-            )
+            image["url"] = wrapper_results.view_url(image)
         job["images"] = images
         if job_id in _PROVENANCE:
             job["provenance"] = _PROVENANCE[job_id]  # additive, like progress
@@ -1226,12 +1284,12 @@ def register_wrapper_routes(routes, prompt_server):
             job["progress"] = progress
         return web.json_response(job)
 
-    @routes.get("/wrapper/jobs/{job_id}/image")
-    async def get_job_image(request):
+    def _finished_job(request):
+        """(job, None) for a completed job, else (None, the error response)."""
         try:
             job_id = comfy_jobs.validate_job_id(request.match_info["job_id"])
         except ValueError:
-            return _error_response("Invalid job id", "job_id must be a canonical UUID.", status=400)
+            return None, _error_response("Invalid job id", "job_id must be a canonical UUID.", status=400)
 
         job = comfy_jobs.get_job(
             job_id,
@@ -1239,17 +1297,38 @@ def register_wrapper_routes(routes, prompt_server):
             prompt_queue.get_history(),
         )
         if job is None:
-            return _error_response("Job not found", f"No job with id {job_id}", status=404)
+            return None, _error_response("Job not found", f"No job with id {job_id}", status=404)
         if job["status"] != "completed":
-            return _error_response("Job not finished", f"Job status is '{job['status']}'.", status=409)
+            return None, _error_response("Job not finished", f"Job status is '{job['status']}'.", status=409)
+        return job, None
+
+    @routes.get("/wrapper/jobs/{job_id}/image")
+    async def get_job_image(request):
+        job, error = _finished_job(request)
+        if error is not None:
+            return error
 
         for node_outputs in (job.get("outputs") or {}).values():
             for image in node_outputs.get("images", []):
-                location = "/view?filename={}&subfolder={}&type={}".format(
-                    image["filename"], image.get("subfolder", ""), image.get("type", "output")
-                )
-                raise web.HTTPFound(location)
+                raise web.HTTPFound(wrapper_results.view_url(image))
         return _error_response("Job has no image output", status=404)
+
+    @routes.get("/wrapper/jobs/{job_id}/text")
+    async def get_job_text(request):
+        """The JSON answer of a completed job whose workflow answers with data
+        (image-describe's caption and objects, image-segment's detections and
+        mask URLs); see api_wrapper/results.py."""
+        job, error = _finished_job(request)
+        if error is not None:
+            return error
+
+        result = wrapper_results.text_result(
+            (job.get("workflow") or {}).get("prompt"), job.get("outputs"), wrapper_workflows.WORKFLOWS)
+        if result is None:
+            return _error_response("Job has no text output",
+                                   "Only workflows that answer with data (image-describe, image-segment) have one.",
+                                   status=404)
+        return web.json_response(result)
 
     # DELETE /wrapper/jobs/{job_id}: see api_wrapper/cleanup.py.
     wrapper_cleanup.register_routes(routes, prompt_queue)
