@@ -1254,15 +1254,27 @@ def fx_upscale_refine_base(out_width, out_height, width, height):
     return max(1, round(out_width * k)), max(1, round(out_height * k))
 
 
+def fx_upscale_refine_tile_size(width, height):
+    """The refine's (tile_width, tile_height): FX_UPSCALE_REFINE_TILE, or a side
+    shorter than that floored to a multiple of 16. A tile taller than the
+    picture would be cut to its height, which the VAE then trims to a multiple
+    of 16, and ImageMergeTileList leaves the trimmed rows black."""
+    def side(length):
+        return min(FX_UPSCALE_REFINE_TILE, max(64, length - length % 16))
+
+    return side(width), side(height)
+
+
 def fx_upscale_refine_tiles(width, height):
     """How many tiles the refine redraws (SplitImageToTileList's grid)."""
-    tile, overlap = FX_UPSCALE_REFINE_TILE, FX_UPSCALE_REFINE_OVERLAP
-    stride = round(max(tile * 0.25, tile - overlap))
+    overlap = FX_UPSCALE_REFINE_OVERLAP
 
-    def count(side):
+    def count(side, tile):
+        stride = round(max(tile * 0.25, tile - overlap))
         return 1 if side <= tile else 1 + math.ceil((side - tile) / stride)
 
-    return count(width) * count(height)
+    tile_w, tile_h = fx_upscale_refine_tile_size(width, height)
+    return count(width, tile_w) * count(height, tile_h)
 
 
 def _fx_upscale_model_stage(graph, image, model, width, height, *, upscale_model_name, unet_name, vae_name, seed,
@@ -1326,7 +1338,8 @@ def build_fx_upscale_image(*, image, width, height, model=FX_UPSCALE_IMAGE_DEFAU
                                   unet_name=unet_name, vae_name=vae_name, seed=seed, source_size=source_size,
                                   first_id=2)
     if refine == "tiled":
-        tile, overlap = FX_UPSCALE_REFINE_TILE, FX_UPSCALE_REFINE_OVERLAP
+        tile_w, tile_h = fx_upscale_refine_tile_size(width, height)
+        overlap = FX_UPSCALE_REFINE_OVERLAP
         graph.update({
             "20": {"class_type": "ImageScale", "inputs": {
                 "image": out, "upscale_method": "lanczos", "width": width, "height": height, "crop": "disabled"}},
@@ -1336,12 +1349,12 @@ def build_fx_upscale_image(*, image, width, height, model=FX_UPSCALE_IMAGE_DEFAU
             "24": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["22", 0], "text": prompt or FX_UPSCALE_REFINE_DEFAULT_PROMPT}},
             # A list of tiles: everything downstream runs once per tile.
             "25": {"class_type": "SplitImageToTileList", "inputs": {
-                "image": ["20", 0], "tile_width": tile, "tile_height": tile, "overlap": overlap}},
+                "image": ["20", 0], "tile_width": tile_w, "tile_height": tile_h, "overlap": overlap}},
             "26": {"class_type": "VAEEncode", "inputs": {"pixels": ["25", 0], "vae": ["23", 0]}},
             "27": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["24", 0], "latent": ["26", 0]}},
             "28": {"class_type": "CFGGuider", "inputs": {"model": ["21", 0], "positive": ["27", 0], "negative": ["27", 0], "cfg": 1.0}},
             "29": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
-            "30": {"class_type": "Flux2Scheduler", "inputs": {"steps": FX_UPSCALE_REFINE_STEPS, "width": tile, "height": tile}},
+            "30": {"class_type": "Flux2Scheduler", "inputs": {"steps": FX_UPSCALE_REFINE_STEPS, "width": tile_w, "height": tile_h}},
             "31": {"class_type": "SplitSigmasDenoise", "inputs": {"sigmas": ["30", 0], "denoise": denoise}},
             "32": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed % (2 ** 63)}},
             "33": {"class_type": "SamplerCustomAdvanced", "inputs": {

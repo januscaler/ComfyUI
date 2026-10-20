@@ -993,6 +993,11 @@ class TestFxUpscaleGraph(unittest.TestCase):
         self.assertEqual(tiles(1024, 1024), 1)
         # 7680 = 1024 + 8 strides of 896 (rounded up); 4320 = 1024 + 4 strides.
         self.assertEqual(tiles(7680, 4320), 9 * 5)
+        # A side shorter than a tile: tiles of that side floored to 16 (else the merge leaves black rows).
+        self.assertEqual(wrapper_workflows.fx_upscale_refine_tile_size(7680, 750), (1024, 736))
+        self.assertEqual(tiles(7680, 750), 9 * 2)
+        graph = wrapper_workflows.build_fx_upscale_image(image="a.png", width=7680, height=750, refine="tiled", base_size=(3840, 375))
+        self.assertEqual((graph["25"]["inputs"]["tile_width"], graph["25"]["inputs"]["tile_height"]), (1024, 736))
 
     def test_image_graph_is_png_in_png_out(self):
         graph = wrapper_workflows.build_fx_upscale_image(image="wrapper/job/in.png", width=3840, height=2160, seed=5)
