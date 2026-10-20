@@ -1178,9 +1178,212 @@ def build_fx_upscale(*, video, width, height, model=FX_UPSCALE_DEFAULT_MODEL,
     return graph
 
 
+# Image mode: a still in ``image`` comes back as a PNG (LoadImage ... SaveImage),
+# so it never passes through H.264 (yuv420 and a one-frame clip's encode). The
+# output is ``width`` x ``height`` exactly (any sides; no 4:2:0 even rule), up to
+# FX_UPSCALE_IMAGE_MAX_SIDE a side and FX_UPSCALE_IMAGE_MAX_FACTOR times the
+# source; seedvr2 is the default model for a still.
+#
+# ``refine=tiled`` (for 8K-class outputs): the model upscales to at most
+# FX_UPSCALE_REFINE_BASE_LONG_SIDE on the long side (SeedVR2's sweet spot), the
+# picture is lanczos-scaled to the output, and FLUX.2 [klein] 4B (Apache-2.0)
+# redraws it in overlapping tiles at a low denoise, so the last 2x is new texture
+# rather than a smear: Ultimate SD Upscale's idea, with the core
+# SplitImageToTileList / ImageMergeTileList nodes (sine-feathered blend).
+FX_UPSCALE_IMAGE_DEFAULT_MODEL = "seedvr2"
+FX_UPSCALE_IMAGE_MAX_SIDE = 8192
+FX_UPSCALE_IMAGE_MAX_FACTOR = 8
+FX_UPSCALE_REFINES = ("none", "tiled")
+FX_UPSCALE_REFINE_BASE_LONG_SIDE = 3840
+FX_UPSCALE_REFINE_TILE = 1024
+FX_UPSCALE_REFINE_OVERLAP = 128
+FX_UPSCALE_REFINE_DEFAULT_DENOISE = 0.3
+FX_UPSCALE_REFINE_STEPS = 8
+FX_UPSCALE_REFINE_DEFAULT_PROMPT = "a sharp, highly detailed photograph with fine natural texture"
+FX_UPSCALE_REFINE_UNET = "flux-2-klein-4b-fp8.safetensors"
+FX_UPSCALE_REFINE_CLIP = "qwen_3_4b.safetensors"
+FX_UPSCALE_REFINE_MODELS = [
+    {"folder": "diffusion_models", "filename": FX_UPSCALE_REFINE_UNET,
+     "url": f"https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/{FX_UPSCALE_REFINE_UNET}"},
+    {"folder": "text_encoders", "filename": FX_UPSCALE_REFINE_CLIP,
+     "url": f"https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/{FX_UPSCALE_REFINE_CLIP}"},
+    {"folder": "vae", "filename": FLUX2_KLEIN_9B_VAE,
+     "url": f"https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/{FLUX2_KLEIN_9B_VAE}"},
+]
+
+
+def fx_upscale_image_size(width, height, fields):
+    """(out_width, out_height) of an image-mode upscale: ``width`` and
+    ``height`` when both are sent, else the source scaled until its short side
+    reaches ``target_short_side`` (rounded, aspect kept). Raises ValueError
+    with the reason when the size is not one this mode makes."""
+    def whole(name):
+        value = fields.get(name)
+        if value in (None, ""):
+            return None
+        try:
+            number = int(str(value).strip())
+        except ValueError:
+            raise ValueError(f"{name} must be a whole number.") from None
+        if not 16 <= number <= FX_UPSCALE_IMAGE_MAX_SIDE:
+            raise ValueError(f"{name} must be from 16 to {FX_UPSCALE_IMAGE_MAX_SIDE}.")
+        return number
+
+    out_w, out_h, short = whole("width"), whole("height"), whole("target_short_side")
+    if (out_w is None) != (out_h is None):
+        raise ValueError("Send width and height together.")
+    if out_w is None:
+        target = short or FX_UPSCALE_DEFAULT_SHORT_SIDE
+        k = target / min(width, height)
+        out_w, out_h = max(1, round(width * k)), max(1, round(height * k))
+        if max(out_w, out_h) > FX_UPSCALE_IMAGE_MAX_SIDE:
+            raise ValueError(f"That would be {out_w}x{out_h}; at most {FX_UPSCALE_IMAGE_MAX_SIDE} a side.")
+    factor = max(out_w / width, out_h / height)
+    if factor > FX_UPSCALE_IMAGE_MAX_FACTOR:
+        raise ValueError(f"{width}x{height} to {out_w}x{out_h} is {factor:.1f}x; at most "
+                         f"{FX_UPSCALE_IMAGE_MAX_FACTOR}x.")
+    return out_w, out_h
+
+
+def fx_upscale_refine_base(out_width, out_height, width, height):
+    """The size the model upscales to before a tiled refine: the output scaled
+    down to FX_UPSCALE_REFINE_BASE_LONG_SIDE on its long side, never below the
+    source."""
+    k = min(1.0, FX_UPSCALE_REFINE_BASE_LONG_SIDE / max(out_width, out_height))
+    k = max(k, max(width / out_width, height / out_height))
+    return max(1, round(out_width * k)), max(1, round(out_height * k))
+
+
+def fx_upscale_refine_tiles(width, height):
+    """How many tiles the refine redraws (SplitImageToTileList's grid)."""
+    tile, overlap = FX_UPSCALE_REFINE_TILE, FX_UPSCALE_REFINE_OVERLAP
+    stride = round(max(tile * 0.25, tile - overlap))
+
+    def count(side):
+        return 1 if side <= tile else 1 + math.ceil((side - tile) / stride)
+
+    return count(width) * count(height)
+
+
+def _fx_upscale_model_stage(graph, image, model, width, height, *, upscale_model_name, unet_name, vae_name, seed,
+                            source_size=None, first_id):
+    """Add one esrgan or seedvr2 upscale of ``image`` to ``width`` x ``height``
+    to ``graph`` (node ids from ``first_id``); returns the output's link."""
+    ids = [str(first_id + i) for i in range(11)]
+    if model == "esrgan":
+        upscale = {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": [ids[0], 0], "image": image}}
+        if source_size:
+            upscale["_meta"] = {"expected_steps": fx_upscale_tile_steps(*source_size)}
+        graph.update({
+            ids[0]: {"class_type": "UpscaleModelLoader", "inputs": {"model_name": upscale_model_name}},
+            ids[1]: upscale,
+            ids[2]: {"class_type": "ImageScale", "inputs": {
+                "image": [ids[1], 0], "upscale_method": "area", "width": width, "height": height, "crop": "disabled"}},
+        })
+        return [ids[2], 0]
+    tiled = {"tile_size": 512, "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}
+    graph.update({
+        ids[0]: {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
+        ids[1]: {"class_type": "VAELoader", "inputs": {"vae_name": vae_name}},
+        ids[2]: {"class_type": "ImageScale", "inputs": {
+            "image": image, "upscale_method": "lanczos", "width": width, "height": height, "crop": "disabled"}},
+        ids[3]: {"class_type": "SeedVR2Preprocess", "inputs": {"resized_images": [ids[2], 0]}},
+        ids[4]: {"class_type": "VAEEncodeTiled", "inputs": {"pixels": [ids[3], 0], "vae": [ids[1], 0], **tiled}},
+        ids[5]: {"class_type": "SeedVR2TemporalChunk", "inputs": {
+            "latent": [ids[4], 0], "temporal_overlap": FX_UPSCALE_SEEDVR2_TEMPORAL_OVERLAP, "chunking_mode": "auto"}},
+        ids[6]: {"class_type": "SeedVR2Conditioning", "inputs": {"model": [ids[0], 0], "vae_conditioning": [ids[5], 0]}},
+        ids[7]: {"class_type": "KSampler", "inputs": {
+            "model": [ids[0], 0], "positive": [ids[6], 0], "negative": [ids[6], 1], "latent_image": [ids[5], 0],
+            "seed": seed, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+        ids[8]: {"class_type": "SeedVR2TemporalMerge", "inputs": {"latents": [ids[7], 0], "temporal_overlap": [ids[5], 1]}},
+        ids[9]: {"class_type": "VAEDecodeTiled", "inputs": {"samples": [ids[8], 0], "vae": [ids[1], 0], **tiled}},
+        ids[10]: {"class_type": "SeedVR2PostProcessing", "inputs": {
+            "images": [ids[9], 0], "original_resized_images": [ids[2], 0], "color_correction_method": "lab"}},
+    })
+    return [ids[10], 0]
+
+
+def build_fx_upscale_image(*, image, width, height, model=FX_UPSCALE_IMAGE_DEFAULT_MODEL, refine="none",
+                           upscale_model_name=FX_UPSCALE_ESRGAN[4]["filename"],
+                           unet_name=FX_UPSCALE_SEEDVR2_UNET, vae_name=FX_UPSCALE_SEEDVR2_VAE,
+                           seed=0, source_size=None, base_size=None, prompt=FX_UPSCALE_REFINE_DEFAULT_PROMPT,
+                           denoise=FX_UPSCALE_REFINE_DEFAULT_DENOISE, filename_prefix="wrapper/fx_upscale"):
+    """Upscale a still: image -> PNG of exactly ``width`` x ``height``.
+
+    ``refine='none'``: the model (esrgan or seedvr2, as in build_fx_upscale)
+    makes the output size directly. ``refine='tiled'``: the model makes
+    ``base_size`` (fx_upscale_refine_base), lanczos takes it to the output, and
+    klein 4B redraws FX_UPSCALE_REFINE_TILE tiles at ``denoise`` from ``prompt``
+    (each tile's own latent is also its reference, so it keeps the picture),
+    merged back with a sine-feathered overlap."""
+    if model not in FX_UPSCALE_MODELS:
+        raise ValueError(f"model must be one of {FX_UPSCALE_MODELS}")
+    if refine not in FX_UPSCALE_REFINES:
+        raise ValueError(f"refine must be one of {FX_UPSCALE_REFINES}")
+    graph = {"1": {"class_type": "LoadImage", "inputs": {"image": image}}}
+    stage_w, stage_h = (base_size or (width, height)) if refine == "tiled" else (width, height)
+    out = _fx_upscale_model_stage(graph, ["1", 0], model, stage_w, stage_h, upscale_model_name=upscale_model_name,
+                                  unet_name=unet_name, vae_name=vae_name, seed=seed, source_size=source_size,
+                                  first_id=2)
+    if refine == "tiled":
+        tile, overlap = FX_UPSCALE_REFINE_TILE, FX_UPSCALE_REFINE_OVERLAP
+        graph.update({
+            "20": {"class_type": "ImageScale", "inputs": {
+                "image": out, "upscale_method": "lanczos", "width": width, "height": height, "crop": "disabled"}},
+            "21": {"class_type": "UNETLoader", "inputs": {"unet_name": FX_UPSCALE_REFINE_UNET, "weight_dtype": "default"}},
+            "22": {"class_type": "CLIPLoader", "inputs": {"clip_name": FX_UPSCALE_REFINE_CLIP, "type": "flux2", "device": "default"}},
+            "23": {"class_type": "VAELoader", "inputs": {"vae_name": FLUX2_KLEIN_9B_VAE}},
+            "24": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["22", 0], "text": prompt or FX_UPSCALE_REFINE_DEFAULT_PROMPT}},
+            # A list of tiles: everything downstream runs once per tile.
+            "25": {"class_type": "SplitImageToTileList", "inputs": {
+                "image": ["20", 0], "tile_width": tile, "tile_height": tile, "overlap": overlap}},
+            "26": {"class_type": "VAEEncode", "inputs": {"pixels": ["25", 0], "vae": ["23", 0]}},
+            "27": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["24", 0], "latent": ["26", 0]}},
+            "28": {"class_type": "CFGGuider", "inputs": {"model": ["21", 0], "positive": ["27", 0], "negative": ["27", 0], "cfg": 1.0}},
+            "29": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+            "30": {"class_type": "Flux2Scheduler", "inputs": {"steps": FX_UPSCALE_REFINE_STEPS, "width": tile, "height": tile}},
+            "31": {"class_type": "SplitSigmasDenoise", "inputs": {"sigmas": ["30", 0], "denoise": denoise}},
+            "32": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed % (2 ** 63)}},
+            "33": {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": ["32", 0], "guider": ["28", 0], "sampler": ["29", 0], "sigmas": ["31", 1], "latent_image": ["26", 0]}},
+            "34": {"class_type": "VAEDecode", "inputs": {"samples": ["33", 0], "vae": ["23", 0]}},
+            "35": {"class_type": "ImageMergeTileList", "inputs": {
+                "image_list": ["34", 0], "final_width": width, "final_height": height, "overlap": overlap}},
+        })
+        out = ["35", 0]
+    graph["40"] = {"class_type": "SaveImage", "inputs": {"images": out, "filename_prefix": filename_prefix}}
+    return graph
+
+
+def build_fx_upscale_any(*, video=None, image=None, **kwargs):
+    """fx-upscale's builder: image mode for a still in ``image``, else the clip."""
+    if image is not None:
+        return build_fx_upscale_image(image=image, **{k: v for k, v in kwargs.items() if k != "frames"})
+    image_only = ("refine", "base_size", "prompt", "denoise")
+    return build_fx_upscale(video=video, **{k: v for k, v in kwargs.items() if k not in image_only})
+
+
 FX_UPSCALE_FORM_EXTRA = {
     "video": {"type": "string", "format": "binary",
-              "description": "The clip to upscale (mp4, webm, mov, mkv, avi or gif). Its audio is dropped."},
+              "description": "The clip to upscale (mp4, webm, mov, mkv, avi or gif). Its audio is dropped. "
+                             "Send this or 'image'."},
+    "image": {"type": "string", "format": "binary",
+              "description": "Image mode: a still (png, jpg, webp, bmp or gif) upscaled to a PNG, never through a "
+                             "video codec. Send this or 'video'."},
+    "width": {"type": "integer", "minimum": 16, "maximum": FX_UPSCALE_IMAGE_MAX_SIDE,
+              "description": "Image mode: the exact output width (with height). Omit both to use "
+                             "target_short_side."},
+    "height": {"type": "integer", "minimum": 16, "maximum": FX_UPSCALE_IMAGE_MAX_SIDE,
+               "description": "Image mode: the exact output height (with width)."},
+    "refine": {"type": "string", "enum": list(FX_UPSCALE_REFINES), "default": "none",
+               "description": "Image mode: 'tiled' upscales with the model to at most "
+                              f"{FX_UPSCALE_REFINE_BASE_LONG_SIDE} px long, then redraws the full-size picture in "
+                              f"{FX_UPSCALE_REFINE_TILE} px tiles with FLUX.2 [klein] 4B at a low denoise (new "
+                              "texture for 8K outputs). 'none' upscales with the model alone."},
+    "denoise": {"type": "number", "minimum": 0.05, "maximum": 0.6, "default": FX_UPSCALE_REFINE_DEFAULT_DENOISE,
+                "description": "Image mode, refine=tiled: how much of each tile is redrawn."},
+    "prompt": {"type": "string",
+               "description": "Image mode, refine=tiled: what the picture shows (guides the redrawn texture)."},
     "model": {"type": "string", "enum": list(FX_UPSCALE_MODELS), "default": FX_UPSCALE_DEFAULT_MODEL,
               "description": "'esrgan' (Real-ESRGAN x2/x4, fast; 67 MB each) or 'seedvr2' (SeedVR2 3B int8 "
                              "video restoration, slower and much sharper on real footage; 3.5 GB + 0.5 GB "
@@ -1542,18 +1745,21 @@ WORKFLOWS = {
         "build": build_fx_bgremove,
     },
     "fx-upscale": {
-        "title": "Video upscale (Real-ESRGAN / SeedVR2)",
+        "title": "Video or image upscale (Real-ESRGAN / SeedVR2, tiled FLUX.2 klein refine)",
         "output_type": "video",
         "requires_image": False,
         "requires_prompt": False,
-        "required_uploads": ["video"],
+        # 'video' (a clip -> MP4) or 'image' (a still -> PNG); the setup refuses neither.
+        "required_uploads": [],
         "setup_uses_uploads": True,
-        "uploads": {"video": {"ext": "video", "max": 1}},
-        # The setup adds a seed for seedvr2 only (esrgan doesn't sample).
+        "uploads": {"video": {"ext": "video", "max": 1}, "image": {"ext": "image", "max": 1}},
+        # The setup adds a seed for seedvr2 only (esrgan doesn't sample); the
+        # image mode's refine prompt comes through its own setup too.
         "uses": [],
-        "form": ["video", "model", "target_short_side", "seed"],
+        "form": ["video", "image", "model", "target_short_side", "width", "height", "refine", "denoise",
+                 "prompt", "seed"],
         "extra_form_properties": FX_UPSCALE_FORM_EXTRA,
-        "build": build_fx_upscale,
+        "build": build_fx_upscale_any,
     },
     "image-segment": {
         "title": "Image segmentation by phrase, box or point (SAM 3)",

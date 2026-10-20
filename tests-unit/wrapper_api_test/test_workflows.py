@@ -967,20 +967,83 @@ class TestFxUpscaleGraph(unittest.TestCase):
         self.assertIsNone(check("seedvr2", 640, 360, 300, 1920, 1080, 3.0))
         self.assertIn("seedvr2 at 1920x1080", check("seedvr2", 640, 360, 400, 1920, 1080, 3.0))
 
+    def test_image_size_is_exact_or_from_the_short_side(self):
+        size = wrapper_workflows.fx_upscale_image_size
+        self.assertEqual(size(2048, 1152, {"width": "7680", "height": "4320"}), (7680, 4320))
+        # Odd sides are fine: a PNG has no 4:2:0 rule.
+        self.assertEqual(size(1001, 667, {"width": "3003", "height": "2001"}), (3003, 2001))
+        self.assertEqual(size(1024, 576, {"target_short_side": "2160"}), (3840, 2160))
+        for src, fields, why in (((1024, 1024), {"width": "4000"}, "together"),
+                                 ((1024, 1024), {"width": "9000", "height": "100"}, "from 16 to 8192"),
+                                 ((1024, 1024), {"width": "x", "height": "1"}, "whole number"),
+                                 ((512, 512), {"width": "8192", "height": "8192"}, "at most 8x"),
+                                 ((1024, 576), {"target_short_side": "8000"}, "at most 8192 a side")):
+            with self.assertRaises(ValueError) as ctx:
+                size(*src, fields)
+            self.assertIn(why, str(ctx.exception))
+
+    def test_refine_base_and_tiles(self):
+        base = wrapper_workflows.fx_upscale_refine_base
+        self.assertEqual(base(7680, 4320, 2048, 1152), (3840, 2160))
+        self.assertEqual(base(7680, 3072, 1600, 640), (3840, 1536))
+        # Never below the source.
+        self.assertEqual(base(7680, 4320, 4096, 2304), (4096, 2304))
+        self.assertEqual(base(3000, 2000, 1500, 1000), (3000, 2000))
+        tiles = wrapper_workflows.fx_upscale_refine_tiles
+        self.assertEqual(tiles(1024, 1024), 1)
+        # 7680 = 1024 + 8 strides of 896 (rounded up); 4320 = 1024 + 4 strides.
+        self.assertEqual(tiles(7680, 4320), 9 * 5)
+
+    def test_image_graph_is_png_in_png_out(self):
+        graph = wrapper_workflows.build_fx_upscale_image(image="wrapper/job/in.png", width=3840, height=2160, seed=5)
+        classes = [node["class_type"] for node in graph.values()]
+        self.assertEqual(classes[0], "LoadImage")
+        self.assertEqual(graph["40"]["class_type"], "SaveImage")
+        self.assertNotIn("CreateVideo", classes)
+        self.assertNotIn("LoadVideo", classes)
+        self.assertIn("SeedVR2Conditioning", classes)
+        self.assertNotIn("SplitImageToTileList", classes)
+
+    def test_tiled_refine_graph(self):
+        graph = wrapper_workflows.build_fx_upscale_image(
+            image="wrapper/job/in.png", width=7680, height=4320, refine="tiled", base_size=(3840, 2160),
+            prompt="a fisherman", denoise=0.25, seed=2 ** 64 - 1)
+        scale = next(node for node in graph.values() if node["class_type"] == "ImageScale")
+        self.assertEqual((scale["inputs"]["width"], scale["inputs"]["height"]), (3840, 2160))
+        self.assertEqual((graph["20"]["inputs"]["width"], graph["20"]["inputs"]["height"]), (7680, 4320))
+        self.assertEqual(graph["21"]["inputs"]["unet_name"], "flux-2-klein-4b-fp8.safetensors")
+        self.assertEqual(graph["24"]["inputs"]["text"], "a fisherman")
+        self.assertEqual(graph["31"]["inputs"]["denoise"], 0.25)
+        self.assertLess(graph["32"]["inputs"]["noise_seed"], 2 ** 63)
+        self.assertEqual(graph["35"]["inputs"]["final_width"], 7680)
+        self.assertEqual(graph["40"]["inputs"]["images"], ["35", 0])
+        with self.assertRaises(ValueError):
+            wrapper_workflows.build_fx_upscale_image(image="a.png", width=64, height=64, refine="soft")
+
+    def test_any_builder_picks_the_mode(self):
+        still = wrapper_workflows.build_fx_upscale_any(image="a.png", width=64, height=64, model="seedvr2", frames=1,
+                                                       refine="none", seed=1)
+        self.assertEqual(still["1"]["class_type"], "LoadImage")
+        clip = wrapper_workflows.build_fx_upscale_any(video="a.mp4", width=64, height=64, model="esrgan", frames=3,
+                                                      refine="none")
+        self.assertEqual(clip["1"]["class_type"], "LoadVideo")
+
     def test_registered_without_a_prompt(self):
         entry = wrapper_workflows.WORKFLOWS["fx-upscale"]
         self.assertFalse(entry["requires_prompt"])
-        self.assertEqual(entry["required_uploads"], ["video"])
+        # A clip in 'video' or a still in 'image' (the setup refuses neither).
+        self.assertEqual(entry["required_uploads"], [])
+        self.assertEqual(set(entry["uploads"]), {"video", "image"})
         self.assertTrue(entry["setup_uses_uploads"])
         self.assertEqual(entry["uses"], [])
-        self.assertIs(entry["build"], wrapper_workflows.build_fx_upscale)
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_upscale_any)
 
     def test_openapi_documents_the_endpoint(self):
         spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
         op = spec["paths"]["/api/wrapper/fx-upscale/generate"]["post"]
         schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
-        self.assertEqual(schema["required"], ["video"])
-        self.assertNotIn("prompt", schema["properties"])
+        self.assertNotIn("video", schema.get("required", []))
+        self.assertEqual(schema["properties"]["refine"]["enum"], ["none", "tiled"])
         self.assertEqual(schema["properties"]["model"]["enum"], ["esrgan", "seedvr2"])
         self.assertEqual(schema["properties"]["target_short_side"]["default"], 1080)
         self.assertIn("seed", schema["properties"])
@@ -1491,6 +1554,19 @@ class TestGraphValidation(unittest.TestCase):
                 video="wrapper/test_input.mp4", width=1920, height=1080), ["7"]),
             ("fx-upscale seedvr2", wrapper_workflows.build_fx_upscale(
                 video="wrapper/test_input.mp4", width=1920, height=1080, model="seedvr2", seed=2 ** 63), ["15"]),
+        ])
+
+    def test_fx_upscale_image_graphs_pass_core_validation(self):
+        models = (wrapper_workflows.fx_upscale_models("esrgan", 4) + wrapper_workflows.fx_upscale_models("seedvr2", 4)
+                  + wrapper_workflows.FX_UPSCALE_REFINE_MODELS)
+        self._validate_with_placeholders(models, [
+            ("fx-upscale image seedvr2", wrapper_workflows.build_fx_upscale_image(
+                image="wrapper/test_input.png", width=3840, height=2160, seed=2 ** 63), ["40"]),
+            ("fx-upscale image esrgan", wrapper_workflows.build_fx_upscale_image(
+                image="wrapper/test_input.png", width=4000, height=2250, model="esrgan", source_size=(1000, 563)), ["40"]),
+            ("fx-upscale image tiled", wrapper_workflows.build_fx_upscale_image(
+                image="wrapper/test_input.png", width=7680, height=4320, refine="tiled", base_size=(3840, 2160),
+                seed=2 ** 63, prompt="a pier", denoise=0.25), ["40"]),
         ])
 
     def test_qwen_image_21_edit_images_reach_the_node(self):

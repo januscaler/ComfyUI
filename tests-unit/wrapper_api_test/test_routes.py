@@ -534,6 +534,48 @@ class _ProbedImageSetup(unittest.TestCase):
         return ctx.exception
 
 
+class TestFxUpscaleImageSetup(_ProbedImageSetup):
+    setup = staticmethod(wrapper_routes._setup_fx_upscale)
+    probe = (2048, 1152)
+
+    def test_still_goes_to_seedvr2_png_at_the_exact_size(self):
+        kwargs, note = self._run({"width": "3840", "height": "2160", "seed": "9"})
+        self.assertEqual(kwargs, {"model": "seedvr2", "width": 3840, "height": 2160, "refine": "none", "seed": 9,
+                                  "unet_name": "seedvr2_3b_int8_convrot.safetensors",
+                                  "vae_name": "seedvr2_ema_vae_fp16.safetensors"})
+        self.assertEqual(note, "image 2048x1152 -> 3840x2160 PNG with seedvr2")
+        self.assertEqual(self.requested, [("diffusion_models", "seedvr2_3b_int8_convrot.safetensors"),
+                                          ("vae", "seedvr2_ema_vae_fp16.safetensors")])
+        graph = wrapper_workflows.build_fx_upscale_any(image="wrapper/job/in.png", **kwargs)
+        self.assertEqual(graph["40"]["class_type"], "SaveImage")
+
+    def test_tiled_refine_fetches_klein_4b(self):
+        kwargs, note = self._run({"width": "7680", "height": "4320", "refine": "tiled", "denoise": "0.2",
+                                  "prompt": " a pier "})
+        self.assertEqual((kwargs["base_size"], kwargs["denoise"], kwargs["prompt"]), ((3840, 2160), 0.2, "a pier"))
+        self.assertIn("then 45 klein-4B tiles at denoise 0.2", note)
+        self.assertIn(("diffusion_models", "flux-2-klein-4b-fp8.safetensors"), self.requested)
+        self.assertIn(("text_encoders", "qwen_3_4b.safetensors"), self.requested)
+        # Without a prompt, a neutral one.
+        kwargs, _ = self._run({"width": "7680", "height": "4320", "refine": "tiled"})
+        self.assertEqual(kwargs["prompt"], wrapper_workflows.FX_UPSCALE_REFINE_DEFAULT_PROMPT)
+
+    def test_esrgan_still(self):
+        kwargs, note = self._run({"model": "esrgan", "target_short_side": "2304"})
+        self.assertEqual((kwargs["width"], kwargs["height"], kwargs["upscale_model_name"]),
+                         (4096, 2304, "RealESRGAN_x2plus.pth"))
+        self.assertIn("with esrgan x2", note)
+
+    def test_refusals_happen_before_any_download(self):
+        for fields, message in (({"refine": "soft"}, "Invalid refine"), ({"model": "waifu2x"}, "Invalid model"),
+                                ({"denoise": "0.9"}, "Invalid denoise"), ({"width": "9000", "height": "10"}, "Invalid size"),
+                                ({"width": "100"}, "Invalid size")):
+            self.assertEqual(self._refused(fields).message, message)
+        both = {"image": ["wrapper/job/in.png"], "video": ["wrapper/job/clip.mp4"]}
+        self.assertEqual(self._refused({}, refs=both).message, "Two inputs")
+        self.assertEqual(self.requested, [])
+
+
 class TestImageSegmentSetup(_ProbedImageSetup):
     setup = staticmethod(wrapper_routes._setup_image_segment)
 

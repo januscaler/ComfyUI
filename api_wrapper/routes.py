@@ -754,9 +754,68 @@ async def _setup_fx_bgremove(fields, downloaded, upload_refs):
     return {"model_name": wrapper_workflows.FX_BGREMOVE_MODELS[model], "frames": frames}, note
 
 
+async def _setup_fx_upscale_image(fields, downloaded, upload_refs):
+    """fx-upscale's image mode: a still in 'image' to an exact PNG size (see
+    build_fx_upscale_image), optionally with the tiled klein refine."""
+    if upload_refs.get("video"):
+        raise _SetupError("Two inputs", "Send the clip in 'video' or the still in 'image', not both.")
+    model = (fields.get("model") or wrapper_workflows.FX_UPSCALE_IMAGE_DEFAULT_MODEL).strip().lower()
+    if model not in wrapper_workflows.FX_UPSCALE_MODELS:
+        raise _SetupError("Invalid model", "model must be 'esrgan' or 'seedvr2'.")
+    refine = (fields.get("refine") or "none").strip().lower()
+    if refine not in wrapper_workflows.FX_UPSCALE_REFINES:
+        raise _SetupError("Invalid refine", "refine must be 'none' or 'tiled'.")
+    try:
+        denoise = float(fields.get("denoise") or wrapper_workflows.FX_UPSCALE_REFINE_DEFAULT_DENOISE)
+    except ValueError:
+        denoise = -1.0
+    if not 0.05 <= denoise <= 0.6:
+        raise _SetupError("Invalid denoise", "denoise must be a number from 0.05 to 0.6.")
+    width, height = await _probe_upload(upload_refs, "Send the picture to upscale in 'image'.", kind="image")
+    try:
+        out_width, out_height = wrapper_workflows.fx_upscale_image_size(width, height, fields)
+    except ValueError as e:
+        raise _SetupError("Invalid size", str(e)) from None
+    base = wrapper_workflows.fx_upscale_refine_base(out_width, out_height, width, height) if refine == "tiled" \
+        else (out_width, out_height)
+    factor = max(base[0] / width, base[1] / height)
+    over_budget = wrapper_workflows.fx_upscale_check_budget(
+        model, width, height, 1, base[0], base[1], factor)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe upscale budget",
+            f"{over_budget} The limit is set by COMFY_FX_UPSCALE_MAX_PIXEL_FRAMES.")
+
+    models = wrapper_workflows.fx_upscale_models(model, factor)
+    if refine == "tiled":
+        models = models + wrapper_workflows.FX_UPSCALE_REFINE_MODELS
+    _raise_if_missing(await _download_models(models, downloaded))
+    seed = int(fields["seed"]) if "seed" in fields else random.randrange(0, 2 ** 63)
+    kwargs = {"model": model, "width": out_width, "height": out_height, "refine": refine, "seed": seed}
+    if model == "esrgan":
+        kwargs["upscale_model_name"] = models[0]["filename"]
+        kwargs["source_size"] = (width, height)
+        how = f"esrgan x{wrapper_workflows.fx_upscale_esrgan_scale(factor)}"
+    else:
+        kwargs["unet_name"] = wrapper_workflows.FX_UPSCALE_SEEDVR2_UNET
+        kwargs["vae_name"] = wrapper_workflows.FX_UPSCALE_SEEDVR2_VAE
+        how = "seedvr2"
+    note = f"image {width}x{height} -> {out_width}x{out_height} PNG with {how}"
+    if refine == "tiled":
+        kwargs["base_size"] = base
+        kwargs["denoise"] = denoise
+        kwargs["prompt"] = (fields.get("prompt") or "").strip() or wrapper_workflows.FX_UPSCALE_REFINE_DEFAULT_PROMPT
+        tiles = wrapper_workflows.fx_upscale_refine_tiles(out_width, out_height)
+        note += f" to {base[0]}x{base[1]}, then {tiles} klein-4B tiles at denoise {denoise:g}"
+    return kwargs, note
+
+
 async def _setup_fx_upscale(fields, downloaded, upload_refs):
     """Setup for fx-upscale: validate model/target_short_side, probe the upload
-    for the output size and the memory budget, and fetch the model files."""
+    for the output size and the memory budget, and fetch the model files.
+    A still in 'image' takes the image mode instead."""
+    if upload_refs.get("image"):
+        return await _setup_fx_upscale_image(fields, downloaded, upload_refs)
     model = (fields.get("model") or wrapper_workflows.FX_UPSCALE_DEFAULT_MODEL).strip().lower()
     if model not in wrapper_workflows.FX_UPSCALE_MODELS:
         raise _SetupError("Invalid model", "model must be 'esrgan' or 'seedvr2'.")
