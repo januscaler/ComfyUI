@@ -342,6 +342,16 @@ def _save_prompt_record(output_path, record):
     return path
 
 
+#: How long a request's body may take to arrive whole. An upload that crawls
+#: (a saturated link) or stops (a client that went) otherwise holds its handler
+#: and its uploads forever.
+_BODY_TIMEOUT = float(os.environ.get("WRAPPER_BODY_TIMEOUT", "120"))
+
+#: A caller's own id for a job, so a submit it retries (its answer lost on the
+#: way) runs once: the job is found instead of queued again.
+CLIENT_JOB_HEADER = "X-Client-Job-Id"
+
+
 def _error_response(message, details="", missing=None, status=400):
     body = {
         "error": {
@@ -927,9 +937,46 @@ def register_wrapper_routes(routes, prompt_server):
         its own folders (input/wrapper/<job_id>/, output/wrapper/<job_id>/),
         which DELETE /wrapper/jobs/{job_id} removes later. Uploads of a request
         that fails before its job is queued are removed on the way out."""
-        prompt_id = str(uuid.uuid4())
-        with wrapper_cleanup.generate_scope(prompt_id) as scope:
-            return await _generate(request, prompt_id, scope)
+        started = time.monotonic()
+        where = f'{request.match_info["workflow"]}/{request.match_info.get("task") or "-"}'
+        client_id = request.headers.get(CLIENT_JOB_HEADER, "").strip()
+        if client_id:
+            try:
+                client_id = comfy_jobs.validate_job_id(client_id)
+            except ValueError:
+                return _error_response("Invalid job id", f"{CLIENT_JOB_HEADER} must be a canonical UUID.")
+            known = _known_job(client_id)
+            if known is not None:
+                logging.info("wrapper: %s job %s already %s; the caller polls it", where, client_id, known)
+                return web.json_response({
+                    "error": {"type": "duplicate", "message": f"This job is already {known} here; poll it.",
+                              "details": f"job_id={client_id}", "extra_info": {}},
+                    "job_id": client_id,
+                }, status=504)
+            if wrapper_cleanup.is_open(client_id):
+                logging.info("wrapper: %s job %s is still being received; refused a second copy", where, client_id)
+                return web.json_response({
+                    "error": {"type": "in_progress", "message": "This job's upload is still arriving here.",
+                              "details": f"job_id={client_id}", "extra_info": {}},
+                    "job_id": client_id,
+                }, status=409)
+        prompt_id = client_id or str(uuid.uuid4())
+        logging.info("wrapper: %s job %s accepted from %s (%s bytes)", where, prompt_id,
+                     request.headers.get("X-Forwarded-For") or request.remote, request.content_length)
+        try:
+            with wrapper_cleanup.generate_scope(prompt_id) as scope:
+                return await _generate(request, prompt_id, scope)
+        finally:
+            logging.info("wrapper: %s job %s answered after %.1fs", where, prompt_id, time.monotonic() - started)
+
+    def _known_job(job_id):
+        """'queued', 'running' or 'finished' when this worker has the job, else None."""
+        running, queued = _queue_snapshots(prompt_queue)
+        job = comfy_jobs.get_job(job_id, running, queued, prompt_queue.get_history())
+        if job is None:
+            return None
+        status = job.get("status")
+        return {"pending": "queued", "in_progress": "running"}.get(status, "finished" if status else "known")
 
     async def _generate(request, prompt_id, scope):
         global _queue_number
@@ -953,10 +1000,16 @@ def register_wrapper_routes(routes, prompt_server):
         elif task_name is not None:
             return _error_response("Unknown task", f"Workflow {workflow_name} has no task variants.")
 
+        reading = time.monotonic()
         try:
-            fields, uploads = await _read_body(request)
+            fields, uploads = await asyncio.wait_for(_read_body(request), _BODY_TIMEOUT)
+        except asyncio.TimeoutError:
+            logging.warning("wrapper: job %s: the upload did not arrive whole within %gs", prompt_id, _BODY_TIMEOUT)
+            return _error_response("Upload too slow", f"The request did not arrive whole within {_BODY_TIMEOUT:g}s.",
+                                   status=408)
         except ValueError as e:
             return _error_response("Invalid request body", str(e))
+        logging.info("wrapper: job %s: body received in %.1fs", prompt_id, time.monotonic() - reading)
 
         # 'prompt' is plain intent that a workflow with prompt_rewrite turns
         # into its native prompt format; 'raw_prompt' is that format already
@@ -1117,6 +1170,7 @@ def register_wrapper_routes(routes, prompt_server):
             _queue_number += 1
             prompt_queue.put((_queue_number, prompt_id, graph, extra_data, valid[2], {}))
             scope.queued = True  # from here on the job is the caller's to DELETE
+            logging.info("wrapper: job %s queued", prompt_id)
 
             # Default: free VRAM as soon as this job finishes. The worker consumes
             # these flags after the next prompt completes and unloads all models
