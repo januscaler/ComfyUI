@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 
@@ -350,6 +351,33 @@ _BODY_TIMEOUT = float(os.environ.get("WRAPPER_BODY_TIMEOUT", "120"))
 #: A caller's own id for a job, so a submit it retries (its answer lost on the
 #: way) runs once: the job is found instead of queued again.
 CLIENT_JOB_HEADER = "X-Client-Job-Id"
+
+
+#: What a CUDA out-of-memory failure says (voxmin-backend's isFloOutOfMemoryError matches the same).
+_OUT_OF_MEMORY = re.compile(r"out of memory|\bOOM\b|cudaMalloc|CUBLAS_STATUS_ALLOC_FAILED|allocation on device", re.IGNORECASE)
+
+
+def _execution_failure(history_entry):
+    """(type, message, extra_info) for a job that did not succeed, from the
+    ``execution_error`` / ``execution_interrupted`` event ComfyUI records in its
+    history entry's ``status.messages``. 'out_of_memory' when it is one, so the
+    caller can free the GPU and try again."""
+    status = history_entry.get("status") if isinstance(history_entry, dict) else None
+    messages = status.get("messages") if isinstance(status, dict) else None
+    event = None
+    for entry in messages or []:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[1], dict):
+            if entry[0] == "execution_interrupted":
+                return "interrupted", "The job was interrupted.", {}
+            if entry[0] == "execution_error":
+                event = entry[1]
+    if not event:
+        return "execution_error", "Workflow execution failed.", {}
+    kind = str(event.get("exception_type") or "").strip()
+    text = str(event.get("exception_message") or "").strip()
+    message = f"{kind}: {text}" if kind and text and kind not in text else (text or kind or "Workflow execution failed.")
+    extra = {key: event[key] for key in ("node_id", "node_type", "exception_type") if event.get(key) is not None}
+    return ("out_of_memory" if _OUT_OF_MEMORY.search(message) else "execution_error"), message, extra
 
 
 def _error_response(message, details="", missing=None, status=400):
@@ -1207,13 +1235,13 @@ def register_wrapper_routes(routes, prompt_server):
         status = history_entry.get("status") or {}
         status_str = status.get("status_str") if isinstance(status, dict) else status
         if status_str != "success":
-            err = history_entry.get("execution_error") or {}
+            err_type, message, extra = _execution_failure(history_entry)
             return web.json_response({
                 "error": {
-                    "type": "execution_error",
-                    "message": err.get("message", "Workflow execution failed."),
+                    "type": err_type,
+                    "message": message,
                     "details": f"job_id={prompt_id}",
-                    "extra_info": {"status": status_str},
+                    "extra_info": {"status": status_str, **extra},
                 },
                 "job_id": prompt_id,
             }, status=500)

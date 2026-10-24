@@ -111,3 +111,30 @@ async def test_a_caller_whose_submit_timed_out_finds_a_job_still_arriving(aiohtt
         assert res.status == 200
         assert (await res.json())["status"] == "pending"
     assert (await client.get(f"/wrapper/jobs/{job}")).status == 404
+
+
+def _history(messages, status_str="error"):
+    return {"prompt": (1, "x", {}, {}, []), "outputs": {},
+            "status": {"status_str": status_str, "completed": False, "messages": messages}}
+
+
+def test_a_failed_job_says_why_from_comfyui_status_messages():
+    """2026-10-24: Remove background ran out of GPU memory, and the wrapper
+    answered "Workflow execution failed." (it read a key ComfyUI never writes),
+    so the backend could not tell it was out of memory and free the GPU."""
+    oom = _history([
+        ["execution_start", {"prompt_id": "x", "timestamp": 1}],
+        ["execution_error", {"prompt_id": "x", "node_id": "3", "node_type": "BackgroundRemoval",
+                             "exception_type": "torch.OutOfMemoryError",
+                             "exception_message": "Allocation on device 0 would exceed allowed memory. (out of memory)",
+                             "traceback": ["..."], "timestamp": 2}],
+    ])
+    kind, message, extra = wrapper_routes._execution_failure(oom)
+    assert kind == "out_of_memory"
+    assert message == "torch.OutOfMemoryError: Allocation on device 0 would exceed allowed memory. (out of memory)"
+    assert extra == {"node_id": "3", "node_type": "BackgroundRemoval", "exception_type": "torch.OutOfMemoryError"}
+
+    other = _history([["execution_error", {"exception_type": "ValueError", "exception_message": "bad mask"}]])
+    assert wrapper_routes._execution_failure(other)[:2] == ("execution_error", "ValueError: bad mask")
+    assert wrapper_routes._execution_failure(_history([["execution_interrupted", {"timestamp": 3}]]))[0] == "interrupted"
+    assert wrapper_routes._execution_failure(_history([]))[:2] == ("execution_error", "Workflow execution failed.")
