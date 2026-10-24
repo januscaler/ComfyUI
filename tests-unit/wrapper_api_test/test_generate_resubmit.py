@@ -99,3 +99,15 @@ async def test_an_upload_that_does_not_arrive_whole_in_time_is_let_go(aiohttp_cl
     assert res.status == 408
     assert (await res.json())["error"]["message"] == "Upload too slow"
     assert loop.time() - started < 3
+
+
+@pytest.mark.asyncio
+async def test_a_caller_whose_submit_timed_out_finds_a_job_still_arriving(aiohttp_client, server):
+    client = await aiohttp_client(make_app(server))
+    job = str(uuid.uuid4())
+    assert (await client.get(f"/wrapper/jobs/{job}")).status == 404
+    with wrapper_cleanup.generate_scope(job):
+        res = await client.get(f"/wrapper/jobs/{job}")
+        assert res.status == 200
+        assert (await res.json())["status"] == "pending"
+    assert (await client.get(f"/wrapper/jobs/{job}")).status == 404

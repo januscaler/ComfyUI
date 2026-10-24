@@ -1380,6 +1380,10 @@ def register_wrapper_routes(routes, prompt_server):
 
         running, queued = _queue_snapshots(prompt_queue)
         job = comfy_jobs.get_job(job_id, running, queued, prompt_queue.get_history())
+        if job is None and wrapper_cleanup.is_open(job_id):
+            # Its generate request is still arriving or being prepared: a caller
+            # whose submit timed out finds it here instead of sending it again.
+            return web.json_response({"id": job_id, "status": "pending", "receiving": True, "outputs": {}, "images": []})
         if job is None:
             return _error_response("Job not found", f"No job with id {job_id}", status=404)
 
