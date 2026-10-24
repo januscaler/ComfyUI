@@ -74,6 +74,16 @@ FAKE_SERVER = textwrap.dedent(
             else:
                 self.answer({"pid": os.getpid(), "path": path, "headers": dict(self.headers)})
 
+        def do_POST(self):
+            # An upload, as the wrapper's /generate reads one: the whole body, then
+            # the answer. What arrived is recorded beside the start log.
+            length = int(self.headers.get("Content-Length", "0"))
+            got = len(self.rfile.read(length))
+            with open(starts + ".posts", "a") as f:
+                f.write(f"{'whole' if got == length else 'short'} {got}/{length}\\n")
+            if got == length:
+                self.answer({"pid": os.getpid(), "got": got})
+
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     '''
 )
@@ -155,6 +165,17 @@ class IdleGateTest(unittest.TestCase):
             return res.status, dict(res.getheaders()), res.read()
         finally:
             conn.close()
+
+    def posts(self):
+        path = self.starts + ".posts"
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [line.split()[0] for line in f if line.strip()]
+
+    def post_head(self, length):
+        return (f"POST /api/wrapper/qwenimage21/generate HTTP/1.1\r\nHost: x\r\n"
+                f"Content-Type: application/octet-stream\r\nContent-Length: {length}\r\n\r\n").encode()
 
     def server_stopped(self):
         pids = self.pids()
@@ -275,6 +296,45 @@ class IdleGateTest(unittest.TestCase):
         self.gate.send_signal(signal.SIGTERM)
         self.assertEqual(self.gate.wait(15), 0)
         self.assertFalse(alive(pid))
+
+    def test_a_client_that_goes_mid_upload_does_not_hold_the_server(self):
+        # 2026-10-24: the backend gave up on a fill whose upload was still arriving
+        # (60 s); the gate kept the half-sent upload open to ComfyUI forever, so
+        # five orphans piled up and the idle server was never stopped again.
+        self.start_gate()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=15) as s:
+            s.sendall(self.post_head(100_000) + b"x" * 1000)
+            self.assertTrue(wait_for(lambda: bool(self.pids())), "the upload never reached the server")
+            time.sleep(0.3)
+        self.assertTrue(wait_for(lambda: self.posts() == ["short"]), "the server still waits on the upload")
+        self.assertTrue(wait_for(self.server_stopped), "the request still counts as use; the server never stops")
+
+    def test_a_whole_upload_is_answered_after_the_client_half_closes(self):
+        self.start_gate()
+        with socket.create_connection(("127.0.0.1", self.port), timeout=15) as s:
+            s.sendall(self.post_head(5000) + b"x" * 5000)
+            s.shutdown(socket.SHUT_WR)
+            answer = b""
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                answer += data
+        self.assertTrue(answer.startswith(b"HTTP/1.0 200"), answer[:80])
+        self.assertEqual(json.loads(answer.split(b"\r\n\r\n", 1)[1])["got"], 5000)
+        self.assertEqual(self.posts(), ["whole"])
+
+    def test_a_request_where_nothing_moves_is_dropped(self):
+        self.start_gate("--forward-idle-seconds", "1", idle="600")
+        started = time.monotonic()
+        status, _, body = self.get("/slow?s=6")
+        self.assertEqual(status, 504)
+        self.assertIn("nothing moved", json.loads(body)["error"])
+        self.assertLess(time.monotonic() - started, 4.5)
+
+    def test_a_long_answer_with_traffic_is_not_dropped(self):
+        self.start_gate("--forward-idle-seconds", "1.5")
+        self.assertEqual(self.get("/slow?s=0.5")[0], 200)
 
     def test_a_malformed_request_is_refused(self):
         self.start_gate()

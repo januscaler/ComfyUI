@@ -104,6 +104,17 @@ def header(headers: list[tuple[str, str]], name: str) -> str:
     return ", ".join(value for key, value in headers if key.lower() == name)
 
 
+def request_body(headers: list[tuple[str, str]]) -> tuple[int | None, bool]:
+    """(Content-Length, chunked) of a request: how the gate knows its body arrived whole."""
+    chunked = "chunked" in header(headers, "transfer-encoding").lower()
+    raw = header(headers, "content-length").strip()
+    try:
+        length = int(raw) if raw and not chunked else None
+    except ValueError:
+        length = None
+    return (max(0, length) if length is not None else None), chunked
+
+
 def is_upgrade(headers: list[tuple[str, str]]) -> bool:
     connection = {token.strip().lower() for token in header(headers, "connection").split(",")}
     return "upgrade" in connection and bool(header(headers, "upgrade"))
@@ -147,6 +158,7 @@ class Gate:
         self.idle_seconds: float = args.idle_seconds
         self.boot_timeout: float = args.boot_timeout
         self.stop_timeout: float = args.stop_timeout
+        self.forward_idle: float = args.forward_idle_seconds
         self.ready_path: str = args.ready_path
         self.stubs: dict[tuple[str, str], tuple[int, bytes]] = dict(args.stub)
         self.cache_routes: set[tuple[str, str]] = set(args.cache)
@@ -380,9 +392,10 @@ class Gate:
 
     async def _forward(self, reader, writer, method, target, version, headers, route, client_ip) -> None:
         try:
-            up_reader, up_writer = await asyncio.open_connection(self.upstream_host, self.upstream_port)
-        except OSError as exc:
-            writer.write(error(502, f"the server is not reachable: {exc}"))
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(self.upstream_host, self.upstream_port), PROBE_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as exc:
+            writer.write(error(502, f"the server is not reachable: {exc or 'timed out'}"))
             return
         upgrade = is_upgrade(headers)
         forwarded = [(k, v) for k, v in headers if k.lower() not in DROPPED_HEADERS]
@@ -393,29 +406,88 @@ class Gate:
         up_writer.write(head.encode("latin-1"))
         capture = bytearray() if route in self.cache_routes and method == "GET" else None
 
-        to_server = asyncio.ensure_future(self._pipe(reader, up_writer))
-        to_client = asyncio.ensure_future(self._pipe(up_reader, writer, capture))
+        # When anything last moved, either way: what --forward-idle-seconds measures.
+        moved = [time.monotonic()]
+        to_client = asyncio.ensure_future(self._pipe(up_reader, writer, capture, moved))
+        if upgrade:
+            to_server = asyncio.ensure_future(self._pipe(reader, up_writer, None, moved))
+        else:
+            to_server = asyncio.ensure_future(self._send_body(reader, up_writer, request_body(headers), moved))
         try:
             if upgrade:
                 await asyncio.wait({to_server, to_client}, return_when=asyncio.FIRST_COMPLETED)
             else:
-                # The request is answered when the server closes; a client that stops
-                # sending early (or half-closes) still gets the whole answer.
-                await to_client
+                await self._await_answer(to_server, to_client, moved, writer, f"{method} {route[1]}")
         finally:
             for task in (to_server, to_client):
                 task.cancel()
+            # Closing it is what tells the server a client that went is gone: a
+            # half-sent upload is otherwise waited on forever, and the request
+            # stays counted as use, so the server is never stopped.
             up_writer.close()
         if capture is not None and capture.startswith((b"HTTP/1.1 200", b"HTTP/1.0 200")) and len(capture) < CACHE_LIMIT:
             self.cache[route] = bytes(capture)
 
+    async def _await_answer(self, to_server, to_client, moved, writer, what: str) -> None:
+        """Wait for the server's answer. A client that stops sending after its
+        whole request (or half-closes) still gets the whole answer; one that
+        goes before its request arrived whole does not hold the server; and a
+        request where nothing moves for --forward-idle-seconds is dropped."""
+        tick = 1.0 if not self.forward_idle else max(0.05, min(1.0, self.forward_idle / 4))
+        while True:
+            pending = {to_client} if to_server.done() else {to_server, to_client}
+            await asyncio.wait(pending, timeout=tick, return_when=asyncio.FIRST_COMPLETED)
+            if to_client.done():
+                return
+            if to_server.done() and not to_server.result():
+                log(f"the client went before its {what} request arrived whole; dropped it")
+                return
+            if self.forward_idle and time.monotonic() - moved[0] >= self.forward_idle:
+                log(f"nothing moved on {what} for {self.forward_idle:g}s; dropped it")
+                try:
+                    writer.write(error(504, f"nothing moved for {self.forward_idle:g}s"))
+                except (ConnectionError, OSError, RuntimeError):
+                    pass
+                return
+
     @staticmethod
-    async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, capture: bytearray | None = None) -> None:
+    async def _send_body(src: asyncio.StreamReader, dst: asyncio.StreamWriter,
+                         body: tuple[int | None, bool], moved: list[float]) -> bool:
+        """Client -> server, for a plain request. True once the request's body has
+        arrived whole (whatever the client does after); False when the client
+        went before it did."""
+        length, chunked = body
+        whole = not chunked and not length
+        got, tail = 0, b""
+        try:
+            while True:
+                data = await src.read(CHUNK)
+                if not data:
+                    return whole
+                moved[0] = time.monotonic()
+                dst.write(data)
+                await dst.drain()
+                if whole:
+                    continue
+                if chunked:
+                    tail = (tail + data)[-7:]
+                    whole = tail.endswith(b"\r\n0\r\n\r\n") or tail == b"0\r\n\r\n"
+                else:
+                    got += len(data)
+                    whole = got >= length
+        except (ConnectionError, OSError):
+            return whole
+
+    @staticmethod
+    async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, capture: bytearray | None = None,
+                    moved: list[float] | None = None) -> None:
         try:
             while True:
                 data = await src.read(CHUNK)
                 if not data:
                     return
+                if moved is not None:
+                    moved[0] = time.monotonic()
                 dst.write(data)
                 await dst.drain()
                 if capture is not None and len(capture) < CACHE_LIMIT:
@@ -454,6 +526,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="stop the server after this long without use; 0: never stop it once started")
     parser.add_argument("--boot-timeout", type=float, default=600.0, help="give up on a start after this long")
     parser.add_argument("--stop-timeout", type=float, default=30.0, help="SIGTERM grace before SIGKILL")
+    parser.add_argument("--forward-idle-seconds", type=float, default=900.0,
+                        help="drop a forwarded request when nothing moves either way for this long; 0: never")
     parser.add_argument("--ready-path", default="/", help="the server is up once a GET here answers below 500")
     parser.add_argument("--quiet", type=parse_route, action="append", default=[], metavar="'METHOD /path'",
                         help="a request that never counts as use")
@@ -472,6 +546,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("no server command after --")
     if args.idle_seconds < 0:
         parser.error("--idle-seconds cannot be negative")
+    if args.forward_idle_seconds < 0:
+        parser.error("--forward-idle-seconds cannot be negative")
     return args
 
 
