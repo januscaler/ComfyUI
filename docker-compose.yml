@@ -107,6 +107,15 @@ services:
       comfyui:
         condition: service_healthy
     command: uvicorn api_server.developer_api:app --host 0.0.0.0 --port 8000
+    # The image's own HEALTHCHECK probes ComfyUI on localhost:8188, which is not in
+    # this container: it failed forever (unhealthy since start). This one asks the
+    # API itself; /openapi.json needs no ComfyUI, so it never wakes an idle worker.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     ports:
       - "8000:8000"
     volumes:
