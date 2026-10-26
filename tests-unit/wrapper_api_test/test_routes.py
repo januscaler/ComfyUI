@@ -502,6 +502,122 @@ class TestProbeImage(unittest.TestCase):
             self.assertEqual(wrapper_routes._probe_image(path), (40, 30))
 
 
+class TestFxTrackSetup(_ProbedVideoSetup):
+    def setUp(self):
+        super().setUp()
+        self._probe_image = wrapper_routes._probe_image
+        self.mask_size = (1280, 720)
+        wrapper_routes._probe_image = lambda path: self.mask_size
+
+    def tearDown(self):
+        wrapper_routes._probe_image = self._probe_image
+        super().tearDown()
+
+    def _setup(self, fields, refs=None):
+        return self._run(wrapper_routes._setup_fx_track, fields, refs)
+
+    def _refused_track(self, fields, refs=None):
+        return self._refused(wrapper_routes._setup_fx_track, fields, refs)
+
+    WITH_MASK = {"video": ["wrapper/job/clip.mp4"], "mask": ["wrapper/job/mask.png"]}
+
+    def test_mask_anchor_fetches_sam3_and_builds(self):
+        kwargs, note = self._setup({"prompt": "ignored"}, refs=self.WITH_MASK)
+        self.assertEqual(self.requested, [("checkpoints", "sam3.1_multiplex_fp16.safetensors")])
+        self.assertEqual(kwargs["request"], {"mode": "mask", "threshold": 0.5, "detect_interval": 1})
+        self.assertEqual((kwargs["width"], kwargs["height"], kwargs["fps"], kwargs["frames"]), (1280, 720, 30.0, 61))
+        self.assertEqual(note, "61 frames of 1280x720 tracked from the uploaded frame-0 mask -> grayscale matte "
+                               "(white = object) at the source 30 fps, no audio, and per-frame boxes")
+        graph = wrapper_workflows.build_fx_track(video="wrapper/job/clip.mp4", mask="wrapper/job/mask.png", **kwargs)
+        self.assertEqual(graph["9"]["_meta"]["expected_steps"], 61)
+        self.assertEqual(graph["15"]["_meta"]["wrapper_result"]["fps"], 30.0)
+
+    def test_phrase_anchor(self):
+        kwargs, note = self._setup({"prompt": "logo"})
+        self.assertEqual(kwargs["request"]["text"], "logo:1")
+        self.assertIn("tracked from 'logo:1'", note)
+
+    def test_refusals_happen_before_any_download(self):
+        self.assertEqual(self._refused_track({}).message, "Invalid track request")
+        self.assertEqual(self._refused_track({"boxes": "[[2000, 0, 5, 5]]"}).message, "Invalid track request")
+        self.assertEqual(self._refused_track({"prompt": "logo"}, refs={}).message, "No video provided")
+        self.mask_size = (640, 360)
+        error = self._refused_track({}, refs=self.WITH_MASK)
+        self.assertEqual(error.message, "Mask size mismatch")
+        self.assertIn("1280x720", error.details)
+        self.probe = (641, 360, 30, 30.0)
+        self.assertEqual(self._refused_track({"prompt": "logo"}).message, "Unsupported video size")
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_clip_is_refused(self):
+        self.probe = (1920, 1080, 1200, 30.0)
+        error = self._refused_track({"prompt": "logo"})
+        self.assertIn("COMFY_FX_TRACK_MAX_PIXEL_FRAMES", error.details)
+        self.assertEqual(self.requested, [])
+
+
+class TestFxReplaceSetup(_ProbedVideoSetup):
+    REFS = {"video": ["wrapper/job/clip.mp4"], "mask": ["wrapper/job/mask.mp4"], "reference": ["wrapper/job/ref.png"]}
+
+    def setUp(self):
+        super().setUp()
+        self.mask_probe = None
+        wrapper_routes._probe_video = lambda path: (self.mask_probe or self.probe) if "mask" in path else self.probe
+
+    def _setup(self, fields, refs=None):
+        return self._run(wrapper_routes._setup_fx_replace, fields, self.REFS if refs is None else refs)
+
+    def _refused_replace(self, fields, refs=None):
+        return self._refused(wrapper_routes._setup_fx_replace, fields, self.REFS if refs is None else refs)
+
+    def test_standard_tier_fetches_vace_and_builds(self):
+        kwargs, note = self._setup({})
+        self.assertEqual(kwargs, {"width": 848, "height": 480, "frames": 61, "steps": 6,
+                                  "unet_name": "wan2.1_vace_14B_fp16.safetensors",
+                                  "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                                  "vae_name": "wan_2.1_vae.safetensors",
+                                  "lora_name": "Wan21_CausVid_14B_T2V_lora_rank32.safetensors"})
+        self.assertEqual([name for _, name in self.requested],
+                         [m["filename"] for m in wrapper_workflows.FX_REPLACE_MODELS])
+        self.assertEqual(note, "61 frames of 1280x720 -> 848x480 (standard) regenerated inside the mask from the "
+                               "reference, 61 frames at 6 steps, the source 30 fps, no audio")
+        graph = wrapper_workflows.build_fx_replace(video="v.mp4", mask="m.mp4", reference="r.png", **kwargs)
+        self.assertEqual(graph["36"]["inputs"]["length"], 61)
+        headers = wrapper_routes._resolution_headers(kwargs, note)
+        self.assertEqual(headers["X-Wrapper-Settings"], "width=848 height=480 steps=6")
+        self.assertTrue(headers["X-Wrapper-Models"].startswith("wan2.1_vace_14B_fp16.safetensors"))
+
+    def test_hd_long_range_with_keyframe(self):
+        self.probe = (1920, 1080, 120, 24.0)
+        refs = {**self.REFS, "keyframe": ["wrapper/job/key.png"]}
+        kwargs, note = self._setup({"tier": " HD ", "steps": "8"}, refs=refs)
+        self.assertEqual((kwargs["width"], kwargs["height"], kwargs["steps"]), (1280, 720, 8))
+        self.assertIn("from the keyframe, 121 frames in context windows at 8 steps", note)
+
+    def test_refusals_happen_before_any_download(self):
+        for fields, message in (({"tier": "4k"}, "Invalid tier"), ({"steps": "0"}, "Invalid steps"),
+                                ({"steps": "x"}, "Invalid steps")):
+            self.assertEqual(self._refused_replace(fields).message, message)
+        self.assertEqual(self._refused_replace({}, refs={"video": ["wrapper/job/clip.mp4"]}).message, "No mask provided")
+        self.mask_probe = (1280, 720, 60, 30.0)
+        self.assertEqual(self._refused_replace({}).message, "Mask length mismatch")
+        self.mask_probe = (720, 720, 61, 30.0)
+        self.assertEqual(self._refused_replace({}).message, "Mask size mismatch")
+        self.mask_probe = (640, 360, 61, 30.0)  # same aspect: fine
+        self._setup({})
+        self.requested.clear()
+        self.probe = (1280, 720, 1, 30.0)
+        self.mask_probe = self.probe
+        self.assertEqual(self._refused_replace({}).message, "Video too short")
+        self.assertEqual(self.requested, [])
+
+    def test_over_budget_range_is_refused(self):
+        self.probe = (1920, 1080, 601, 30.0)
+        error = self._refused_replace({"tier": "hd"})
+        self.assertIn("COMFY_FX_REPLACE_MAX_PIXEL_FRAMES", error.details)
+        self.assertEqual(self.requested, [])
+
+
 class _ProbedImageSetup(unittest.TestCase):
     """Setup handlers that probe the uploaded still: the probe and the
     downloads are mocked (no real image or model)."""

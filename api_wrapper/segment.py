@@ -44,7 +44,8 @@ def parse_flag(raw, default):
     raise ValueError(f"'{raw}' is not a boolean; send true or false.")
 
 
-def _bounded(raw, default, low, high, field, kind):
+def parse_bounded(raw, default, low, high, field, kind):
+    """A form number from ``low`` to ``high`` (``kind`` int or float), or ``default`` when blank."""
     if raw is None or str(raw).strip() == "":
         return default
     try:
@@ -152,11 +153,11 @@ def segment_request(fields, width, height):
                          "([[x, y, w, h], ...] in pixels) or 'positive_coords' ([[x, y], ...] in pixels, "
                          "optionally with negative_coords).")
     mode = chosen[0]
-    max_objects = _bounded(fields.get("max_objects"), SEGMENT_DEFAULT_MAX_OBJECTS, 1, SEGMENT_MAX_OBJECTS,
+    max_objects = parse_bounded(fields.get("max_objects"), SEGMENT_DEFAULT_MAX_OBJECTS, 1, SEGMENT_MAX_OBJECTS,
                            "max_objects", int)
     request = {
         "mode": mode,
-        "threshold": _bounded(fields.get("threshold"), SEGMENT_DEFAULT_THRESHOLD, 0.0, 1.0, "threshold", float),
+        "threshold": parse_bounded(fields.get("threshold"), SEGMENT_DEFAULT_THRESHOLD, 0.0, 1.0, "threshold", float),
         "individual_masks": parse_flag(fields.get("individual_masks"), False) and mode != "points",
     }
     if mode == "prompt":
@@ -175,16 +176,20 @@ def segment_request(fields, width, height):
     return request
 
 
+def segment_what(request):
+    """What a request selects, e.g. "'the sky:8'" or '2 box(es)'."""
+    mode = request["mode"]
+    if mode == "prompt":
+        return f"'{request['text']}'"
+    if mode == "boxes":
+        return f"{len(request['boxes'])} box(es)"
+    return f"{len(request['positive'])} positive and {len(request['negative'])} negative point(s)"
+
+
 def segment_summary(request):
     """One line on what a request selects and which masks it saves, for the
     X-Wrapper-Note header."""
-    mode = request["mode"]
-    if mode == "prompt":
-        what = f"'{request['text']}'"
-    elif mode == "boxes":
-        what = f"{len(request['boxes'])} box(es)"
-    else:
-        what = f"{len(request['positive'])} positive and {len(request['negative'])} negative point(s)"
+    what = segment_what(request)
     masks = "the union mask, then one per object" if request["individual_masks"] else "the union mask"
     return f"{what}; saves {masks}"
 

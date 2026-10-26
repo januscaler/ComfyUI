@@ -11,7 +11,7 @@ audio, 3D asset, ...) as a downloadable file:
 - GET    /wrapper/workflows
 - GET    /wrapper/jobs/{job_id}          (also /api/wrapper/jobs/{job_id}; `progress` while it runs)
 - GET    /wrapper/jobs/{job_id}/image
-- GET    /wrapper/jobs/{job_id}/text     (the JSON answer of image-describe / image-segment)
+- GET    /wrapper/jobs/{job_id}/text     (the JSON answer of image-describe / image-segment / fx-track)
 - DELETE /wrapper/jobs/{job_id}          (worker cleanup: the job's outputs, uploads and history)
 - POST   /wrapper/free
 - GET    /wrapper/openapi.json
@@ -43,6 +43,7 @@ from api_wrapper import progress as wrapper_progress
 from api_wrapper import prompt_rewriter
 from api_wrapper import results as wrapper_results
 from api_wrapper import segment as wrapper_segment
+from api_wrapper import track as wrapper_track
 from api_wrapper import workflows as wrapper_workflows
 from api_wrapper.openapi import WRAPPER_SWAGGER_HTML, spec_with_workflows
 from api_wrapper.quantize import convert_fp8_to_nvfp4, fp4_filename
@@ -721,17 +722,32 @@ def _probe_image(path):
         return wrapper_workflows.upright_size(image.width, image.height, image.getexif().get(0x0112))
 
 
-async def _probe_upload(upload_refs, missing_hint, kind="video"):
+async def _probe_upload(upload_refs, missing_hint, kind="video", field=None):
     """Probe the job's uploaded 'video' (see _probe_video) or 'image' (see
-    _probe_image), refusing a missing or unreadable one."""
-    ref = (upload_refs.get(kind) or [None])[0]
+    _probe_image) -- or the ``field`` upload of that kind -- refusing a
+    missing or unreadable one."""
+    field = field or kind
+    ref = (upload_refs.get(field) or [None])[0]
     if ref is None:
-        raise _SetupError(f"No {kind} provided", missing_hint)
+        raise _SetupError(f"No {field} provided", missing_hint)
     probe = _probe_image if kind == "image" else _probe_video
     try:
         return await asyncio.to_thread(probe, _input_path(ref))
     except Exception as e:
-        raise _SetupError(f"Unreadable {kind}", f"The uploaded {kind} could not be read: {e}") from None
+        raise _SetupError(f"Unreadable {field}", f"The uploaded {field} could not be read: {e}") from None
+
+
+async def _probe_even_clip(upload_refs, missing_hint):
+    """(width, height, frames, fps) of the uploaded 'video', refusing an empty
+    one or an odd side: a matte must match the source pixel for pixel, and
+    H.264 4:2:0 can't encode an odd side."""
+    width, height, frames, fps = await _probe_upload(upload_refs, missing_hint)
+    if frames < 1:
+        raise _SetupError("Video too short", "The video has no frames.")
+    if width % 2 or height % 2:
+        raise _SetupError("Unsupported video size",
+                          f"The video is {width}x{height}; the matte needs an even width and height.")
+    return width, height, frames, fps
 
 
 async def _setup_fx_interp(fields, downloaded, upload_refs):
@@ -772,14 +788,7 @@ async def _setup_fx_bgremove(fields, downloaded, upload_refs):
     if model not in wrapper_workflows.FX_BGREMOVE_MODELS:
         raise _SetupError("Invalid model", "model must be 'birefnet' or 'lucida'.")
 
-    width, height, frames, fps = await _probe_upload(upload_refs, "Send the clip to cut out in 'video'.")
-    if frames < 1:
-        raise _SetupError("Video too short", "The video has no frames.")
-    if width % 2 or height % 2:
-        # The matte must match the source pixel for pixel, and H.264 4:2:0 can't
-        # encode an odd side.
-        raise _SetupError("Unsupported video size",
-                          f"The video is {width}x{height}; the matte needs an even width and height.")
+    width, height, frames, fps = await _probe_even_clip(upload_refs, "Send the clip to cut out in 'video'.")
     over_budget = wrapper_workflows.fx_bgremove_check_budget(width, height, frames)
     if over_budget:
         raise _SetupError(
@@ -917,6 +926,75 @@ async def _setup_image_segment(fields, downloaded, upload_refs):
             "ckpt_name": wrapper_workflows.IMAGE_SEGMENT_CKPT}, note
 
 
+async def _setup_fx_track(fields, downloaded, upload_refs):
+    """Setup for fx-track: probe the video (even sides, memory budget), check
+    the frame-0 mask's size or the phrase / boxes / points against the frame,
+    and fetch the SAM 3.1 checkpoint."""
+    width, height, frames, fps = await _probe_even_clip(upload_refs, "Send the pass to track in 'video'.")
+    has_mask = bool(upload_refs.get("mask"))
+    if has_mask:
+        mask_size = await _probe_upload(upload_refs, "", kind="image", field="mask")
+        if mask_size != (width, height):
+            raise _SetupError("Mask size mismatch", f"The mask is {mask_size[0]}x{mask_size[1]}; send it at the "
+                                                    f"video's {width}x{height}.")
+    try:
+        request = wrapper_track.track_request(fields, width, height, has_mask)
+    except ValueError as e:
+        raise _SetupError("Invalid track request", str(e)) from None
+    over_budget = wrapper_track.track_check_budget(width, height, frames)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe tracking budget",
+            f"{over_budget} The limit is set by COMFY_FX_TRACK_MAX_PIXEL_FRAMES.")
+    _raise_if_missing(await _download_models(wrapper_workflows.FX_TRACK_MODELS, downloaded))
+    note = (f"{frames} frames of {width}x{height} tracked from {wrapper_track.track_summary(request)} -> "
+            f"grayscale matte (white = object) at the source {fps:g} fps, no audio, and per-frame boxes")
+    return {"request": request, "width": width, "height": height, "fps": fps, "frames": frames,
+            "ckpt_name": wrapper_workflows.IMAGE_SEGMENT_CKPT}, note
+
+
+async def _setup_fx_replace(fields, downloaded, upload_refs):
+    """Setup for fx-replace: check tier/steps, probe the video and its mask
+    video (same frames and aspect), size the generation canvas against the
+    budget, and fetch the VACE 14B files."""
+    tier = (fields.get("tier") or wrapper_workflows.FX_REPLACE_DEFAULT_TIER).strip().lower()
+    if tier not in wrapper_workflows.FX_REPLACE_TIERS:
+        raise _SetupError("Invalid tier", "tier must be 'standard' or 'hd'.")
+    try:
+        steps = int(fields.get("steps") or wrapper_workflows.FX_REPLACE_DEFAULT_STEPS)
+    except ValueError:
+        steps = 0
+    if not 1 <= steps <= 50:
+        raise _SetupError("Invalid steps", "steps must be a whole number from 1 to 50.")
+    width, height, frames, fps = await _probe_upload(upload_refs, "Send the range to regenerate in 'video'.")
+    if frames < 2:
+        raise _SetupError("Video too short", "The video needs at least two frames.")
+    mask_width, mask_height, mask_frames, _ = await _probe_upload(
+        upload_refs, "Send the mask video (white = replace) in 'mask'.", field="mask")
+    if mask_frames != frames:
+        raise _SetupError("Mask length mismatch",
+                          f"The mask video has {mask_frames} frames and the video {frames}; send the same frames.")
+    if abs(mask_width * height - width * mask_height) > 0.01 * width * mask_height:
+        raise _SetupError("Mask size mismatch", f"The mask video is {mask_width}x{mask_height}, the video "
+                                                f"{width}x{height}; send them at the same aspect.")
+    out_width, out_height = wrapper_workflows.fx_replace_size(width, height, tier)
+    length = wrapper_workflows.fx_replace_length(frames)
+    over_budget = wrapper_workflows.fx_replace_check_budget(out_width, out_height, length)
+    if over_budget:
+        raise _SetupError(
+            "Request exceeds this host's safe replace budget",
+            f"{over_budget} The limit is set by COMFY_FX_REPLACE_MAX_PIXEL_FRAMES.")
+    _raise_if_missing(await _download_models(wrapper_workflows.FX_REPLACE_MODELS, downloaded))
+    windows = " in context windows" if length > wrapper_workflows.FX_REPLACE_WINDOW else ""
+    keyframe = ", from the keyframe" if upload_refs.get("keyframe") else ""
+    note = (f"{frames} frames of {width}x{height} -> {out_width}x{out_height} ({tier}) regenerated inside the mask "
+            f"from the reference{keyframe}, {length} frames{windows} at {steps} steps, the source {fps:g} fps, "
+            "no audio")
+    return {"width": out_width, "height": out_height, "frames": frames, "steps": steps,
+            "unet_name": wrapper_workflows.FX_REPLACE_UNET, "clip_name": wrapper_workflows.FX_REPLACE_CLIP,
+            "vae_name": wrapper_workflows.FX_REPLACE_VAE, "lora_name": wrapper_workflows.FX_REPLACE_LORA}, note
+
+
 async def _setup_image_describe(fields, downloaded, upload_refs):
     """Setup for image-describe: check task/max_length, probe the upload for
     its scale-down budget, and make sure the Qwen3-VL encoder is present."""
@@ -943,6 +1021,8 @@ _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "fx-interp": _setup_fx_interp,
                     "fx-bgremove": _setup_fx_bgremove,
                     "fx-upscale": _setup_fx_upscale,
+                    "fx-track": _setup_fx_track,
+                    "fx-replace": _setup_fx_replace,
                     "image-segment": _setup_image_segment,
                     "image-describe": _setup_image_describe}
 
