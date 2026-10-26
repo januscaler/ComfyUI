@@ -1204,6 +1204,218 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
+def _track_graph(width=640, height=360, has_mask=False, **fields):
+    from api_wrapper import track
+    request = track.track_request(fields, width, height, has_mask)
+    return wrapper_workflows.build_fx_track(
+        video="wrapper/test_input.mp4", request=request, width=width, height=height, fps=29.97,
+        mask="wrapper/test_input.png" if has_mask else None, frames=12, filename_prefix="wrapper/job/fx-track")
+
+
+class TestFxTrackGraph(unittest.TestCase):
+    def test_uploaded_mask_anchors_the_tracker(self):
+        graph = _track_graph(has_mask=True, prompt="ignored")
+        self.assertEqual({k: v["class_type"] for k, v in graph.items()}, {
+            "1": "CheckpointLoaderSimple", "2": "LoadImage", "3": "ImageFromBatch", "4": "LoadVideo",
+            "5": "GetVideoComponents", "8": "ImageToMask", "9": "SAM3_VideoTrack", "10": "SAM3_TrackToMask",
+            "11": "MaskToImage", "12": "CreateVideo", "13": "SaveVideo", "14": "SAM3_TrackToBBoxes",
+            "15": "PreviewAny"})
+        self.assertEqual(graph["8"]["inputs"], {"image": ["3", 0], "channel": "red"})
+        self.assertEqual(graph["9"]["inputs"], {
+            "images": ["5", 0], "model": ["1", 0], "initial_mask": ["8", 0], "detection_threshold": 0.5,
+            "max_objects": 1, "detect_interval": 1})
+        self.assertEqual(graph["9"]["_meta"], {"expected_steps": 12})
+        _assert_links_resolve(self, graph)
+
+    def test_matte_keeps_the_source_fps_without_audio(self):
+        graph = _track_graph(has_mask=True)
+        self.assertEqual(graph["10"]["inputs"], {"track_data": ["9", 0], "object_indices": ""})
+        self.assertEqual(graph["11"]["inputs"], {"mask": ["10", 0]})
+        self.assertEqual(graph["12"]["inputs"], {"images": ["11", 0], "fps": ["5", 2], "bit_depth": 8})
+        self.assertEqual(graph["13"]["inputs"]["filename_prefix"], "wrapper/job/fx-track")
+
+    def test_boxes_are_the_json_answer(self):
+        graph = _track_graph(has_mask=True)
+        self.assertEqual(graph["14"]["inputs"], {"track_data": ["9", 0], "object_indices": ""})
+        self.assertEqual(graph["15"]["inputs"], {"source": ["14", 0]})
+        self.assertEqual(graph["15"]["_meta"], {"wrapper_result": {
+            "workflow": "fx-track", "width": 640, "height": 360, "fps": 29.97}})
+
+    def test_phrase_detects_on_frame_0(self):
+        graph = _track_graph(prompt="logo", threshold="0.3", detect_interval="4")
+        self.assertNotIn("2", graph)
+        self.assertEqual(graph["6"]["inputs"], {"image": ["5", 0], "batch_index": 0, "length": 1})
+        self.assertEqual(graph["7"]["inputs"], {"clip": ["1", 1], "text": "logo:1"})
+        self.assertEqual(graph["8"], {"class_type": "SAM3_Detect", "inputs": {
+            "model": ["1", 0], "image": ["6", 0], "conditioning": ["7", 0], "threshold": 0.3,
+            "refine_iterations": 2, "individual_masks": False}})
+        self.assertEqual((graph["9"]["inputs"]["detection_threshold"], graph["9"]["inputs"]["detect_interval"]),
+                         (0.3, 4))
+        _assert_links_resolve(self, graph)
+
+    def test_points_and_boxes(self):
+        graph = _track_graph(positive_coords="[[10, 20]]", negative_coords="[[30, 40]]")
+        self.assertNotIn("7", graph)
+        self.assertEqual(json.loads(graph["8"]["inputs"]["positive_coords"]), [{"x": 10.0, "y": 20.0}])
+        self.assertEqual(json.loads(graph["8"]["inputs"]["negative_coords"]), [{"x": 30.0, "y": 40.0}])
+        graph = _track_graph(boxes="[[0, 0, 50, 50]]")
+        self.assertEqual(graph["8"]["inputs"]["bboxes"],
+                         {"__value__": [{"x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0}]})
+
+    def test_mask_mode_needs_the_mask(self):
+        from api_wrapper import track
+        with self.assertRaises(ValueError):
+            wrapper_workflows.build_fx_track(video="v.mp4", request=track.track_request({}, 64, 64, True),
+                                             width=64, height=64, fps=30.0)
+
+    def test_registered_with_a_text_answer(self):
+        from api_wrapper import track
+        entry = wrapper_workflows.WORKFLOWS["fx-track"]
+        self.assertEqual(entry["output_type"], "video")
+        self.assertFalse(entry["requires_prompt"])
+        self.assertEqual(entry["required_uploads"], ["video"])
+        self.assertEqual(entry["uploads"], {"video": {"ext": "video", "max": 1}, "mask": {"ext": "image", "max": 1}})
+        self.assertTrue(entry["setup_uses_uploads"])
+        self.assertEqual(entry["uses"], [])
+        self.assertIs(entry["text_result"], track.track_result)
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_track)
+        self.assertEqual(wrapper_workflows.FX_TRACK_MODELS, wrapper_workflows.IMAGE_SEGMENT_MODELS)
+
+    def test_openapi_documents_the_endpoint_and_its_answer(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/fx-track/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(schema["required"], ["video"])
+        for name in ("mask", "prompt", "boxes", "positive_coords", "negative_coords", "threshold", "detect_interval"):
+            self.assertIn(name, schema["properties"])
+        self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
+        self.assertEqual(op["operationId"], "generateFxTrack")
+        answer = spec["components"]["schemas"]["FxTrackResult"]
+        self.assertEqual(sorted(answer["properties"]), ["fps", "frames", "height", "width"])
+        self.assertEqual(sorted(answer["properties"]["frames"]["items"]["properties"]), ["area", "bbox", "i", "score"])
+
+
+def _replace_graph(frames=40, keyframe=None, **kwargs):
+    return wrapper_workflows.build_fx_replace(
+        video="wrapper/test_input.mp4", mask="wrapper/test_input.mp4", reference="wrapper/test_input.png",
+        keyframe=keyframe, width=832, height=480, frames=frames, prompt="a red can", seed=7,
+        filename_prefix="wrapper/job/fx-replace", **kwargs)
+
+
+class TestFxReplaceGraph(unittest.TestCase):
+    def test_blueprint_models_and_sampler(self):
+        graph = _replace_graph()
+        self.assertEqual(graph["1"]["inputs"], {"unet_name": "wan2.1_vace_14B_fp16.safetensors",
+                                                "weight_dtype": "fp8_e4m3fn_fast"})
+        self.assertEqual(graph["2"]["inputs"], {"model": ["1", 0], "strength_model": 0.3,
+                                                "lora_name": "Wan21_CausVid_14B_T2V_lora_rank32.safetensors"})
+        self.assertEqual(graph["3"]["inputs"], {"model": ["2", 0], "shift": 5.0})
+        self.assertEqual(graph["5"]["inputs"], {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                                                "type": "wan", "device": "default"})
+        self.assertEqual(graph["7"]["inputs"]["text"], "a red can")
+        sampler = graph["33"]["inputs"]
+        self.assertEqual((sampler["model"], sampler["seed"], sampler["steps"], sampler["cfg"],
+                          sampler["sampler_name"], sampler["scheduler"]), (["3", 0], 7, 6, 1.0, "uni_pc", "simple"))
+        _assert_links_resolve(self, graph)
+
+    def test_masked_pixels_are_painted_grey_and_the_reference_padded(self):
+        graph = _replace_graph()
+        self.assertEqual(graph["12"]["inputs"], {"image": ["11", 0], "upscale_method": "area", "width": 832,
+                                                 "height": 480, "crop": "center"})
+        self.assertEqual(graph["15"]["inputs"]["image"], ["14", 0])
+        self.assertEqual(graph["16"]["inputs"], {"image": ["15", 0], "channel": "red"})
+        self.assertEqual(graph["17"]["inputs"]["color"], 0x808080)
+        self.assertEqual(graph["18"]["inputs"], {"destination": ["12", 0], "source": ["17", 0], "x": 0, "y": 0,
+                                                 "resize_source": False, "mask": ["16", 0]})
+        self.assertEqual(graph["31"]["inputs"]["padding_color"], "white")
+        vace = graph["32"]["inputs"]
+        self.assertEqual((vace["control_video"], vace["control_masks"], vace["reference_image"]),
+                         (["18", 0], ["16", 0], ["31", 0]))
+        self.assertEqual((vace["width"], vace["height"], vace["length"]), (832, 480, 41))
+
+    def test_padding_is_trimmed_and_the_source_fps_kept(self):
+        graph = _replace_graph(frames=40)
+        self.assertEqual(graph["34"]["inputs"], {"samples": ["33", 0], "trim_amount": ["32", 3]})
+        self.assertEqual(graph["36"]["inputs"], {"image": ["35", 0], "batch_index": 0, "length": 40})
+        self.assertEqual(graph["37"]["inputs"], {"images": ["36", 0], "fps": ["11", 2], "bit_depth": 8})
+        self.assertEqual(graph["38"]["inputs"]["filename_prefix"], "wrapper/job/fx-replace")
+
+    def test_keyframe_is_frame_0_unmasked(self):
+        graph = _replace_graph(keyframe="wrapper/key.png")
+        self.assertEqual(graph["22"]["inputs"], {"image": ["18", 0], "batch_index": 1, "length": 39})
+        self.assertEqual(graph["23"]["inputs"], {"images.image0": ["21", 0], "images.image1": ["22", 0]})
+        self.assertEqual(graph["24"]["inputs"]["color"], 0)
+        self.assertEqual(graph["26"]["inputs"], {"images.image0": ["24", 0], "images.image1": ["25", 0]})
+        vace = graph["32"]["inputs"]
+        self.assertEqual((vace["control_video"], vace["control_masks"]), (["23", 0], ["27", 0]))
+        self.assertNotIn("20", _replace_graph())
+        _assert_links_resolve(self, graph)
+
+    def test_long_ranges_sample_in_context_windows(self):
+        self.assertNotIn("4", _replace_graph(frames=81))
+        graph = _replace_graph(frames=82)
+        self.assertEqual(graph["32"]["inputs"]["length"], 85)
+        windows = graph["4"]["inputs"]
+        self.assertEqual((windows["model"], windows["context_length"], windows["context_overlap"],
+                          windows["context_schedule"]), (["3", 0], 81, 30, "standard_static"))
+        self.assertEqual(graph["33"]["inputs"]["model"], ["4", 0])
+
+    def test_one_frame_is_refused(self):
+        with self.assertRaises(ValueError):
+            _replace_graph(frames=1)
+
+    def test_length_is_the_next_4n_plus_1(self):
+        self.assertEqual([wrapper_workflows.fx_replace_length(n) for n in (2, 5, 6, 9, 80, 81, 82, 300)],
+                         [5, 5, 9, 9, 81, 81, 85, 301])
+
+    def test_tier_sizes_keep_the_aspect_in_multiples_of_16(self):
+        size = wrapper_workflows.fx_replace_size
+        self.assertEqual(size(1920, 1080, "standard"), (848, 480))
+        self.assertEqual(size(1920, 1080, "hd"), (1280, 720))
+        self.assertEqual(size(1080, 1920, "standard"), (480, 848))
+        self.assertEqual(size(1000, 1000, "hd"), (960, 960))
+        self.assertEqual(size(640, 360, "standard"), (848, 480))
+
+    def test_budget(self):
+        # 10 s of 30 fps at hd fits the default budget; 20 s does not.
+        self.assertIsNone(wrapper_workflows.fx_replace_check_budget(1280, 720, 301))
+        detail = wrapper_workflows.fx_replace_check_budget(1280, 720, 601)
+        self.assertIn("601 frames at 1280x720", detail)
+        self.assertIn("at most about 325 frames", detail)
+
+    def test_models_come_from_the_blueprints_sources(self):
+        urls = {m["filename"]: m["url"] for m in wrapper_workflows.FX_REPLACE_MODELS}
+        base = "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files"
+        self.assertEqual(urls, {
+            "wan2.1_vace_14B_fp16.safetensors": f"{base}/diffusion_models/wan2.1_vace_14B_fp16.safetensors",
+            "umt5_xxl_fp8_e4m3fn_scaled.safetensors": f"{base}/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "wan_2.1_vae.safetensors": f"{base}/vae/wan_2.1_vae.safetensors",
+            "Wan21_CausVid_14B_T2V_lora_rank32.safetensors":
+                "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan21_CausVid_14B_T2V_lora_rank32.safetensors",
+        })
+        self.assertEqual([m["folder"] for m in wrapper_workflows.FX_REPLACE_MODELS],
+                         ["diffusion_models", "text_encoders", "vae", "loras"])
+
+    def test_registered_with_its_uploads(self):
+        entry = wrapper_workflows.WORKFLOWS["fx-replace"]
+        self.assertEqual(entry["output_type"], "video")
+        self.assertFalse(entry["requires_prompt"])
+        self.assertEqual(entry["required_uploads"], ["video", "mask", "reference"])
+        self.assertEqual(sorted(entry["uploads"]), ["keyframe", "mask", "reference", "video"])
+        self.assertEqual(entry["uses"], ["prompt", "seed"])
+        self.assertIs(entry["build"], wrapper_workflows.build_fx_replace)
+
+    def test_openapi_documents_the_endpoint(self):
+        spec = wrapper_openapi.spec_with_workflows(wrapper_workflows.WORKFLOWS)
+        op = spec["paths"]["/api/wrapper/fx-replace/generate"]["post"]
+        schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
+        self.assertEqual(sorted(schema["required"]), ["mask", "reference", "video"])
+        self.assertEqual(schema["properties"]["tier"]["enum"], ["standard", "hd"])
+        self.assertEqual(schema["properties"]["steps"]["default"], 6)
+        self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
+        self.assertEqual(op["operationId"], "generateFxReplace")
+
+
 def _prepare_env_for_comfy_import():
     """Allow comfy to import on environments whose torch predates the
     comfy-kitchen requirement (torch < 2.4 lacks torch.library.custom_op).
@@ -1573,6 +1785,41 @@ class TestGraphValidation(unittest.TestCase):
                 image="wrapper/test_input.png", width=7680, height=4320, refine="tiled", base_size=(3840, 2160),
                 seed=2 ** 63, prompt="a pier", denoise=0.25), ["40"]),
         ])
+
+    def test_fx_track_graphs_pass_core_validation(self):
+        graphs = [
+            ("mask", _track_graph(has_mask=True)),
+            ("phrase", _track_graph(prompt="logo")),
+            ("boxes", _track_graph(boxes="[[0, 0, 10, 10]]")),
+            ("points", _track_graph(positive_coords="[[1, 1]]", negative_coords="[[5, 5]]")),
+        ]
+        self._validate_with_placeholders(wrapper_workflows.FX_TRACK_MODELS,
+                                         [(f"fx-track {label}", graph, ["13", "15"]) for label, graph in graphs])
+
+    def test_fx_replace_graphs_pass_core_validation(self):
+        self._validate_with_placeholders(wrapper_workflows.FX_REPLACE_MODELS, [
+            ("fx-replace", _replace_graph(), ["38"]),
+            ("fx-replace keyframe", _replace_graph(keyframe="wrapper/test_input.png"), ["38"]),
+            ("fx-replace windows", _replace_graph(frames=120), ["38"]),
+        ])
+
+    def test_fx_replace_keyframe_batches_reach_the_node(self):
+        _prepare_env_for_comfy_import()
+        import nodes
+        from comfy_api.latest import _io
+
+        async def _init():
+            await nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+
+        asyncio.run(_init())
+
+        import execution
+
+        graph = _replace_graph(keyframe="wrapper/key.png")
+        node_class = nodes.NODE_CLASS_MAPPINGS[graph["23"]["class_type"]]
+        received, _missing, v3_data = execution.get_input_data(graph["23"]["inputs"], node_class, "23")
+        received = _io.build_nested_inputs(received, v3_data)
+        self.assertEqual(list(received["images"]), ["image0", "image1"])
 
     def test_qwen_image_21_edit_images_reach_the_node(self):
         _prepare_env_for_comfy_import()

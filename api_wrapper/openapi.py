@@ -173,8 +173,8 @@ WRAPPER_OPENAPI_SPEC = {
                 "summary": "Get the JSON answer of a completed job",
                 "description": (
                     "For workflows that answer with data: image-describe's caption and objects (the same JSON its "
-                    "generate call returns), and image-segment's detections with the URLs of its masks. Use it "
-                    "after polling a job whose generate call timed out (504)."),
+                    "generate call returns), image-segment's detections with the URLs of its masks, and "
+                    "fx-track's per-frame boxes. Use it after polling a job whose generate call timed out (504)."),
                 "operationId": "getJobText",
                 "parameters": [
                     {"name": "job_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}},
@@ -182,7 +182,8 @@ WRAPPER_OPENAPI_SPEC = {
                 "responses": {
                     "200": {"description": "The job's answer.", "content": {"application/json": {"schema": {
                         "oneOf": [{"$ref": "#/components/schemas/ImageDescribeResult"},
-                                  {"$ref": "#/components/schemas/ImageSegmentResult"}]}}}},
+                                  {"$ref": "#/components/schemas/ImageSegmentResult"},
+                                  {"$ref": "#/components/schemas/FxTrackResult"}]}}}},
                     "400": {"description": "job_id is not a canonical UUID.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
                     "404": {"description": "Unknown job id, or a workflow that answers only with files.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
                     "409": {"description": "Job has not completed yet.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
@@ -325,6 +326,26 @@ WRAPPER_OPENAPI_SPEC = {
                             "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
                                      "description": "[x, y, w, h] in pixels."},
                             "mask": {"type": "string", "description": "URL of this object's own mask (individual_masks only)."},
+                        }},
+                    },
+                },
+            },
+            "FxTrackResult": {
+                "type": "object",
+                "properties": {
+                    "width": {"type": "integer", "description": "The video's width; the matte's size."},
+                    "height": {"type": "integer"},
+                    "fps": {"type": "number", "description": "The video's frame rate; the matte's."},
+                    "frames": {
+                        "type": "array",
+                        "description": "One entry per frame of the matte, in order.",
+                        "items": {"type": "object", "properties": {
+                            "i": {"type": "integer", "description": "Frame index (0 = the anchor)."},
+                            "bbox": {"type": "array", "nullable": True, "items": {"type": "number"},
+                                     "minItems": 4, "maxItems": 4,
+                                     "description": "[x, y, w, h] in pixels; null where the object is not visible."},
+                            "score": {"type": "number", "description": "The track's confidence in the object; 0 when hidden."},
+                            "area": {"type": "number", "description": "The object's mask as a fraction of the frame."},
                         }},
                     },
                 },

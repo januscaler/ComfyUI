@@ -500,12 +500,7 @@ class SAM3_TrackToMask(io.ComfyNode):
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
 
         N, N_obj = packed.shape[0], packed.shape[1]
-
-        if object_indices.strip():
-            indices = [int(i.strip()) for i in object_indices.split(",") if i.strip().isdigit()]
-            indices = [i for i in indices if 0 <= i < N_obj]
-        else:
-            indices = list(range(N_obj))
+        indices = _track_object_indices(object_indices, N_obj)
 
         if not indices:
             return io.NodeOutput(torch.zeros(N, H, W, device=comfy.model_management.intermediate_device()))
@@ -518,6 +513,71 @@ class SAM3_TrackToMask(io.ComfyNode):
         return io.NodeOutput(mask_out)
 
 
+def _track_object_indices(object_indices, n_obj):
+    """Object indices from a comma-separated string, in range; empty = all objects."""
+    if not object_indices.strip():
+        return list(range(n_obj))
+    indices = [int(i.strip()) for i in object_indices.split(",") if i.strip().isdigit()]
+    return [i for i in indices if 0 <= i < n_obj]
+
+
+def _mask_boxes(masks):
+    """Per-frame bounds of bool masks [N, H, W]: (visible [N], x1, y1, x2, y2 [N] with exclusive ends, area [N]
+    as a fraction of the frame). The bounds of a frame with no mask pixels are meaningless."""
+    rows, cols = masks.any(dim=2), masks.any(dim=1)
+    H, W = masks.shape[-2:]
+    y1 = rows.byte().argmax(dim=1)
+    y2 = H - rows.flip(1).byte().argmax(dim=1)
+    x1 = cols.byte().argmax(dim=1)
+    x2 = W - cols.flip(1).byte().argmax(dim=1)
+    area = masks.flatten(1).sum(dim=1).float() / (H * W)
+    return rows.any(dim=1), x1, y1, x2, y2, area
+
+
+class SAM3_TrackToBBoxes(io.ComfyNode):
+    """Per-frame bounding boxes of tracked objects."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SAM3_TrackToBBoxes",
+            display_name="SAM3 Track to Bounding Boxes",
+            category="image/detection",
+            inputs=[
+                SAM3TrackData.Input("track_data", display_name="track_data"),
+                io.String.Input("object_indices", display_name="object_indices", default="",
+                                tooltip="Comma-separated object indices to include (e.g. '0,2,3'). Empty = all objects."),
+            ],
+            outputs=[
+                io.BoundingBox.Output("bboxes", display_name="bboxes",
+                                      tooltip="Per frame, a box for each selected object visible in it, in pixels of the "
+                                              "original frames, with the object's track score and its mask's share of the frame as area."),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, track_data, object_indices="") -> io.NodeOutput:
+        from comfy.ldm.sam3.tracker import unpack_masks
+        packed = track_data["packed_masks"]
+        H, W = track_data["orig_size"]
+        if packed is None:
+            return io.NodeOutput([[] for _ in range(track_data["n_frames"])])
+
+        N, N_obj = packed.shape[0], packed.shape[1]
+        scores = track_data.get("scores") or []
+        frames = [[] for _ in range(N)]
+        for i in _track_object_indices(object_indices, N_obj):
+            masks = unpack_masks(packed[:, i])  # [N, Hm, Wm] at the tracker's resolution
+            sx, sy = W / masks.shape[-1], H / masks.shape[-2]
+            visible, x1, y1, x2, y2, area = (t.tolist() for t in _mask_boxes(masks))
+            score = float(scores[i]) if i < len(scores) else 1.0
+            for t in range(N):
+                if visible[t]:
+                    frames[t].append({"x": x1[t] * sx, "y": y1[t] * sy, "width": (x2[t] - x1[t]) * sx,
+                                      "height": (y2[t] - y1[t]) * sy, "score": score, "area": area[t]})
+        return io.NodeOutput(frames)
+
+
 class SAM3Extension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -526,6 +586,7 @@ class SAM3Extension(ComfyExtension):
             SAM3_VideoTrack,
             SAM3_TrackPreview,
             SAM3_TrackToMask,
+            SAM3_TrackToBBoxes,
         ]
 
 

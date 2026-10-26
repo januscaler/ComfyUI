@@ -11,6 +11,7 @@ import os
 
 from api_wrapper import describe as image_describe
 from api_wrapper import segment as image_segment
+from api_wrapper import track as object_track
 from api_wrapper.prompt_rewriter import MODEL_OPTIONS as MINIMAX_H3_LLM_MODELS
 from api_wrapper.results import tag_result
 
@@ -1437,6 +1438,26 @@ IMAGE_SEGMENT_MODELS = [
 IMAGE_SEGMENT_REFINE_ITERATIONS = 2
 
 
+def _sam3_detect_inputs(graph, request, image, text_node):
+    """SAM3_Detect's inputs for a segment_request() on ``image``, with the SAM
+    3.1 checkpoint in node "1": one mask, the union of what is selected. A
+    phrase adds its text encoding to ``graph`` as node ``text_node``."""
+    detect = {"model": ["1", 0], "image": image, "threshold": request["threshold"],
+              "refine_iterations": IMAGE_SEGMENT_REFINE_ITERATIONS, "individual_masks": False}
+    if request["mode"] == "prompt":
+        # SAM 3's own text encoder, from the checkpoint's CLIP output.
+        graph[text_node] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": request["text"]}}
+        detect["conditioning"] = [text_node, 0]
+    elif request["mode"] == "boxes":
+        # Wrapped: a bare list is read as a link to another node.
+        detect["bboxes"] = {"__value__": request["boxes"]}
+    else:
+        detect["positive_coords"] = json.dumps(request["positive"])
+        if request["negative"]:
+            detect["negative_coords"] = json.dumps(request["negative"])
+    return detect
+
+
 def build_image_segment(*, image, request, width, height, ckpt_name=IMAGE_SEGMENT_CKPT,
                         filename_prefix="wrapper/image_segment"):
     """Image segmentation: still + a phrase, boxes or points -> grayscale PNG
@@ -1450,24 +1471,13 @@ def build_image_segment(*, image, request, width, height, ckpt_name=IMAGE_SEGMEN
     also keeps a request that finds nothing a single black mask rather than
     no file. The detections reach the job's history through a PreviewAny
     tagged as the job's JSON answer (GET /wrapper/jobs/{job_id}/text)."""
-    detect = {"model": ["1", 0], "image": ["3", 0], "threshold": request["threshold"],
-              "refine_iterations": IMAGE_SEGMENT_REFINE_ITERATIONS, "individual_masks": False}
     graph = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
              **_first_frame(image)}
+    detect = _sam3_detect_inputs(graph, request, ["3", 0], "4")
     mode = request["mode"]
     tag = {"mode": mode, "width": width, "height": height, "individual_masks": request["individual_masks"]}
-    if mode == "prompt":
-        # SAM 3's own text encoder, from the checkpoint's CLIP output.
-        graph["4"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": request["text"]}}
-        detect["conditioning"] = ["4", 0]
-    elif mode == "boxes":
-        # Wrapped: a bare list is read as a link to another node.
-        detect["bboxes"] = {"__value__": request["boxes"]}
+    if mode == "boxes":
         tag["boxes"] = [image_segment.box_xywh(box) for box in request["boxes"]]
-    else:
-        detect["positive_coords"] = json.dumps(request["positive"])
-        if request["negative"]:
-            detect["negative_coords"] = json.dumps(request["negative"])
     graph["5"] = {"class_type": "SAM3_Detect", "inputs": detect}
     masks, detections = ["5", 0], ["5", 1]
     if request["individual_masks"]:
@@ -1509,6 +1519,260 @@ IMAGE_SEGMENT_FORM_EXTRA = {
                          "description": "Also save one mask per object (phrases and boxes), after the union. "
                                         "The response body stays the union; GET /api/wrapper/jobs/{job_id}/text "
                                         "pairs each object with its mask's URL."},
+}
+
+
+# FloStudio's "Track & replace", step 2: follow the object a member picked
+# through the shot. Frame 0 of the clip is the anchor (Flow cuts each pass so,
+# reversing backward ones). SAM3_VideoTrack (comfy_extras/nodes_sam3.py)
+# propagates the frame-0 mask with SAM 3.1's memory tracker -- the checkpoint
+# image-segment already loads -- and the result is a grey matte (white =
+# object) plus per-frame boxes as the job's JSON answer (api_wrapper/track.py).
+FX_TRACK_MODELS = IMAGE_SEGMENT_MODELS
+
+
+def build_fx_track(*, video, request, width, height, fps, mask=None, frames=None,
+                   ckpt_name=IMAGE_SEGMENT_CKPT, filename_prefix="wrapper/fx_track"):
+    """Object tracking: video (+ a frame-0 mask PNG, or a phrase, boxes or
+    points on frame 0) -> grayscale matte MP4 with the source's frames, size
+    and frame rate, no audio; the per-frame boxes reach the job's history
+    through a PreviewAny tagged as its JSON answer.
+
+    ``request`` is api_wrapper.track.track_request()'s output; ``width``,
+    ``height`` and ``fps`` (the probed video) go into the answer. Whatever
+    frame 0's selection holds is tracked as one object. ``frames`` (the probed
+    frame count) is the tracker's expected step total, one per frame (see
+    api_wrapper/progress.py)."""
+    graph = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+             "4": {"class_type": "LoadVideo", "inputs": {"file": video}},
+             # outputs: images, audio, fps, bit_depth, color_space
+             "5": {"class_type": "GetVideoComponents", "inputs": {"video": ["4", 0]}}}
+    if request["mode"] == "mask":
+        if not mask:
+            raise ValueError("a mask-anchored track needs the mask")
+        graph.update(_first_frame(mask))
+        graph["8"] = {"class_type": "ImageToMask", "inputs": {"image": ["3", 0], "channel": "red"}}
+    else:
+        graph["6"] = {"class_type": "ImageFromBatch", "inputs": {"image": ["5", 0], "batch_index": 0, "length": 1}}
+        graph["8"] = {"class_type": "SAM3_Detect", "inputs": _sam3_detect_inputs(graph, request, ["6", 0], "7")}
+    track = {"class_type": "SAM3_VideoTrack", "inputs": {
+        "images": ["5", 0], "model": ["1", 0], "initial_mask": ["8", 0],
+        "detection_threshold": request["threshold"], "max_objects": 1,
+        "detect_interval": request["detect_interval"]}}
+    if frames:
+        track["_meta"] = {"expected_steps": frames}
+    graph.update({
+        "9": track,
+        "10": {"class_type": "SAM3_TrackToMask", "inputs": {"track_data": ["9", 0], "object_indices": ""}},
+        "11": {"class_type": "MaskToImage", "inputs": {"mask": ["10", 0]}},
+        "12": {"class_type": "CreateVideo", "inputs": {"images": ["11", 0], "fps": ["5", 2], "bit_depth": 8}},
+        "13": {"class_type": "SaveVideo", "inputs": {
+            "video": ["12", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
+        "14": {"class_type": "SAM3_TrackToBBoxes", "inputs": {"track_data": ["9", 0], "object_indices": ""}},
+        "15": tag_result({"class_type": "PreviewAny", "inputs": {"source": ["14", 0]}}, "fx-track",
+                         width=width, height=height, fps=fps),
+    })
+    return graph
+
+
+FX_TRACK_FORM_EXTRA = {
+    "video": {"type": "string", "format": "binary",
+              "description": "The pass to track (mp4, webm, mov, mkv, avi or gif), with an even width and height. "
+                             "Frame 0 is the anchor: track backward by sending the clip reversed."},
+    "mask": {"type": "string", "format": "binary",
+             "description": "Frame 0's selection as a PNG at the video's size, white = object (e.g. "
+                            "image-segment's mask). Preferred; with it the fields below are ignored."},
+    "prompt": {"type": "string",
+               "description": "Without a mask: what to track as a short phrase, found on frame 0 (its best match). "
+                              "Send exactly one of prompt, boxes or positive_coords."},
+    "boxes": {"type": "string",
+              "description": "Without a mask: JSON list of pixel boxes [[x, y, w, h], ...] on frame 0 (up to "
+                             f"{object_track.TRACK_MAX_BOXES}), tracked together as one object."},
+    "positive_coords": {"type": "string",
+                        "description": "Without a mask: JSON list of pixel points [[x, y], ...] on the object in "
+                                       f"frame 0 (up to {image_segment.SEGMENT_MAX_POINTS})."},
+    "negative_coords": {"type": "string",
+                        "description": "JSON list of pixel points [[x, y], ...] to keep out of frame 0's "
+                                       "selection; only with positive_coords."},
+    "threshold": {"type": "number", "minimum": 0, "maximum": 1, "default": image_segment.SEGMENT_DEFAULT_THRESHOLD,
+                  "description": "Detection confidence a phrase's match needs on frame 0."},
+    "detect_interval": {"type": "integer", "minimum": 1, "maximum": object_track.TRACK_MAX_DETECT_INTERVAL,
+                        "default": object_track.TRACK_DEFAULT_DETECT_INTERVAL,
+                        "description": "SAM3_VideoTrack's detector interval in frames (1 = every frame)."},
+}
+
+
+# FloStudio's "Track & replace", AI mode: regenerate the tracked object inside
+# its (dilated) matte from a photo, with Wan 2.1 VACE 14B
+# (Wan-AI/Wan2.1-VACE-14B, Apache-2.0) through the core WanVaceToVideo node,
+# wired like the shipped "Video Inpainting (Wan2.1 VACE)" blueprint: the
+# blueprint's files (Comfy-Org's repackage and Kijai's CausVid speed LoRA at
+# 0.3), the fp16 UNET loaded as fp8_e4m3fn_fast, 6 uni_pc steps at cfg 1 and
+# shift 5. No int8_convrot or fp8 build of VACE 14B is published by Comfy-Org,
+# so the 35 GB fp16 file is fetched and cast on load (~17 GB of VRAM).
+FX_REPLACE_BASE_URL = "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files"
+FX_REPLACE_UNET = "wan2.1_vace_14B_fp16.safetensors"
+FX_REPLACE_WEIGHT_DTYPE = "fp8_e4m3fn_fast"
+FX_REPLACE_CLIP = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+FX_REPLACE_VAE = "wan_2.1_vae.safetensors"
+FX_REPLACE_LORA = "Wan21_CausVid_14B_T2V_lora_rank32.safetensors"
+FX_REPLACE_MODELS = [
+    {"folder": "diffusion_models", "filename": FX_REPLACE_UNET,
+     "url": f"{FX_REPLACE_BASE_URL}/diffusion_models/{FX_REPLACE_UNET}"},
+    {"folder": "text_encoders", "filename": FX_REPLACE_CLIP,
+     "url": f"{FX_REPLACE_BASE_URL}/text_encoders/{FX_REPLACE_CLIP}"},
+    {"folder": "vae", "filename": FX_REPLACE_VAE, "url": f"{FX_REPLACE_BASE_URL}/vae/{FX_REPLACE_VAE}"},
+    {"folder": "loras", "filename": FX_REPLACE_LORA,
+     "url": f"https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/{FX_REPLACE_LORA}"},
+]
+FX_REPLACE_LORA_STRENGTH = 0.3
+FX_REPLACE_SHIFT = 5.0
+FX_REPLACE_DEFAULT_STEPS = 6
+FX_REPLACE_CFG = 1.0
+# Generation canvases by tier, as pixel areas: Wan 2.1's 480p and 720p.
+FX_REPLACE_TIERS = {"standard": 832 * 480, "hd": 1280 * 720}
+FX_REPLACE_DEFAULT_TIER = "standard"
+# Wan 2.1 is trained on 81-frame clips; longer ones sample in overlapping
+# windows of that length (WanContextWindowsManual), blended where they meet.
+FX_REPLACE_WINDOW = 81
+FX_REPLACE_WINDOW_OVERLAP = 30
+# What WanVaceToVideo reads as "no picture here": the object's pixels are
+# painted this grey so the model never sees what it replaces.
+FX_REPLACE_GREY = 0x808080
+# Sampling time and VRAM grow with the generated pixel-frames. The default
+# (3e8) takes 10 s of 30 fps at hd (1280x720x301) or 20 s at standard.
+FX_REPLACE_MAX_PIXEL_FRAMES = max(1, int(float(
+    os.environ.get("COMFY_FX_REPLACE_MAX_PIXEL_FRAMES", "300000000"))))
+
+
+def fx_replace_size(width, height, tier):
+    """The generation canvas for a width x height clip: the tier's pixel area
+    at the clip's aspect, each side a multiple of 16."""
+    scale = math.sqrt(FX_REPLACE_TIERS[tier] / (width * height))
+    return max(16, round(width * scale / 16) * 16), max(16, round(height * scale / 16) * 16)
+
+
+def fx_replace_length(frames):
+    """Frames Wan generates for a ``frames`` clip: the next 4n+1 (its VAE packs
+    four frames per latent after the first); the extra ones are trimmed off."""
+    return (frames + 2) // 4 * 4 + 1
+
+
+def fx_replace_check_budget(width, height, length):
+    """An error detail when the generation would not fit this host's budget, else None."""
+    used = width * height * length
+    if used <= FX_REPLACE_MAX_PIXEL_FRAMES:
+        return None
+    return (f"{length} frames at {width}x{height} is {used / 1e6:.0f} megapixel-frames, above this host's "
+            f"{FX_REPLACE_MAX_PIXEL_FRAMES / 1e6:.0f} budget. Send at most about "
+            f"{FX_REPLACE_MAX_PIXEL_FRAMES // (width * height)} frames at this tier, a shorter range, or tier "
+            "'standard'.")
+
+
+def build_fx_replace(*, video, mask, reference, width, height, frames, keyframe=None, prompt="", seed=0,
+                     steps=FX_REPLACE_DEFAULT_STEPS, unet_name=FX_REPLACE_UNET, clip_name=FX_REPLACE_CLIP,
+                     vae_name=FX_REPLACE_VAE, lora_name=FX_REPLACE_LORA, filename_prefix="wrapper/fx_replace"):
+    """Generative replace inside a mask: video + its grey mask video (white =
+    replace) + a reference photo (+ an approved edited frame 0) -> MP4 at the
+    width x height canvas with the source's ``frames`` and frame rate, no
+    audio.
+
+    The clip and its mask are scaled to the canvas, the masked pixels painted
+    grey, and WanVaceToVideo regenerates them from the reference (padded onto
+    white, so all of it stays in view) and the prompt. A ``keyframe`` replaces
+    frame 0 of the control video, unmasked, so the result starts from it.
+    Generation runs for fx_replace_length(frames) frames, in context windows
+    past FX_REPLACE_WINDOW, and the padding is trimmed off the decoded clip."""
+    if frames < 2:
+        raise ValueError("fx-replace needs at least two frames")
+    length = fx_replace_length(frames)
+    graph = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": FX_REPLACE_WEIGHT_DTYPE}},
+        "2": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["1", 0], "lora_name": lora_name, "strength_model": FX_REPLACE_LORA_STRENGTH}},
+        "3": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["2", 0], "shift": FX_REPLACE_SHIFT}},
+        "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "wan", "device": "default"}},
+        "6": {"class_type": "VAELoader", "inputs": {"vae_name": vae_name}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["5", 0], "text": prompt}},
+        "8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["5", 0], "text": ""}},
+        "10": {"class_type": "LoadVideo", "inputs": {"file": video}},
+        # outputs: images, audio, fps, bit_depth, color_space
+        "11": {"class_type": "GetVideoComponents", "inputs": {"video": ["10", 0]}},
+        "12": {"class_type": "ImageScale", "inputs": {
+            "image": ["11", 0], "upscale_method": "area", "width": width, "height": height, "crop": "center"}},
+        "13": {"class_type": "LoadVideo", "inputs": {"file": mask}},
+        "14": {"class_type": "GetVideoComponents", "inputs": {"video": ["13", 0]}},
+        "15": {"class_type": "ImageScale", "inputs": {
+            "image": ["14", 0], "upscale_method": "bilinear", "width": width, "height": height, "crop": "center"}},
+        "16": {"class_type": "ImageToMask", "inputs": {"image": ["15", 0], "channel": "red"}},
+        "17": {"class_type": "EmptyImage", "inputs": {"width": width, "height": height, "batch_size": 1,
+                                                      "color": FX_REPLACE_GREY}},
+        "18": {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": ["12", 0], "source": ["17", 0], "x": 0, "y": 0, "resize_source": False,
+            "mask": ["16", 0]}},
+        "30": {"class_type": "LoadImage", "inputs": {"image": reference}},
+        "31": {"class_type": "ResizeAndPadImage", "inputs": {
+            "image": ["30", 0], "target_width": width, "target_height": height, "padding_color": "white",
+            "interpolation": "area"}},
+    }
+    model, control, control_masks = ["3", 0], ["18", 0], ["16", 0]
+    if length > FX_REPLACE_WINDOW:
+        graph["4"] = {"class_type": "WanContextWindowsManual", "inputs": {
+            "model": ["3", 0], "context_length": FX_REPLACE_WINDOW, "context_overlap": FX_REPLACE_WINDOW_OVERLAP,
+            "context_schedule": "standard_static", "context_stride": 1, "closed_loop": False,
+            "fuse_method": "pyramid", "freenoise": True, "retain_first_frame": False,
+            "split_conds_to_windows": False}}
+        model = ["4", 0]
+    if keyframe:
+        # Frame 0 becomes the keyframe, kept as is (a black mask frame).
+        graph.update({
+            "20": {"class_type": "LoadImage", "inputs": {"image": keyframe}},
+            "21": {"class_type": "ImageScale", "inputs": {
+                "image": ["20", 0], "upscale_method": "area", "width": width, "height": height, "crop": "center"}},
+            "22": {"class_type": "ImageFromBatch", "inputs": {"image": ["18", 0], "batch_index": 1, "length": frames - 1}},
+            "23": {"class_type": "BatchImagesNode", "inputs": {"images.image0": ["21", 0], "images.image1": ["22", 0]}},
+            "24": {"class_type": "EmptyImage", "inputs": {"width": width, "height": height, "batch_size": 1, "color": 0}},
+            "25": {"class_type": "ImageFromBatch", "inputs": {"image": ["15", 0], "batch_index": 1, "length": frames - 1}},
+            "26": {"class_type": "BatchImagesNode", "inputs": {"images.image0": ["24", 0], "images.image1": ["25", 0]}},
+            "27": {"class_type": "ImageToMask", "inputs": {"image": ["26", 0], "channel": "red"}},
+        })
+        control, control_masks = ["23", 0], ["27", 0]
+    graph.update({
+        "32": {"class_type": "WanVaceToVideo", "inputs": {
+            "positive": ["7", 0], "negative": ["8", 0], "vae": ["6", 0], "width": width, "height": height,
+            "length": length, "batch_size": 1, "strength": 1.0, "control_video": control,
+            "control_masks": control_masks, "reference_image": ["31", 0]}},
+        "33": {"class_type": "KSampler", "inputs": {
+            "model": model, "seed": seed, "steps": steps, "cfg": FX_REPLACE_CFG, "sampler_name": "uni_pc",
+            "scheduler": "simple", "positive": ["32", 0], "negative": ["32", 1], "latent_image": ["32", 2],
+            "denoise": 1.0}},
+        # Drop the reference's latent frame, then the 4n+1 padding.
+        "34": {"class_type": "TrimVideoLatent", "inputs": {"samples": ["33", 0], "trim_amount": ["32", 3]}},
+        "35": {"class_type": "VAEDecode", "inputs": {"samples": ["34", 0], "vae": ["6", 0]}},
+        "36": {"class_type": "ImageFromBatch", "inputs": {"image": ["35", 0], "batch_index": 0, "length": frames}},
+        "37": {"class_type": "CreateVideo", "inputs": {"images": ["36", 0], "fps": ["11", 2], "bit_depth": 8}},
+        "38": {"class_type": "SaveVideo", "inputs": {
+            "video": ["37", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
+    })
+    return graph
+
+
+FX_REPLACE_FORM_EXTRA = {
+    "video": {"type": "string", "format": "binary",
+              "description": "The range to regenerate (mp4, webm, mov, mkv, avi or gif), at least two frames."},
+    "mask": {"type": "string", "format": "binary",
+             "description": "Grey mask video with the same frames (and aspect) as 'video', white = replace; "
+                            "used as is, so dilate it first."},
+    "reference": {"type": "string", "format": "binary",
+                  "description": "Photo of the new object (png, jpg, webp, bmp or gif)."},
+    "keyframe": {"type": "string", "format": "binary",
+                 "description": "Optional approved edit of frame 0 (e.g. a still preview); the video starts from it."},
+    "prompt": {"type": "string", "description": "Optional words about the new object, e.g. 'a red soda can'."},
+    "tier": {"type": "string", "enum": list(FX_REPLACE_TIERS), "default": FX_REPLACE_DEFAULT_TIER,
+             "description": "Generation size at the clip's aspect, sides multiples of 16: 'standard' (about "
+                            "832x480) or 'hd' (about 1280x720). The output stays at this size."},
+    "steps": {"type": "integer", "minimum": 1, "maximum": 50, "default": FX_REPLACE_DEFAULT_STEPS,
+              "description": "Sampling steps; the speed LoRA is tuned for the default."},
 }
 
 
@@ -1773,6 +2037,37 @@ WORKFLOWS = {
                  "prompt", "seed"],
         "extra_form_properties": FX_UPSCALE_FORM_EXTRA,
         "build": build_fx_upscale_any,
+    },
+    "fx-track": {
+        "title": "Object tracking matte and boxes (SAM 3.1)",
+        "output_type": "video",
+        "requires_image": False,
+        # The phrase is one of four ways to say what to track (setup checks).
+        "requires_prompt": False,
+        "required_uploads": ["video"],
+        "setup_uses_uploads": True,
+        "uploads": {"video": {"ext": "video", "max": 1}, "mask": {"ext": "image", "max": 1}},
+        "uses": [],
+        "form": ["video", "mask", "prompt", "boxes", "positive_coords", "negative_coords", "threshold",
+                 "detect_interval"],
+        "extra_form_properties": FX_TRACK_FORM_EXTRA,
+        "text_result": object_track.track_result,
+        "build": build_fx_track,
+    },
+    "fx-replace": {
+        "title": "Generative object replace inside a mask (Wan 2.1 VACE 14B)",
+        "output_type": "video",
+        "requires_image": False,
+        "requires_prompt": False,
+        "required_uploads": ["video", "mask", "reference"],
+        "setup_uses_uploads": True,
+        "uploads": {"video": {"ext": "video", "max": 1}, "mask": {"ext": "video", "max": 1},
+                    "reference": {"ext": "image", "max": 1}, "keyframe": {"ext": "image", "max": 1}},
+        # steps comes through the setup (the speed LoRA's default, not 20).
+        "uses": ["prompt", "seed"],
+        "form": ["video", "mask", "reference", "keyframe", "prompt", "tier", "seed", "steps"],
+        "extra_form_properties": FX_REPLACE_FORM_EXTRA,
+        "build": build_fx_replace,
     },
     "image-segment": {
         "title": "Image segmentation by phrase, box or point (SAM 3)",
