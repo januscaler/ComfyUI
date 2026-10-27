@@ -1555,9 +1555,9 @@ def register_wrapper_routes(routes, prompt_server):
         if error is not None:
             return error
 
-        for node_outputs in (job.get("outputs") or {}).values():
-            for image in node_outputs.get("images", []):
-                raise web.HTTPFound(wrapper_results.view_url(image))
+        image = wrapper_results.first_image(job.get("outputs"))
+        if image is not None:
+            raise web.HTTPFound(wrapper_results.view_url(image))
         return _error_response("Job has no image output", status=404)
 
     @routes.get("/wrapper/jobs/{job_id}/text")

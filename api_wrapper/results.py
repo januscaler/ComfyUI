@@ -38,6 +38,19 @@ def saved_images(outputs):
             and item.get("type", "output") == "output"]
 
 
+def first_image(outputs):
+    """The first file a job saved to the output folder ({filename, subfolder,
+    type}), in history order; failing that, the first of any kind. A graph that
+    loads its inputs through LoadVideo / LoadImage also lists them in the history
+    (``type: input``, a preview of each), and they come first when their node ids
+    sort before the SaveVideo's: the answer must never be one of those."""
+    items = [item
+             for node_outputs in (outputs or {}).values() if isinstance(node_outputs, dict)
+             for item in node_outputs.get("images") or () if isinstance(item, dict) and item.get("filename")]
+    saved = [item for item in items if item.get("type", "output") == "output"]
+    return (saved or items or [None])[0]
+
+
 def _result_node(graph):
     """(node id, tag) of the graph's tagged result node, or None."""
     for node_id, node in (graph or {}).items():
