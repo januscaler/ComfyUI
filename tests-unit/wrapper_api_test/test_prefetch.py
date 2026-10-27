@@ -46,7 +46,11 @@ class TestPrefetchSpecs(unittest.TestCase):
     def test_flo_track_and_replace_specs(self):
         """Tracking reuses image-segment's SAM 3.1 file; replace fetches the VACE 14B set."""
         self.assertEqual(_prefetch().models_for("fx-track"), wf.IMAGE_SEGMENT_MODELS)
-        self.assertEqual(_prefetch().models_for("FX-Replace"), wf.FX_REPLACE_MODELS)
+        replace = {m["filename"] for m in _prefetch().models_for("fx-replace")}
+        self.assertIn("lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors", replace)
+        self.assertIn("Wan21_CausVid_14B_T2V_lora_rank32.safetensors", replace)
+        self.assertIn("film_net_fp16.safetensors", replace)
+        self.assertEqual(_prefetch().models_for("FX-Replace"), wf.fx_replace_all_models())
         with self.assertRaises(SystemExit) as ctx:
             _prefetch().models_for("fx-nothing")
         self.assertIn("fx-replace", str(ctx.exception))

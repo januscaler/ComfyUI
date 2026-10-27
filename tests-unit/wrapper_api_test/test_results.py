@@ -70,6 +70,21 @@ class TestTextResult:
         assert results.saved_images(outputs) == ["/view?filename=a.png&subfolder=&type=output"]
 
 
+    def test_first_image_is_a_saved_one_never_an_inputs_preview(self):
+        """A graph that loads its video through LoadVideo lists the input in its history
+        (node ids 10 and 13 before the SaveVideo's 38): the job's answer is the saved file."""
+        outputs = {"10": {"images": [{"filename": "in.mp4", "subfolder": "wrapper/j", "type": "input"}]},
+                   "13": {"images": [{"filename": "mask.mp4", "subfolder": "wrapper/j", "type": "input"}]},
+                   "38": {"images": [{"filename": "fx-replace_00001_.mp4", "subfolder": "wrapper/j",
+                                      "type": "output"}]}}
+        assert results.first_image(outputs)["filename"] == "fx-replace_00001_.mp4"
+        # With nothing saved, the first of any kind (the old behaviour); with nothing, None.
+        only_inputs = {"10": outputs["10"], "13": outputs["13"]}
+        assert results.first_image(only_inputs)["filename"] == "in.mp4"
+        assert results.first_image({"3": {"text": ["x"]}, "4": "not a dict"}) is None
+        assert results.first_image(None) is None
+
+
 class FakePromptQueue:
     def __init__(self):
         self.mutex = threading.RLock()
@@ -154,3 +169,14 @@ class TestTextRoute:
         response = await client.get(f"/api/wrapper/jobs/{job_id}/image", allow_redirects=False)
         assert response.status == 302
         assert response.headers["Location"] == "/view?filename=image-segment_00001_.png&subfolder=wrapper/j&type=output"
+
+    async def test_image_route_redirects_to_the_saved_file_not_the_loaded_input(self, aiohttp_client, queue):
+        outputs = {"10": {"images": [{"filename": "in.mp4", "subfolder": "wrapper/j", "type": "input"}]},
+                   "38": {"images": [{"filename": "fx-replace_00001_.mp4", "subfolder": "wrapper/j",
+                                      "type": "output"}]}}
+        job_id = finished(queue, wf.build_fx_bgremove(video="v.mp4"), outputs)
+        client = await aiohttp_client(make_app(queue))
+        response = await client.get(f"/api/wrapper/jobs/{job_id}/image", allow_redirects=False)
+        assert response.status == 302
+        assert response.headers["Location"] == (
+            "/view?filename=fx-replace_00001_.mp4&subfolder=wrapper/j&type=output")

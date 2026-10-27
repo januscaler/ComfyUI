@@ -19,7 +19,8 @@ Specs name a workflow and, for MiniMax H3 or Qwen Image 2.1, a quantization:
     image-describe         Qwen3-VL 8B captions/objects: Qwen Image 2.1's int8 encoder
     fx-track               FloStudio object tracking: image-segment's SAM 3.1 checkpoint
     fx-replace             FloStudio AI object replace: Wan 2.1 VACE 14B fp16 UNET (35 GB),
-                           UMT5 fp8 encoder, Wan 2.1 VAE, CausVid speed LoRA (~42 GB)
+                           UMT5 fp8 encoder, Wan 2.1 VAE, the CausVid and lightx2v speed
+                           LoRAs and the FILM interpolation checkpoint (~42 GB)
 
 H3 quantizations are the wrapper's: nvfp4 (fp8 UNET), int8, fp8, bf16; they pick
 the UNET. The text encoder is always the one the wrapper loads at render time,
@@ -76,7 +77,7 @@ def models_for(spec: str) -> list[dict]:
     if name == "fx-track":
         return list(wf.FX_TRACK_MODELS)
     if name == "fx-replace":
-        return list(wf.FX_REPLACE_MODELS)
+        return wf.fx_replace_all_models()
     raise SystemExit(f"prefetch: unknown spec {spec!r} (minimaxh3[:quant], minimaxh3-ref[:quant], flux2klein9b, "
                      "qwenimage21[:quant], image-segment, image-describe, fx-track, fx-replace)")
 

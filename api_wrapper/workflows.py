@@ -1629,9 +1629,33 @@ FX_REPLACE_LORA_STRENGTH = 0.3
 FX_REPLACE_SHIFT = 5.0
 FX_REPLACE_DEFAULT_STEPS = 6
 FX_REPLACE_CFG = 1.0
-# Generation canvases by tier, as pixel areas: Wan 2.1's 480p and 720p.
-FX_REPLACE_TIERS = {"standard": 832 * 480, "hd": 1280 * 720}
+# The quick tier swaps CausVid (6 steps, strength 0.3) for lightx2v's 4-step
+# distillation of Wan 2.1 14B (Lightx2v/lightx2v_T2V_14B_cfg_step_distill_v2,
+# Kijai/WanVideo_comfy, rank 32): its documented use is 4 steps, cfg 1, strength 1.
+FX_REPLACE_QUICK_LORA = "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors"
+FX_REPLACE_QUICK_LORA_STRENGTH = 1.0
+FX_REPLACE_QUICK_STEPS = 4
+FX_REPLACE_MODELS.append({
+    "folder": "loras", "filename": FX_REPLACE_QUICK_LORA,
+    "url": f"https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/{FX_REPLACE_QUICK_LORA}"})
+# Generation canvases by tier, as pixel areas: 'standard' and 'hd' are Wan
+# 2.1's 480p and 720p; 'quick' is a quarter of a megapixel.
+FX_REPLACE_TIERS = {"quick": 640 * 384, "standard": 832 * 480, "hd": 1280 * 720}
 FX_REPLACE_DEFAULT_TIER = "standard"
+# What each tier samples with: the speed LoRA, its strength and the steps.
+FX_REPLACE_TIER_SETUP = {
+    "quick": {"lora": FX_REPLACE_QUICK_LORA, "lora_strength": FX_REPLACE_QUICK_LORA_STRENGTH,
+              "steps": FX_REPLACE_QUICK_STEPS},
+    "standard": {"lora": FX_REPLACE_LORA, "lora_strength": FX_REPLACE_LORA_STRENGTH,
+                 "steps": FX_REPLACE_DEFAULT_STEPS},
+    "hd": {"lora": FX_REPLACE_LORA, "lora_strength": FX_REPLACE_LORA_STRENGTH,
+           "steps": FX_REPLACE_DEFAULT_STEPS},
+}
+# ``interpolate``: frames made per generated gap (1 = none), so a clip generated
+# at half the frame rate is played back at the full one.
+FX_REPLACE_INTERPOLATE = (1, 2)
+# The exact generation canvas a caller may ask for (``canvas``, 'WxH').
+FX_REPLACE_CANVAS_SIDE = (64, 2048)
 # Wan 2.1 is trained on 81-frame clips; longer ones sample in overlapping
 # windows of that length (WanContextWindowsManual), blended where they meet.
 FX_REPLACE_WINDOW = 81
@@ -1645,11 +1669,40 @@ FX_REPLACE_MAX_PIXEL_FRAMES = max(1, int(float(
     os.environ.get("COMFY_FX_REPLACE_MAX_PIXEL_FRAMES", "300000000"))))
 
 
+def fx_replace_models(tier=FX_REPLACE_DEFAULT_TIER, interpolate=1):
+    """The files one fx-replace job at ``tier`` needs: the VACE stack, the
+    tier's speed LoRA, and the interpolation checkpoint when it interpolates."""
+    wanted = FX_REPLACE_TIER_SETUP[tier]["lora"]
+    models = [m for m in FX_REPLACE_MODELS if m["folder"] != "loras" or m["filename"] == wanted]
+    if interpolate > 1:
+        models += fx_interp_models(FX_INTERP_DEFAULT_MODEL)
+    return models
+
+
+def fx_replace_all_models():
+    """Every file any tier needs (what ``prefetch fx-replace`` fetches)."""
+    return FX_REPLACE_MODELS + fx_interp_models(FX_INTERP_DEFAULT_MODEL)
+
+
 def fx_replace_size(width, height, tier):
     """The generation canvas for a width x height clip: the tier's pixel area
     at the clip's aspect, each side a multiple of 16."""
     scale = math.sqrt(FX_REPLACE_TIERS[tier] / (width * height))
     return max(16, round(width * scale / 16) * 16), max(16, round(height * scale / 16) * 16)
+
+
+def fx_replace_canvas(text):
+    """A ``canvas`` form value ('WxH', multiples of 16) as ``(width, height)``;
+    ``ValueError`` (with what is wrong) for anything else."""
+    parts = str(text).lower().replace("*", "x").split("x")
+    try:
+        width, height = (int(p) for p in parts) if len(parts) == 2 else (0, 0)
+    except ValueError:
+        width = height = 0
+    low, high = FX_REPLACE_CANVAS_SIDE
+    if not (low <= width <= high and low <= height <= high) or width % 16 or height % 16:
+        raise ValueError(f"canvas must be 'WxH' with each side a multiple of 16 from {low} to {high}.")
+    return width, height
 
 
 def fx_replace_length(frames):
@@ -1671,11 +1724,17 @@ def fx_replace_check_budget(width, height, length):
 
 def build_fx_replace(*, video, mask, reference, width, height, frames, keyframe=None, prompt="", seed=0,
                      steps=FX_REPLACE_DEFAULT_STEPS, unet_name=FX_REPLACE_UNET, clip_name=FX_REPLACE_CLIP,
-                     vae_name=FX_REPLACE_VAE, lora_name=FX_REPLACE_LORA, filename_prefix="wrapper/fx_replace"):
+                     vae_name=FX_REPLACE_VAE, lora_name=FX_REPLACE_LORA,
+                     lora_strength=FX_REPLACE_LORA_STRENGTH, interpolate=1, fps=None,
+                     interp_model_name=FX_INTERP_MODELS[FX_INTERP_DEFAULT_MODEL],
+                     filename_prefix="wrapper/fx_replace"):
     """Generative replace inside a mask: video + its grey mask video (white =
     replace) + a reference photo (+ an approved edited frame 0) -> MP4 at the
     width x height canvas with the source's ``frames`` and frame rate, no
-    audio.
+    audio. With ``interpolate`` 2 the answer has ``(frames - 1) * 2 + 1``
+    frames at twice the rate (the same duration): FILM fills in between the
+    generated ones, so a clip sent at half the frame rate comes back at it
+    (``fps`` is then the sent clip's probed rate, which the answer doubles).
 
     The clip and its mask are scaled to the canvas, the masked pixels painted
     grey, and WanVaceToVideo regenerates them from the reference (padded onto
@@ -1685,11 +1744,15 @@ def build_fx_replace(*, video, mask, reference, width, height, frames, keyframe=
     past FX_REPLACE_WINDOW, and the padding is trimmed off the decoded clip."""
     if frames < 2:
         raise ValueError("fx-replace needs at least two frames")
+    if interpolate not in FX_REPLACE_INTERPOLATE:
+        raise ValueError(f"interpolate must be one of {FX_REPLACE_INTERPOLATE}")
+    if interpolate > 1 and not fps:
+        raise ValueError("interpolating needs the clip's frame rate (fps)")
     length = fx_replace_length(frames)
     graph = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": FX_REPLACE_WEIGHT_DTYPE}},
         "2": {"class_type": "LoraLoaderModelOnly", "inputs": {
-            "model": ["1", 0], "lora_name": lora_name, "strength_model": FX_REPLACE_LORA_STRENGTH}},
+            "model": ["1", 0], "lora_name": lora_name, "strength_model": lora_strength}},
         "3": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["2", 0], "shift": FX_REPLACE_SHIFT}},
         "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "wan", "device": "default"}},
         "6": {"class_type": "VAELoader", "inputs": {"vae_name": vae_name}},
@@ -1754,6 +1817,14 @@ def build_fx_replace(*, video, mask, reference, width, height, frames, keyframe=
         "38": {"class_type": "SaveVideo", "inputs": {
             "video": ["37", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
     })
+    if interpolate > 1:
+        graph.update({
+            "39": {"class_type": "FrameInterpolationModelLoader", "inputs": {"model_name": interp_model_name}},
+            "40": {"class_type": "FrameInterpolate", "inputs": {
+                "interp_model": ["39", 0], "images": ["36", 0], "multiplier": interpolate},
+                   "_meta": {"expected_steps": (frames - 1) * (interpolate - 1)}},
+        })
+        graph["37"]["inputs"].update({"images": ["40", 0], "fps": float(fps) * interpolate})
     return graph
 
 
@@ -1769,10 +1840,21 @@ FX_REPLACE_FORM_EXTRA = {
                  "description": "Optional approved edit of frame 0 (e.g. a still preview); the video starts from it."},
     "prompt": {"type": "string", "description": "Optional words about the new object, e.g. 'a red soda can'."},
     "tier": {"type": "string", "enum": list(FX_REPLACE_TIERS), "default": FX_REPLACE_DEFAULT_TIER,
-             "description": "Generation size at the clip's aspect, sides multiples of 16: 'standard' (about "
-                            "832x480) or 'hd' (about 1280x720). The output stays at this size."},
-    "steps": {"type": "integer", "minimum": 1, "maximum": 50, "default": FX_REPLACE_DEFAULT_STEPS,
-              "description": "Sampling steps; the speed LoRA is tuned for the default."},
+             "description": "The model setup and, without 'canvas', the generation size at the clip's aspect "
+                            "(sides multiples of 16): 'quick' (about 640x384; lightx2v's 4-step LoRA), "
+                            "'standard' (about 832x480; CausVid, 6 steps) or 'hd' (about 1280x720; the same "
+                            "setup as standard). The output stays at the canvas size."},
+    "canvas": {"type": "string", "example": "336x512",
+               "description": "The exact generation size, 'WxH' with each side a multiple of 16 (64 to 2048); "
+                              "overrides the tier's. A caller that sends only the crop around the object sends "
+                              "it already at this size."},
+    "steps": {"type": "integer", "minimum": 1, "maximum": 50,
+              "description": "Sampling steps; the speed LoRA is tuned for the tier's default (quick 4, "
+                             f"standard and hd {FX_REPLACE_DEFAULT_STEPS})."},
+    "interpolate": {"type": "integer", "enum": list(FX_REPLACE_INTERPOLATE), "default": 1,
+                    "description": "2: FILM makes a frame between each pair generated, so the answer has "
+                                   "(frames - 1) * 2 + 1 frames at twice the video's frame rate (the same "
+                                   "duration). For a video sent at half the rate it is to play at."},
 }
 
 

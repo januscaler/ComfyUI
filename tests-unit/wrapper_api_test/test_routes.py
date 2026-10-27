@@ -578,7 +578,9 @@ class TestFxReplaceSetup(_ProbedVideoSetup):
                                   "vae_name": "wan_2.1_vae.safetensors",
                                   "lora_name": "Wan21_CausVid_14B_T2V_lora_rank32.safetensors"})
         self.assertEqual([name for _, name in self.requested],
-                         [m["filename"] for m in wrapper_workflows.FX_REPLACE_MODELS])
+                         [m["filename"] for m in wrapper_workflows.fx_replace_models("standard")])
+        self.assertNotIn("lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors",
+                         [name for _, name in self.requested])
         self.assertEqual(note, "61 frames of 1280x720 -> 848x480 (standard) regenerated inside the mask from the "
                                "reference, 61 frames at 6 steps, the source 30 fps, no audio")
         graph = wrapper_workflows.build_fx_replace(video="v.mp4", mask="m.mp4", reference="r.png", **kwargs)
@@ -586,6 +588,32 @@ class TestFxReplaceSetup(_ProbedVideoSetup):
         headers = wrapper_routes._resolution_headers(kwargs, note)
         self.assertEqual(headers["X-Wrapper-Settings"], "width=848 height=480 steps=6")
         self.assertTrue(headers["X-Wrapper-Models"].startswith("wan2.1_vace_14B_fp16.safetensors"))
+
+    def test_quick_tier_uses_the_distilled_lora_and_four_steps(self):
+        kwargs, note = self._setup({"tier": "quick"})
+        self.assertEqual((kwargs["width"], kwargs["height"], kwargs["steps"]), (656, 368, 4))
+        self.assertEqual(kwargs["lora_name"], "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors")
+        self.assertEqual(kwargs["lora_strength"], 1.0)
+        self.assertNotIn("interpolate", kwargs)
+        self.assertEqual([name for _, name in self.requested],
+                         [m["filename"] for m in wrapper_workflows.fx_replace_models("quick")])
+        self.assertIn("(quick)", note)
+        graph = wrapper_workflows.build_fx_replace(video="v.mp4", mask="m.mp4", reference="r.png", **kwargs)
+        self.assertEqual(graph["2"]["inputs"]["strength_model"], 1.0)
+
+    def test_canvas_overrides_the_tier_and_steps_the_tier_default(self):
+        kwargs, note = self._setup({"tier": "quick", "canvas": "336x512", "steps": "6"})
+        self.assertEqual((kwargs["width"], kwargs["height"], kwargs["steps"]), (336, 512, 6))
+        self.assertIn("1280x720 -> 336x512 (quick)", note)
+
+    def test_interpolating_doubles_the_rate_and_fetches_the_interpolator(self):
+        self.probe = (336, 512, 40, 16.0)
+        kwargs, note = self._setup({"tier": "quick", "canvas": "336x512", "interpolate": "2"})
+        self.assertEqual((kwargs["interpolate"], kwargs["fps"]), (2, 16.0))
+        self.assertIn(("frame_interpolation", "film_net_fp16.safetensors"), self.requested)
+        self.assertIn("32 fps (interpolated from the sent 16)", note)
+        graph = wrapper_workflows.build_fx_replace(video="v.mp4", mask="m.mp4", reference="r.png", **kwargs)
+        self.assertEqual(graph["37"]["inputs"]["fps"], 32.0)
 
     def test_hd_long_range_with_keyframe(self):
         self.probe = (1920, 1080, 120, 24.0)
@@ -596,7 +624,9 @@ class TestFxReplaceSetup(_ProbedVideoSetup):
 
     def test_refusals_happen_before_any_download(self):
         for fields, message in (({"tier": "4k"}, "Invalid tier"), ({"steps": "0"}, "Invalid steps"),
-                                ({"steps": "x"}, "Invalid steps")):
+                                ({"steps": "x"}, "Invalid steps"), ({"interpolate": "3"}, "Invalid interpolate"),
+                                ({"interpolate": "x"}, "Invalid interpolate"),
+                                ({"canvas": "100x100"}, "Invalid canvas"), ({"canvas": "wide"}, "Invalid canvas")):
             self.assertEqual(self._refused_replace(fields).message, message)
         self.assertEqual(self._refused_replace({}, refs={"video": ["wrapper/job/clip.mp4"]}).message, "No mask provided")
         self.mask_probe = (1280, 720, 60, 30.0)
