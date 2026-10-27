@@ -954,18 +954,32 @@ async def _setup_fx_track(fields, downloaded, upload_refs):
 
 
 async def _setup_fx_replace(fields, downloaded, upload_refs):
-    """Setup for fx-replace: check tier/steps, probe the video and its mask
-    video (same frames and aspect), size the generation canvas against the
-    budget, and fetch the VACE 14B files."""
+    """Setup for fx-replace: check tier/steps/canvas/interpolate, probe the
+    video and its mask video (same frames and aspect), size the generation
+    canvas against the budget, and fetch the VACE 14B files and the tier's
+    speed LoRA."""
     tier = (fields.get("tier") or wrapper_workflows.FX_REPLACE_DEFAULT_TIER).strip().lower()
     if tier not in wrapper_workflows.FX_REPLACE_TIERS:
-        raise _SetupError("Invalid tier", "tier must be 'standard' or 'hd'.")
+        raise _SetupError("Invalid tier", "tier must be 'quick', 'standard' or 'hd'.")
+    setup = wrapper_workflows.FX_REPLACE_TIER_SETUP[tier]
     try:
-        steps = int(fields.get("steps") or wrapper_workflows.FX_REPLACE_DEFAULT_STEPS)
+        steps = int(fields.get("steps") or setup["steps"])
     except ValueError:
         steps = 0
     if not 1 <= steps <= 50:
         raise _SetupError("Invalid steps", "steps must be a whole number from 1 to 50.")
+    try:
+        interpolate = int(fields.get("interpolate") or 1)
+    except ValueError:
+        interpolate = 0
+    if interpolate not in wrapper_workflows.FX_REPLACE_INTERPOLATE:
+        raise _SetupError("Invalid interpolate",
+                          f"interpolate must be one of {list(wrapper_workflows.FX_REPLACE_INTERPOLATE)}.")
+    canvas = (fields.get("canvas") or "").strip()
+    try:
+        asked_size = wrapper_workflows.fx_replace_canvas(canvas) if canvas else None
+    except ValueError as e:
+        raise _SetupError("Invalid canvas", str(e)) from None
     width, height, frames, fps = await _probe_upload(upload_refs, "Send the range to regenerate in 'video'.")
     if frames < 2:
         raise _SetupError("Video too short", "The video needs at least two frames.")
@@ -977,22 +991,30 @@ async def _setup_fx_replace(fields, downloaded, upload_refs):
     if abs(mask_width * height - width * mask_height) > 0.01 * width * mask_height:
         raise _SetupError("Mask size mismatch", f"The mask video is {mask_width}x{mask_height}, the video "
                                                 f"{width}x{height}; send them at the same aspect.")
-    out_width, out_height = wrapper_workflows.fx_replace_size(width, height, tier)
+    out_width, out_height = asked_size or wrapper_workflows.fx_replace_size(width, height, tier)
     length = wrapper_workflows.fx_replace_length(frames)
     over_budget = wrapper_workflows.fx_replace_check_budget(out_width, out_height, length)
     if over_budget:
         raise _SetupError(
             "Request exceeds this host's safe replace budget",
             f"{over_budget} The limit is set by COMFY_FX_REPLACE_MAX_PIXEL_FRAMES.")
-    _raise_if_missing(await _download_models(wrapper_workflows.FX_REPLACE_MODELS, downloaded))
+    _raise_if_missing(await _download_models(wrapper_workflows.fx_replace_models(tier, interpolate), downloaded))
     windows = " in context windows" if length > wrapper_workflows.FX_REPLACE_WINDOW else ""
     keyframe = ", from the keyframe" if upload_refs.get("keyframe") else ""
+    rate = (f"{fps * interpolate:g} fps (interpolated from the sent {fps:g})" if interpolate > 1
+            else f"the source {fps:g} fps")
     note = (f"{frames} frames of {width}x{height} -> {out_width}x{out_height} ({tier}) regenerated inside the mask "
-            f"from the reference{keyframe}, {length} frames{windows} at {steps} steps, the source {fps:g} fps, "
+            f"from the reference{keyframe}, {length} frames{windows} at {steps} steps, {rate}, "
             "no audio")
-    return {"width": out_width, "height": out_height, "frames": frames, "steps": steps,
-            "unet_name": wrapper_workflows.FX_REPLACE_UNET, "clip_name": wrapper_workflows.FX_REPLACE_CLIP,
-            "vae_name": wrapper_workflows.FX_REPLACE_VAE, "lora_name": wrapper_workflows.FX_REPLACE_LORA}, note
+    kwargs = {"width": out_width, "height": out_height, "frames": frames, "steps": steps,
+              "unet_name": wrapper_workflows.FX_REPLACE_UNET, "clip_name": wrapper_workflows.FX_REPLACE_CLIP,
+              "vae_name": wrapper_workflows.FX_REPLACE_VAE, "lora_name": setup["lora"]}
+    if setup["lora_strength"] != wrapper_workflows.FX_REPLACE_LORA_STRENGTH:
+        kwargs["lora_strength"] = setup["lora_strength"]
+    if interpolate > 1:
+        kwargs.update({"interpolate": interpolate, "fps": fps,
+                       "interp_model_name": wrapper_workflows.FX_INTERP_MODELS[wrapper_workflows.FX_INTERP_DEFAULT_MODEL]})
+    return kwargs, note
 
 
 async def _setup_image_describe(fields, downloaded, upload_refs):

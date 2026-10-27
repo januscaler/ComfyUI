@@ -1375,6 +1375,7 @@ class TestFxReplaceGraph(unittest.TestCase):
         self.assertEqual(size(1080, 1920, "standard"), (480, 848))
         self.assertEqual(size(1000, 1000, "hd"), (960, 960))
         self.assertEqual(size(640, 360, "standard"), (848, 480))
+        self.assertEqual(size(1080, 1920, "quick"), (368, 656))
 
     def test_budget(self):
         # 10 s of 30 fps at hd fits the default budget; 20 s does not.
@@ -1392,9 +1393,65 @@ class TestFxReplaceGraph(unittest.TestCase):
             "wan_2.1_vae.safetensors": f"{base}/vae/wan_2.1_vae.safetensors",
             "Wan21_CausVid_14B_T2V_lora_rank32.safetensors":
                 "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan21_CausVid_14B_T2V_lora_rank32.safetensors",
+            "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors":
+                "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/"
+                "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors",
         })
         self.assertEqual([m["folder"] for m in wrapper_workflows.FX_REPLACE_MODELS],
-                         ["diffusion_models", "text_encoders", "vae", "loras"])
+                         ["diffusion_models", "text_encoders", "vae", "loras", "loras"])
+
+    def test_each_tier_fetches_only_its_speed_lora(self):
+        names = lambda tier, interpolate=1: [m["filename"] for m in  # noqa: E731
+                                              wrapper_workflows.fx_replace_models(tier, interpolate)]
+        self.assertIn("Wan21_CausVid_14B_T2V_lora_rank32.safetensors", names("standard"))
+        self.assertNotIn("lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors", names("hd"))
+        quick = names("quick", 2)
+        self.assertIn("lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank32_bf16.safetensors", quick)
+        self.assertNotIn("Wan21_CausVid_14B_T2V_lora_rank32.safetensors", quick)
+        self.assertIn("film_net_fp16.safetensors", quick)          # the interpolation checkpoint
+        self.assertNotIn("film_net_fp16.safetensors", names("quick"))
+        # What `prefetch fx-replace` fetches is every file any tier needs.
+        self.assertEqual({m["filename"] for m in wrapper_workflows.fx_replace_all_models()},
+                         set(quick) | set(names("standard")))
+
+    def test_tiers_and_their_setups(self):
+        self.assertEqual(list(wrapper_workflows.FX_REPLACE_TIERS), ["quick", "standard", "hd"])
+        areas = list(wrapper_workflows.FX_REPLACE_TIERS.values())
+        self.assertEqual(areas, sorted(areas))
+        setup = wrapper_workflows.FX_REPLACE_TIER_SETUP
+        self.assertEqual(set(setup), set(wrapper_workflows.FX_REPLACE_TIERS))
+        self.assertEqual((setup["quick"]["steps"], setup["quick"]["lora_strength"]), (4, 1.0))
+        self.assertEqual((setup["standard"]["steps"], setup["hd"]["steps"]), (6, 6))
+        # The default tier is the one the endpoint always had.
+        self.assertEqual(wrapper_workflows.FX_REPLACE_DEFAULT_TIER, "standard")
+
+    def test_canvas_form_value(self):
+        canvas = wrapper_workflows.fx_replace_canvas
+        self.assertEqual(canvas("336x512"), (336, 512))
+        self.assertEqual(canvas(" 64X2048 "), (64, 2048))
+        for bad in ("", "336", "336x", "axb", "336x500", "32x512", "4096x512", "336x512x3", "0x0"):
+            with self.assertRaises(ValueError, msg=bad):
+                canvas(bad)
+
+    def test_lora_strength_and_interpolation(self):
+        quick = _replace_graph(frames=40, lora_name="lightx2v.safetensors", lora_strength=1.0, steps=4,
+                               interpolate=2, fps=16.0)
+        self.assertEqual(quick["2"]["inputs"]["strength_model"], 1.0)
+        self.assertEqual(quick["33"]["inputs"]["steps"], 4)
+        self.assertEqual(quick["39"]["inputs"], {"model_name": "film_net_fp16.safetensors"})
+        self.assertEqual(quick["40"]["inputs"], {"interp_model": ["39", 0], "images": ["36", 0], "multiplier": 2})
+        self.assertEqual(quick["40"]["_meta"], {"expected_steps": 39})
+        # The answer plays at twice the sent rate: the same duration, ``(n-1)*2+1`` frames.
+        self.assertEqual(quick["37"]["inputs"], {"images": ["40", 0], "fps": 32.0, "bit_depth": 8})
+        _assert_links_resolve(self, quick)
+        plain = _replace_graph(frames=40)
+        self.assertNotIn("40", plain)
+        self.assertEqual(plain["37"]["inputs"]["images"], ["36", 0])
+        self.assertEqual(plain["2"]["inputs"]["strength_model"], 0.3)
+        with self.assertRaises(ValueError):
+            _replace_graph(interpolate=3, fps=16.0)
+        with self.assertRaises(ValueError):
+            _replace_graph(interpolate=2)       # the answer's rate needs the sent clip's
 
     def test_registered_with_its_uploads(self):
         entry = wrapper_workflows.WORKFLOWS["fx-replace"]
@@ -1410,8 +1467,9 @@ class TestFxReplaceGraph(unittest.TestCase):
         op = spec["paths"]["/api/wrapper/fx-replace/generate"]["post"]
         schema = op["requestBody"]["content"]["multipart/form-data"]["schema"]
         self.assertEqual(sorted(schema["required"]), ["mask", "reference", "video"])
-        self.assertEqual(schema["properties"]["tier"]["enum"], ["standard", "hd"])
-        self.assertEqual(schema["properties"]["steps"]["default"], 6)
+        self.assertEqual(schema["properties"]["tier"]["enum"], ["quick", "standard", "hd"])
+        self.assertEqual(schema["properties"]["interpolate"]["enum"], [1, 2])
+        self.assertIn("canvas", schema["properties"])
         self.assertEqual(list(op["responses"]["200"]["content"])[0], "video/mp4")
         self.assertEqual(op["operationId"], "generateFxReplace")
 
@@ -1797,10 +1855,13 @@ class TestGraphValidation(unittest.TestCase):
                                          [(f"fx-track {label}", graph, ["13", "15"]) for label, graph in graphs])
 
     def test_fx_replace_graphs_pass_core_validation(self):
-        self._validate_with_placeholders(wrapper_workflows.FX_REPLACE_MODELS, [
+        self._validate_with_placeholders(wrapper_workflows.fx_replace_all_models(), [
             ("fx-replace", _replace_graph(), ["38"]),
             ("fx-replace keyframe", _replace_graph(keyframe="wrapper/test_input.png"), ["38"]),
             ("fx-replace windows", _replace_graph(frames=120), ["38"]),
+            ("fx-replace quick", _replace_graph(
+                lora_name=wrapper_workflows.FX_REPLACE_QUICK_LORA, lora_strength=1.0, steps=4,
+                interpolate=2, fps=16.0, keyframe="wrapper/test_input.png"), ["38"]),
         ])
 
     def test_fx_replace_keyframe_batches_reach_the_node(self):
