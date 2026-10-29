@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -647,6 +648,30 @@ class TestMiniMaxH3Graph(unittest.TestCase):
             self.assertLessEqual(fitted_w * fitted_h, w.MINIMAX_H3_MAX_PIXELS)
             self.assertIn("native canvas", note)
             self.assertAlmostEqual(fitted_w / fitted_h, width / height, delta=0.15)
+
+    def test_720p_class_long_edge_snaps_to_1216(self):
+        w = wrapper_workflows
+        self.assertEqual(w.MINIMAX_H3_SNAP_LONG_EDGE, 1216)
+        # 1280x720 (Voxmin's HD tier) -> 1216x704: fewer VAE tiles, aspect kept, on the grid
+        fitted_w, fitted_h, note = w.minimax_h3_fit_canvas(1280, 720)
+        self.assertEqual((fitted_w, fitted_h), (1216, 704))
+        self.assertIn("1280x720 is generated at 1216x704", note)
+        # the grid-rounded form of the same request lands in the same place
+        self.assertEqual(w.minimax_h3_fit_canvas(1280, 736)[:2], (1216, 704))
+        # portrait: the long edge is the height
+        self.assertEqual(w.minimax_h3_fit_canvas(720, 1280)[:2], (704, 1216))
+        # at or below 1216, and above 1280, nothing snaps
+        for size in ((1216, 704), (1152, 640), (864, 480), (1344, 768)):
+            self.assertEqual(w.minimax_h3_fit_canvas(*size), (*size, None))
+        self.assertEqual(w.minimax_h3_fit_canvas(1281, 720)[:2], (1312, 736))
+        # the snapped canvas is cheaper than the one it replaces, and inside the native canvas
+        self.assertLess(1216 * 704, 1280 * 736)
+        self.assertLessEqual(1216 * 704, w.MINIMAX_H3_MAX_PIXELS)
+
+    def test_snap_can_be_turned_off(self):
+        w = wrapper_workflows
+        with mock.patch.object(w, "MINIMAX_H3_SNAP_LONG_EDGE", 0):
+            self.assertEqual(w.minimax_h3_fit_canvas(1280, 720), (1280, 736, None))
 
     def test_budget_matches_measured_envelope(self):
         """The guard has to agree with what the reference box actually did:
