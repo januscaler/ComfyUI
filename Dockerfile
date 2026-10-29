@@ -26,17 +26,23 @@
 #
 # CUDA only. The PyTorch CUDA wheels bundle the CUDA runtime, so this slim
 # image uses the host GPU through the NVIDIA container toolkit. The torch build
-# is cu130, which needs host driver >= 580: comfy/quant_ops.py turns off
-# comfy-kitchen's CUDA kernels on any torch older than CUDA 13, and without
-# them one RTX 5090 samples MiniMax H3 1.8-2.9x slower (720p 5 s: 13.5 s/step
-# on cu128, 7.4 s/step on cu130). The backend only rents hosts whose driver
-# supports CUDA 13, and docker/entrypoint.sh stops on an older driver.
+# is cu134 (CUDA 13.4, the newest index on download.pytorch.org, which carries
+# torch 2.15.0 with torchvision 0.29.2 and torchaudio 2.11.1 for it).
+# comfy/quant_ops.py turns off comfy-kitchen's CUDA kernels on any torch older
+# than CUDA 13, and without them one RTX 5090 samples MiniMax H3 1.8-2.9x slower
+# (720p 5 s: 13.5 s/step on cu128, 7.4 s/step on cu130). Any CUDA 13.x wheel runs
+# on host driver >= 580 (CUDA minor-version compatibility); docker/entrypoint.sh
+# stops on an older driver and warns below 615, the branch CUDA 13.4 ships with,
+# where Triton-compiled kernels can be rejected by the driver.
 # TORCH_VERSION is pinned so a rebuild changes torch only when this file does.
 # Any torch that is not a CUDA build fails the image build (`comfyui`) or the
 # env build on the volume (`runpod`).
 ARG BASE_IMAGE=python:3.12-slim
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
-ARG TORCH_VERSION=2.11.0
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu134
+ARG TORCH_VERSION=2.15.0
+# See the sage-wheel stages below: 1 builds SageAttention 2.x into the image.
+ARG SAGEATTENTION=0
+ARG SAGEATTENTION_TAG=v2.2.0
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.2
 
 FROM ${UV_IMAGE} AS uv
@@ -85,6 +91,35 @@ RUN apt-get update && \
         tini && \
     rm -rf /var/lib/apt/lists/*
 
+# --- Optional: SageAttention 2.2.0, built for sm_89 and sm_120 (RTX 40/50) -----
+# Off by default (`--build-arg SAGEATTENTION=1` turns it on): PyPI's `sageattention`
+# is the 1.x line, 2.x has to be compiled, and that needs nvcc, which the slim
+# image does not have. The wheel is built in a CUDA 13.4 devel image against the
+# same torch as the final image (same Python 3.12), then installed into `base`.
+# It is an alternative to --use-ck-attention (the two flags exclude each other),
+# which docker/entrypoint.sh prefers; Sage is the fallback when comfy-kitchen's
+# INT8 attention is unavailable. Not built for the `runpod` target (its env is
+# built on the volume at boot).
+FROM scratch AS sage-wheel-0
+FROM nvidia/cuda:13.4.3-devel-ubuntu24.04 AS sage-build
+ARG TORCH_INDEX_URL
+ARG TORCH_VERSION
+ARG SAGEATTENTION_TAG
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git python3.12 python3.12-venv python3-pip ninja-build && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3.12 -m venv /venv
+ENV PATH=/venv/bin:$PATH \
+    TORCH_CUDA_ARCH_LIST="8.9 12.0" \
+    MAX_JOBS=4
+RUN pip install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}" && \
+    pip install setuptools wheel packaging && \
+    git clone --depth 1 --branch "${SAGEATTENTION_TAG}" https://github.com/thu-ml/SageAttention.git /src && \
+    cd /src && pip wheel . --no-build-isolation --no-deps -w /wheels
+FROM scratch AS sage-wheel-1
+COPY --from=sage-build /wheels /
+FROM sage-wheel-${SAGEATTENTION} AS sage-wheel
+
 FROM system AS base
 
 ARG TORCH_INDEX_URL
@@ -100,6 +135,14 @@ COPY requirements.txt manager_requirements.txt ./
 # a CPU wheel fails the build instead of shipping a GPU-less worker.
 RUN python -m pip install -r requirements.txt && \
     python -c "import torch; assert torch.version.cuda, 'torch %s is not a CUDA build' % torch.__version__; print('torch', torch.__version__, 'CUDA', torch.version.cuda)"
+
+# SageAttention, when built (see the sage-wheel stages): an empty directory
+# otherwise, and nothing is installed.
+COPY --from=sage-wheel / /tmp/sage-wheel/
+RUN if ls /tmp/sage-wheel/*.whl >/dev/null 2>&1; then \
+        python -m pip install --no-deps /tmp/sage-wheel/*.whl && \
+        python -c "import sageattention; print('sageattention', sageattention.__file__)"; \
+    fi && rm -rf /tmp/sage-wheel
 
 # --- RunPod target: the Python env lives on the network volume ----------------
 FROM system AS runpod

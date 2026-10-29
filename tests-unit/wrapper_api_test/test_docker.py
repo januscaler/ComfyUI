@@ -136,8 +136,9 @@ class TestDockerfile(unittest.TestCase):
             self.assertIn(tool, apt, f"{tool} must be installed for Triton JIT")
 
     def test_cuda_only_and_entrypoint(self):
-        # cu130: comfy/quant_ops.py turns comfy-kitchen's CUDA kernels off below CUDA 13.
-        self.assertIn("ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130", self.dockerfile)
+        # cu134 (CUDA 13.4, the newest torch index): comfy/quant_ops.py turns
+        # comfy-kitchen's CUDA kernels off below CUDA 13.
+        self.assertIn("ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu134", self.dockerfile)
         self.assertRegex(self.dockerfile, r"(?m)^ARG TORCH_VERSION=\d+\.\d+\.\d+$", "pin torch, so a rebuild cannot move it")
         self.assertIn('--index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}" torchvision torchaudio', self.dockerfile)
         self.assertIn("assert torch.version.cuda", self.dockerfile)
@@ -553,7 +554,7 @@ class TestHostDriverCheck(unittest.TestCase):
 
     @unittest.skipIf(sys.platform == "win32", "bash scripts")
     def test_old_driver_stops_a_cuda13_torch(self):
-        result = self.check("2.11.0+cu130", "575.57.08")
+        result = self.check("2.15.0+cu134", "575.57.08")
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("started", result.stdout)
         self.assertIn("needs an NVIDIA driver >= 580", result.stderr)
@@ -561,10 +562,18 @@ class TestHostDriverCheck(unittest.TestCase):
 
     @unittest.skipIf(sys.platform == "win32", "bash scripts")
     def test_new_enough_drivers_start(self):
-        for driver in ("580.173.02", "595.84"):
-            result = self.check("2.11.0+cu130", driver)
+        for driver in ("580.173.02", "595.84", "615.20"):
+            result = self.check("2.15.0+cu134", driver)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("started", result.stdout)
+
+    @unittest.skipIf(sys.platform == "win32", "bash scripts")
+    def test_cuda_13_4_warns_below_its_driver_branch(self):
+        old = self.check("2.15.0+cu134", "580.173.02")
+        self.assertIn("older than R615", old.stderr)
+        self.assertIn("started", old.stdout)
+        for torch_version, driver in (("2.15.0+cu134", "615.20"), ("2.11.0+cu130", "580.173.02")):
+            self.assertNotIn("R615", self.check(torch_version, driver).stderr, (torch_version, driver))
 
     @unittest.skipIf(sys.platform == "win32", "bash scripts")
     def test_skipped_where_it_cannot_or_need_not_tell(self):
@@ -580,6 +589,98 @@ class TestHostDriverCheck(unittest.TestCase):
             result = self.check(torch_version, driver, args, comfyui_args)
             self.assertEqual(result.returncode, 0, (torch_version, driver, args, comfyui_args, result.stderr))
             self.assertIn("started", result.stdout)
+
+
+@unittest.skipIf(sys.platform == "win32", "bash scripts")
+class TestAttentionEntrypoint(unittest.TestCase):
+    """docker/entrypoint.sh turns on comfy-kitchen's INT8 attention (or SageAttention 2.x) when the GPU/image has it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script = read("docker", "entrypoint.sh")
+        cls.function = re.search(r"^attention_flag\(\) \{\n.*?^\}$", cls.script, re.MULTILINE | re.DOTALL).group(0)
+
+    def test_applies_to_the_leader_and_the_followers(self):
+        # Both read ${args[@]}, so the flag has to be in it before either starts.
+        flag = self.script.index('attention=$(attention_flag "$@")')
+        self.assertLess(self.script.index("args+=(--fast-disk)"), flag)
+        self.assertLess(flag, self.script.index('start_sequence_parallel "$@"\n'))
+        self.assertLess(flag, self.script.index("exec python main.py"))
+
+    def pick(self, ck=False, sage=False, want=None, comfyui_args="", args=(), smi=True):
+        """The flag attention_flag prints, with stand-in python (probe results from ck/sage) and nvidia-smi."""
+        with tempfile.TemporaryDirectory() as bin_dir:
+            with open(os.path.join(bin_dir, "python"), "w") as f:
+                f.write("#!/bin/sh\n"
+                        'case "$2" in\n'
+                        f'  *comfy_kitchen*) exit {0 if ck else 1};;\n'
+                        '  *"print(version"*) echo 2.2.0; exit 0;;\n'
+                        f'  *sageattention*) exit {0 if sage else 1};;\n'
+                        "esac\nexit 1\n")
+            if smi:
+                with open(os.path.join(bin_dir, "nvidia-smi"), "w") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+            for name in os.listdir(bin_dir):
+                os.chmod(os.path.join(bin_dir, name), 0o755)
+            harness = f'set -euo pipefail\nlog() {{ echo "entrypoint: $*" >&2; }}\n{self.function}\nattention_flag "$@"'
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "COMFYUI_ARGS": comfyui_args}
+            if want is not None:
+                env["COMFY_ATTENTION"] = want
+            result = subprocess.run(["bash", "-c", harness, "_", *args], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip(), result.stderr
+
+    def test_auto_prefers_int8_attention_then_sage(self):
+        self.assertEqual(self.pick(ck=True, sage=True)[0], "--use-ck-attention")
+        self.assertEqual(self.pick(ck=False, sage=True)[0], "--use-sage-attention")
+        flag, log = self.pick(ck=False, sage=False)
+        self.assertEqual(flag, "")
+        self.assertIn("not available", log)
+
+    def test_a_named_choice_is_the_only_one_tried(self):
+        self.assertEqual(self.pick(ck=True, sage=True, want="sage")[0], "--use-sage-attention")
+        self.assertEqual(self.pick(ck=True, sage=True, want="ck")[0], "--use-ck-attention")
+        self.assertEqual(self.pick(ck=False, sage=True, want="ck")[0], "", "ck asked for, missing: no silent switch to sage")
+        self.assertEqual(self.pick(ck=True, sage=True, want="default")[0], "")
+        self.assertEqual(self.pick(ck=True, sage=True, want="nonsense")[0], "")
+
+    def test_never_adds_a_second_attention_flag_or_runs_off_gpu(self):
+        # ComfyUI's attention flags exclude each other: a second one is a startup error.
+        self.assertEqual(self.pick(ck=True, comfyui_args="--use-flash-attention")[0], "")
+        self.assertEqual(self.pick(ck=True, args=("--use-pytorch-cross-attention",))[0], "")
+        self.assertEqual(self.pick(ck=True, comfyui_args="--cpu")[0], "")
+        self.assertEqual(self.pick(ck=True, smi=False)[0], "", "no nvidia-smi (CI, CPU box)")
+        self.assertEqual(self.pick(ck=True, comfyui_args="--preview-method none")[0], "--use-ck-attention")
+
+
+@unittest.skipIf(sys.platform == "win32", "bash scripts")
+class TestSageAttentionBuild(unittest.TestCase):
+    """The optional SageAttention 2.x wheel: built only on request, installed only when built."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dockerfile = read("Dockerfile")
+        cls.stages = dockerfile_stages(cls.dockerfile)
+
+    def test_off_by_default_and_selected_by_a_build_arg(self):
+        # Global ARGs must precede the first FROM to be usable in a FROM line.
+        first_from = self.dockerfile.index("\nFROM ")
+        self.assertLess(self.dockerfile.index("ARG SAGEATTENTION=0"), first_from)
+        self.assertIn("FROM sage-wheel-${SAGEATTENTION} AS sage-wheel", self.dockerfile)
+        self.assertEqual(self.stages["sage-wheel-0"][0], "scratch")
+        self.assertIn("nvidia/cuda:13.4", self.stages["sage-build"][0])
+        self.assertIn("devel", self.stages["sage-build"][0])
+
+    def test_wheel_is_built_for_rtx_40_and_50_against_the_images_torch(self):
+        build = self.stages["sage-build"][1]
+        self.assertIn('TORCH_CUDA_ARCH_LIST="8.9 12.0"', build)
+        self.assertIn('"torch==${TORCH_VERSION}"', build)
+        self.assertIn("--no-build-isolation", build)
+
+    def test_base_installs_a_wheel_only_when_there_is_one(self):
+        base = self.stages["base"][1]
+        self.assertIn("COPY --from=sage-wheel / /tmp/sage-wheel/", base)
+        self.assertIn("if ls /tmp/sage-wheel/*.whl", base)
 
 
 @unittest.skipIf(sys.platform == "win32", "bash scripts")
