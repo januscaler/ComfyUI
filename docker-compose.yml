@@ -71,6 +71,13 @@ services:
       # the largest values measured to complete on 32 GB of RAM.
       - COMFY_MINIMAX_H3_MAX_FRAMES=${MINIMAX_H3_MAX_FRAMES:-124}
       - COMFY_MINIMAX_H3_MAX_PIXEL_FRAMES=${MINIMAX_H3_MAX_PIXEL_FRAMES:-91422720}
+      # Attention kernel: auto = comfy-kitchen INT8 attention if the GPU has it,
+      # else SageAttention 2.x if the image was built with it, else ComfyUI's
+      # own. ck | sage | default pick one. See .env.example.
+      - COMFY_ATTENTION=${COMFY_ATTENTION:-auto}
+      # A 720p-class H3 canvas (long edge 1217-1280) is generated at 1216 instead
+      # (1280x720 -> 1216x704, ~15% faster). 0 = off.
+      - COMFY_MINIMAX_H3_SNAP_LONG_EDGE=${MINIMAX_H3_SNAP_LONG_EDGE:-1216}
       # Xiaomi MiMo, used by the H3 endpoints to rewrite a plain-language
       # 'prompt' into a real H3 prompt. Unset only disables the rewrite:
       # 'raw_prompt' still works and needs no key. See .env.example.

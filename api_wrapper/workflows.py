@@ -477,6 +477,16 @@ def minimax_h3_align_frames(length):
 MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MAX_PIXELS = 1344 * 768
 
+# A 720p-class canvas (long edge 1217..1280) is generated at a 1216 long edge
+# instead. The video VAE decodes in 256 px tiles; on one RTX 5090 a 1216 edge
+# needs 24 tiles where 1280 needs 28, and a whole render (1280x704 -> 1216x704)
+# finishes about 15% sooner with the picture otherwise the same. The aspect
+# ratio is kept and the short edge snaps to the grid (1280x720 -> 1216x704).
+# 0 turns it off. Measured for width; the VAE tiles both axes alike, so a
+# portrait canvas's height gets the same treatment, which is not measured.
+MINIMAX_H3_SNAP_LONG_EDGE = max(0, int(os.environ.get("COMFY_MINIMAX_H3_SNAP_LONG_EDGE", "1216")))
+MINIMAX_H3_SNAP_FROM_EDGE = 1280
+
 # H3's four checkpoints total ~43 GB (21 GB UNET + 16 GB text encoder + 5.8 GB
 # VAEs), so on a 32 GB RAM box every job already runs at 29-31 GB of host RAM
 # before a single pixel is generated. What is left decides whether the run
@@ -552,6 +562,14 @@ def minimax_h3_fit_canvas(width, height):
     """Round a requested canvas up to H3's grid, scaling it down (aspect kept)
     when it exceeds the model's 768*1344 pixel budget."""
     m = MINIMAX_H3_CANVAS_MULTIPLE
+    snap = MINIMAX_H3_SNAP_LONG_EDGE
+    if snap and snap < max(width, height) <= MINIMAX_H3_SNAP_FROM_EDGE:
+        asked_w, asked_h = width, height
+        factor = snap / max(width, height)
+        width = max(m, -(-round(width * factor) // m) * m)
+        height = max(m, -(-round(height * factor) // m) * m)
+        return width, height, (f"{asked_w}x{asked_h} is generated at {width}x{height}: a {snap} px "
+                               "edge decodes in fewer VAE tiles, about 15% faster per render.")
     width = max(m, -(-width // m) * m)
     height = max(m, -(-height // m) * m)
     if width * height <= MINIMAX_H3_MAX_PIXELS:

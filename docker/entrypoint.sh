@@ -397,6 +397,12 @@ check_host_driver() {
 		exit 1
 	fi
 	log "NVIDIA driver $driver, torch $torch_version"
+	# CUDA 13.4 ships with the R615 driver branch. Older CUDA 13 drivers (>= 580)
+	# run its wheels through minor-version compatibility, but a kernel Triton
+	# compiles with a newer ptxas can be rejected by the driver.
+	if [[ "$cuda" == 134* ]] && ((${driver%%.*} < 615)); then
+		log "WARNING: driver $driver is older than R615, the branch CUDA 13.4 ships with; torch $torch_version runs through CUDA minor-version compatibility, and Triton-compiled kernels may be rejected. Update the driver if a kernel fails to load."
+	fi
 }
 check_host_driver "$@"
 
@@ -498,6 +504,59 @@ if [[ "${FAST_DISK:-1}" == "1" ]]; then
 fi
 
 read -r -a extra <<<"${COMFYUI_ARGS:-}"
+
+# --- Attention kernel ---------------------------------------------------------
+# MiniMax H3 spends most of a render in attention. Measured on one RTX 5090
+# (1280x704, ~5 s, 8-step Turbo LoRA), comfy-kitchen's INT8 attention made the
+# sampler about 2x faster with identity and lip-sync scores unchanged, and
+# SageAttention 2.2 about 1.2x on top of plain attention. They are two ways of
+# doing the same job: ComfyUI takes one attention flag (they exclude each
+# other), so exactly one is on.
+#   COMFY_ATTENTION   auto (default): comfy-kitchen INT8 (--use-ck-attention) if
+#                     this GPU has it, else SageAttention 2.x (--use-sage-attention)
+#                     if the image has it, else ComfyUI's own choice
+#                     ck | sage: that one only, else ComfyUI's own choice
+#                     default: ComfyUI's own choice (no flag)
+# It applies to every workflow the wrapper serves, not only H3. Nothing is added
+# when COMFYUI_ARGS or the command line already choose an attention flag, on a
+# CPU run, or where there is no nvidia-smi (CI, a CPU-only box). Each choice is
+# probed first: ComfyUI exits when --use-ck-attention is asked for and the kernel
+# is missing, and a host that lost its worker that way would restart forever.
+attention_flag() {
+	local want=${COMFY_ATTENTION:-auto}
+	case "$want" in
+		auto | ck | sage | default) ;;
+		*)
+			log "WARNING: COMFY_ATTENTION=$want is not auto, ck, sage or default; using ComfyUI's own attention"
+			return 0
+			;;
+	esac
+	[[ "$want" == default ]] && return 0
+	[[ " ${COMFYUI_ARGS:-} $* " == *" --cpu "* ]] && return 0
+	command -v nvidia-smi >/dev/null || return 0
+	if [[ " ${COMFYUI_ARGS:-} $* " == *" --use-"*"attention"* ]]; then
+		log "attention: left as set in the ComfyUI flags"
+		return 0
+	fi
+	if [[ "$want" == auto || "$want" == ck ]] && python -c '
+import sys, torch, comfy_kitchen
+sys.exit(0 if torch.cuda.is_available() and comfy_kitchen.int8_attention_is_available() else 1)' 2>/dev/null; then
+		log "attention: comfy-kitchen INT8 (--use-ck-attention)"
+		echo "--use-ck-attention"
+		return 0
+	fi
+	if [[ "$want" == auto || "$want" == sage ]] && python -c '
+import sys
+from importlib.metadata import version
+sys.exit(0 if version("sageattention").split(".")[0] == "2" else 1)' 2>/dev/null; then
+		log "attention: SageAttention $(python -c 'from importlib.metadata import version; print(version("sageattention"))') (--use-sage-attention)"
+		echo "--use-sage-attention"
+		return 0
+	fi
+	log "attention: COMFY_ATTENTION=$want is not available on this GPU or image; using ComfyUI's own attention"
+}
+attention=$(attention_flag "$@")
+[[ -n "$attention" ]] && args+=("$attention")
 
 if [[ -n "${WRAPPER_AUTH_TOKEN:-}" ]]; then
 	echo "entrypoint: bearer auth is ON for every route" >&2
