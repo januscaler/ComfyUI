@@ -673,7 +673,7 @@ class TestSageAttentionBuild(unittest.TestCase):
 
     def test_wheel_is_built_for_rtx_40_and_50_against_the_images_torch(self):
         build = self.stages["sage-build"][1]
-        self.assertIn('TORCH_CUDA_ARCH_LIST="8.9 12.0"', build)
+        self.assertIn('TORCH_CUDA_ARCH_LIST="8.9;12.0"', build, "';'-separated: Sage ignores a space-separated list's second entry")
         self.assertIn('"torch==${TORCH_VERSION}"', build)
         self.assertIn("--no-build-isolation", build)
         self.assertIn("python3.12-dev", build, "Python.h is needed to compile the extension")

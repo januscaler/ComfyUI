@@ -96,6 +96,8 @@ RUN apt-get update && \
 # is the 1.x line, 2.x has to be compiled, and that needs nvcc, which the slim
 # image does not have. The wheel is built in a CUDA 13.4 devel image against the
 # same torch as the final image (same Python 3.12), then installed into `base`.
+# SageAttention splits TORCH_CUDA_ARCH_LIST on ";" or "," only: with a space it
+# built sm_89 alone and failed on the RTX 5090 (sm_120) with "no kernel image".
 # SageAttention v2.2.0 builds with -std=c++17, which torch 2.15's headers reject
 # (they need C++20), hence the sed. It is an alternative to --use-ck-attention (the two flags exclude each other),
 # which docker/entrypoint.sh prefers; Sage is the fallback when comfy-kitchen's
@@ -111,7 +113,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     python3.12 -m venv /venv
 ENV PATH=/venv/bin:$PATH \
-    TORCH_CUDA_ARCH_LIST="8.9 12.0" \
+    TORCH_CUDA_ARCH_LIST="8.9;12.0" \
     MAX_JOBS=4
 RUN pip install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}" && \
     pip install setuptools wheel packaging && \
