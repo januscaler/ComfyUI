@@ -1528,6 +1528,68 @@ def _prepare_env_for_comfy_import():
 
 
 @unittest.skipUnless(TORCH_AVAILABLE, "torch not available")
+class TestLtx25(unittest.TestCase):
+    """The LTX-2.5 workflow: canvas/length rules and a graph that fits the real nodes."""
+
+    def test_length_snaps_to_the_8k_plus_1_grid(self):
+        w = wrapper_workflows
+        self.assertEqual([w.ltx25_length(s) for s in (3, 5, 10)], [73, 121, 241])
+        self.assertEqual(w.ltx25_length(0.1), 9)
+        for seconds in (1.0, 2.5, 3.0, 4.2, 7.7):
+            self.assertEqual((w.ltx25_length(seconds) - 1) % 8, 0)
+            self.assertGreaterEqual(w.ltx25_length(seconds), round(seconds * 24))
+
+    def test_canvas_is_on_the_64_px_grid_and_capped(self):
+        w = wrapper_workflows
+        self.assertEqual(w.ltx25_fit_canvas(1280, 704), (1280, 704, None))
+        fitted_w, fitted_h, note = w.ltx25_fit_canvas(1280, 720)
+        self.assertEqual((fitted_w, fitted_h), (1280, 704))
+        self.assertIn("1280x720", note)
+        self.assertEqual(w.ltx25_fit_canvas(1920, 1080)[:2], (1920, 1088))
+        for size in ((3840, 2160), (4096, 4096), (100, 100), (720, 1280)):
+            fitted_w, fitted_h, _ = w.ltx25_fit_canvas(*size)
+            self.assertEqual((fitted_w % 64, fitted_h % 64), (0, 0))
+            self.assertLessEqual(fitted_w * fitted_h, w.LTX25_MAX_PIXELS)
+            self.assertGreaterEqual(min(fitted_w, fitted_h), 64)
+
+    def test_registered_with_both_tasks_and_a_prefetch_spec(self):
+        entry = wrapper_workflows.WORKFLOWS["ltx25"]
+        self.assertEqual(sorted(entry["tasks"]), ["image", "text"])
+        self.assertFalse(entry["tasks"]["text"]["requires_image"])
+        self.assertTrue(entry["tasks"]["image"]["requires_image"])
+        self.assertEqual(entry["tasks"]["image"]["upload_params"], {"image": "first_frame"})
+
+    def test_graphs_only_use_real_nodes_inputs_and_links(self):
+        _prepare_env_for_comfy_import()
+        import nodes
+
+        async def _init():
+            await nodes.init_extra_nodes(init_custom_nodes=False, init_api_nodes=False)
+
+        asyncio.run(_init())
+        w = wrapper_workflows
+        graphs = {
+            "text": w.build_ltx25_text_to_video(prompt="a test", seed=7, duration=3),
+            "image": w.build_ltx25_image_to_video(prompt="a test", seed=7, duration=3, first_frame="a.png"),
+        }
+        for name, graph in graphs.items():
+            for node_id, node in graph.items():
+                cls = nodes.NODE_CLASS_MAPPINGS.get(node["class_type"])
+                self.assertIsNotNone(cls, f"{name}: node {node_id} {node['class_type']} is not registered")
+                spec = cls.INPUT_TYPES()
+                known = set(spec.get("required", {})) | set(spec.get("optional", {}))
+                for input_name, value in node["inputs"].items():
+                    self.assertIn(input_name, known, f"{name}: {node['class_type']} has no input {input_name!r}")
+                    if isinstance(value, list):
+                        self.assertIn(value[0], graph, f"{name}: node {node_id}.{input_name} links to a missing node")
+                        outputs = nodes.NODE_CLASS_MAPPINGS[graph[value[0]]["class_type"]].RETURN_TYPES
+                        self.assertLess(value[1], len(outputs), f"{name}: node {node_id}.{input_name} links to a missing output")
+                required = set(spec.get("required", {}))
+                self.assertLessEqual(required - set(node["inputs"]), set(), f"{name}: {node['class_type']} misses required inputs")
+        self.assertNotIn("LTXVImgToVideoInplace", {n["class_type"] for n in graphs["text"].values()})
+        self.assertEqual(sum(n["class_type"] == "LTXVImgToVideoInplace" for n in graphs["image"].values()), 2)
+
+
 class TestGraphValidation(unittest.TestCase):
     TEST_IMAGE = "wrapper/test_input.png"
     # 1x1 transparent PNG

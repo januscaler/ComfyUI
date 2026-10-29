@@ -13,6 +13,7 @@ Specs name a workflow and, for MiniMax H3 or Qwen Image 2.1, a quantization:
 
     minimaxh3[:quant]      text/image-to-video (fl2va) UNET + text encoder + VAEs
     minimaxh3-ref[:quant]  reference-to-video (ref2va) UNET + the same encoder/VAEs
+    ltx25                  LTX-2.5 text/image-to-video (distilled int8 UNET, Gemma 4 encoder, VAEs, x2 upscaler; ~44 GB)
     flux2klein9b           FLUX.2 [klein] 9B stills (gated on Hugging Face: HF_TOKEN)
     qwenimage21[:quant]    Qwen Image 2.1 stills: int8 (default) or bf16 UNET + encoder
     image-segment          SAM 3.1 select-by-name masks (1.7 GB, Meta's SAM License)
@@ -63,6 +64,8 @@ def models_for(spec: str) -> list[dict]:
         # quantization's own: see the module docstring.
         return wf.minimax_h3_models(quant, ref2va=name == "minimaxh3-ref",
                                     clip_name=wf.MINIMAX_H3_CLIP_ORDER[0])
+    if name == "ltx25":
+        return list(wf.LTX25_MODELS)
     if name == "flux2klein9b":
         return list(wf.FLUX2_KLEIN_9B_MODELS)
     if name == "qwenimage21":
@@ -79,7 +82,7 @@ def models_for(spec: str) -> list[dict]:
     if name == "fx-replace":
         return wf.fx_replace_all_models()
     raise SystemExit(f"prefetch: unknown spec {spec!r} (minimaxh3[:quant], minimaxh3-ref[:quant], flux2klein9b, "
-                     "qwenimage21[:quant], image-segment, image-describe, fx-track, fx-replace)")
+                     "ltx25, qwenimage21[:quant], image-segment, image-describe, fx-track, fx-replace)")
 
 
 def main(argv: list[str]) -> int:
