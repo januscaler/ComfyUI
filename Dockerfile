@@ -96,7 +96,8 @@ RUN apt-get update && \
 # is the 1.x line, 2.x has to be compiled, and that needs nvcc, which the slim
 # image does not have. The wheel is built in a CUDA 13.4 devel image against the
 # same torch as the final image (same Python 3.12), then installed into `base`.
-# It is an alternative to --use-ck-attention (the two flags exclude each other),
+# SageAttention v2.2.0 builds with -std=c++17, which torch 2.15's headers reject
+# (they need C++20), hence the sed. It is an alternative to --use-ck-attention (the two flags exclude each other),
 # which docker/entrypoint.sh prefers; Sage is the fallback when comfy-kitchen's
 # INT8 attention is unavailable. Not built for the `runpod` target (its env is
 # built on the volume at boot).
@@ -106,7 +107,7 @@ ARG TORCH_INDEX_URL
 ARG TORCH_VERSION
 ARG SAGEATTENTION_TAG
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git python3.12 python3.12-venv python3-pip ninja-build && \
+    apt-get install -y --no-install-recommends git python3.12 python3.12-dev python3.12-venv python3-pip ninja-build && \
     rm -rf /var/lib/apt/lists/* && \
     python3.12 -m venv /venv
 ENV PATH=/venv/bin:$PATH \
@@ -115,7 +116,8 @@ ENV PATH=/venv/bin:$PATH \
 RUN pip install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}" && \
     pip install setuptools wheel packaging && \
     git clone --depth 1 --branch "${SAGEATTENTION_TAG}" https://github.com/thu-ml/SageAttention.git /src && \
-    cd /src && pip wheel . --no-build-isolation --no-deps -w /wheels
+    cd /src && sed -i 's/-std=c++17/-std=c++20/g' setup.py && \
+    pip wheel . --no-build-isolation --no-deps -w /wheels
 FROM scratch AS sage-wheel-1
 COPY --from=sage-build /wheels /
 FROM sage-wheel-${SAGEATTENTION} AS sage-wheel

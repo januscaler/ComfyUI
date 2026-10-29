@@ -676,6 +676,8 @@ class TestSageAttentionBuild(unittest.TestCase):
         self.assertIn('TORCH_CUDA_ARCH_LIST="8.9 12.0"', build)
         self.assertIn('"torch==${TORCH_VERSION}"', build)
         self.assertIn("--no-build-isolation", build)
+        self.assertIn("python3.12-dev", build, "Python.h is needed to compile the extension")
+        self.assertIn("s/-std=c++17/-std=c++20/g", build, "torch 2.15 headers need C++20")
 
     def test_base_installs_a_wheel_only_when_there_is_one(self):
         base = self.stages["base"][1]
