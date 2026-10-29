@@ -691,6 +691,31 @@ async def _setup_minimax_h3(fields, downloaded, ref2va):
     return kwargs, note
 
 
+async def _setup_ltx25(fields, downloaded):
+    """LTX-2.5 setup: validate canvas and length against the host's budget, then
+    fetch the ~44 GB of weights on first use."""
+    try:
+        width = int(fields.get("width", wrapper_workflows.LTX25_DEFAULT_WIDTH))
+        height = int(fields.get("height", wrapper_workflows.LTX25_DEFAULT_HEIGHT))
+        duration = float(fields.get("duration", 5.0))
+    except ValueError:
+        raise _SetupError("Invalid parameter value", "width/height/duration must be numbers.") from None
+    if not 64 <= width <= 4096 or not 64 <= height <= 4096:
+        raise _SetupError("Invalid size", "width/height must be between 64 and 4096.")
+    if not 0 < duration <= 3600:
+        raise _SetupError("Invalid duration", "duration must be between 0 and 3600 seconds.")
+    frames = wrapper_workflows.ltx25_length(duration)
+    if frames > wrapper_workflows.LTX25_MAX_FRAMES:
+        raise _SetupError(
+            "Request exceeds this host's LTX-2.5 limit",
+            f"{frames} frames at 24 fps is above the {wrapper_workflows.LTX25_MAX_FRAMES}-frame limit "
+            f"(max duration {wrapper_workflows.LTX25_MAX_DURATION}s); raise COMFY_LTX25_MAX_FRAMES on a host "
+            "with more memory.")
+    width, height, note = wrapper_workflows.ltx25_fit_canvas(width, height)
+    _raise_if_missing(await _download_models(list(wrapper_workflows.LTX25_MODELS), downloaded))
+    return {"width": width, "height": height, "duration": duration}, note
+
+
 async def _setup_minimax_h3_text(fields, downloaded):
     return await _setup_minimax_h3(fields, downloaded, ref2va=False)
 
@@ -1040,6 +1065,7 @@ _WORKFLOW_SETUPS = {"flux2klein9b": _setup_flux2klein9b_edit,
                     "minimaxh3": {"text": _setup_minimax_h3_text,
                                   "image": _setup_minimax_h3_image,
                                   "reference": _setup_minimax_h3_reference},
+                    "ltx25": {"text": _setup_ltx25, "image": _setup_ltx25},
                     "fx-interp": _setup_fx_interp,
                     "fx-bgremove": _setup_fx_bgremove,
                     "fx-upscale": _setup_fx_upscale,

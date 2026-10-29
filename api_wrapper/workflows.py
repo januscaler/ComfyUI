@@ -1926,6 +1926,168 @@ With ``output_type: "json"`` that answer is also the generate response body,
 for workflows that save no file.
 """
 
+# --- Lightricks LTX-2.5 (22B distilled audio+video) -------------------------------
+# The official two-stage pipeline (blueprints "Text to Video (LTX-2.5)" and
+# "Image to Video (LTX-2.5)"): an 8-step pass at half the canvas, a 2x latent
+# upscale, a 3-step refine at the full canvas. The distilled transformer runs at
+# CFG 1, so there is no steps/cfg/scheduler to tune. Weights ~44 GB:
+# Lightricks/LTX-2.5 (LTX-2 Community License: free under USD 10M annual revenue).
+LTX25_BASE_URL = "https://huggingface.co/Lightricks/LTX-2.5/resolve/main"
+LTX25_UNET = "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+LTX25_CLIP = "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
+LTX25_VIDEO_VAE = "ltx-2.5-video-vae-bf16.safetensors"
+LTX25_AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
+LTX25_UPSCALER = "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+LTX25_MODELS = [
+    {"folder": "diffusion_models", "filename": LTX25_UNET, "url": f"{LTX25_BASE_URL}/diffusion_models/{LTX25_UNET}"},
+    {"folder": "text_encoders", "filename": LTX25_CLIP, "url": f"{LTX25_BASE_URL}/text_encoders/{LTX25_CLIP}"},
+    {"folder": "vae", "filename": LTX25_VIDEO_VAE, "url": f"{LTX25_BASE_URL}/vae/{LTX25_VIDEO_VAE}"},
+    {"folder": "vae", "filename": LTX25_AUDIO_VAE, "url": f"{LTX25_BASE_URL}/vae/{LTX25_AUDIO_VAE}"},
+    {"folder": "latent_upscale_models", "filename": LTX25_UPSCALER,
+     "url": f"{LTX25_BASE_URL}/latent_upscale_models/{LTX25_UPSCALER}"},
+]
+LTX25_FPS = 24
+# The two stages work on a half-size canvas that must sit on the 32 px latent
+# grid, so the output canvas is a multiple of 64.
+LTX25_CANVAS_MULTIPLE = 64
+LTX25_DEFAULT_WIDTH = 1280
+LTX25_DEFAULT_HEIGHT = 704
+LTX25_MAX_PIXELS = 1920 * 1088
+LTX25_MAX_FRAMES = max(9, int(os.environ.get("COMFY_LTX25_MAX_FRAMES", "241")))
+LTX25_MAX_DURATION = round((LTX25_MAX_FRAMES - 1) / LTX25_FPS, 2)
+LTX25_NEGATIVE_PROMPT = "pc game, console game, video game, cartoon, childish, ugly"
+LTX25_STAGE1_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+LTX25_STAGE2_SIGMAS = "0.85, 0.7250, 0.4219, 0.0"
+
+
+def ltx25_length(duration):
+    """Duration (seconds) -> frame count at 24 fps on LTX's 8k+1 grid."""
+    n = max(9, round(duration * LTX25_FPS))
+    return ((n - 1 + 7) // 8) * 8 + 1
+
+
+def ltx25_fit_canvas(width, height):
+    """Round a requested canvas to LTX's 64 px grid (nearest, never below 64),
+    scaling it down (aspect kept) when it exceeds 1920x1088 pixels. Returns
+    (width, height, note)."""
+    m = LTX25_CANVAS_MULTIPLE
+    snap = lambda v: max(m, int(round(v / m)) * m)
+    fitted_w, fitted_h = snap(width), snap(height)
+    note = None
+    if fitted_w * fitted_h > LTX25_MAX_PIXELS:
+        scale = (LTX25_MAX_PIXELS / (fitted_w * fitted_h)) ** 0.5
+        fitted_w, fitted_h = max(m, int(fitted_w * scale) // m * m), max(m, int(fitted_h * scale) // m * m)
+        note = (f"{width}x{height} exceeds this model's {LTX25_MAX_PIXELS}-pixel canvas; "
+                f"generating at {fitted_w}x{fitted_h} instead.")
+    elif (fitted_w, fitted_h) != (width, height):
+        note = f"{width}x{height} generated at {fitted_w}x{fitted_h} (this model works on a 64 px grid)."
+    return fitted_w, fitted_h, note
+
+
+def _ltx25_graph(prompt, width, height, length, seed, filename_prefix, *, first_frame=None,
+                 unet_name=LTX25_UNET, clip_name=LTX25_CLIP):
+    """Shared two-stage graph. ``first_frame`` (an uploaded image name) switches
+    the low-res and full-res latents to image-conditioned ones."""
+    half_w, half_h = width // 2, height // 2
+    g = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
+        "2": {"class_type": "VAELoader", "inputs": {"vae_name": LTX25_VIDEO_VAE}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": LTX25_AUDIO_VAE}},
+        "4": {"class_type": "CLIPLoader", "inputs": {"clip_name": clip_name, "type": "ltxv", "device": "default"}},
+        "5": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": LTX25_UPSCALER}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["4", 0]}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": LTX25_NEGATIVE_PROMPT, "clip": ["4", 0]}},
+        "8": {"class_type": "LTXVConditioning", "inputs": {
+            "positive": ["6", 0], "negative": ["7", 0], "frame_rate": float(LTX25_FPS)}},
+        "9": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+            "width": half_w, "height": half_h, "length": length, "batch_size": 1}},
+        "10": {"class_type": "LTXVEmptyLatentAudio", "inputs": {
+            "frames_number": length, "frame_rate": LTX25_FPS, "batch_size": 1, "audio_vae": ["3", 0]}},
+    }
+    video_latent = ["9", 0]
+    image = None
+    if first_frame is not None:
+        # Cover-crop the still to the canvas, light compression like the
+        # official template, then pin it as the first frame of both stages.
+        g["11"] = {"class_type": "LoadImage", "inputs": {"image": first_frame}}
+        g["12"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["11", 0], "upscale_method": "lanczos", "width": width, "height": height, "crop": "center"}}
+        g["13"] = {"class_type": "LTXVPreprocess", "inputs": {"image": ["12", 0], "img_compression": 18}}
+        g["14"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["2", 0], "image": ["13", 0], "latent": ["9", 0], "strength": 0.7, "bypass": False}}
+        video_latent = ["14", 0]
+        image = ["13", 0]
+    g.update({
+        "20": {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": video_latent, "audio_latent": ["10", 0]}},
+        "21": {"class_type": "LTXVDualCFGGuider", "inputs": {
+            "model": ["1", 0], "positive": ["8", 0], "negative": ["8", 1], "video_cfg": 1.0, "audio_cfg": 1.0}},
+        "22": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "23": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
+        "24": {"class_type": "ManualSigmas", "inputs": {"sigmas": LTX25_STAGE1_SIGMAS}},
+        "25": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["22", 0], "guider": ["21", 0], "sampler": ["23", 0], "sigmas": ["24", 0],
+            "latent_image": ["20", 0]}},
+        "26": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["25", 0]}},
+        "27": {"class_type": "LTXVLatentUpsampler", "inputs": {
+            "samples": ["26", 0], "upscale_model": ["5", 0], "vae": ["2", 0]}},
+    })
+    upscaled = ["27", 0]
+    if image is not None:
+        g["28"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["2", 0], "image": image, "latent": ["27", 0], "strength": 1.0, "bypass": False}}
+        upscaled = ["28", 0]
+    g.update({
+        "30": {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": upscaled, "audio_latent": ["26", 1]}},
+        "31": {"class_type": "LTXVDualCFGGuider", "inputs": {
+            "model": ["1", 0], "positive": ["8", 0], "negative": ["8", 1], "video_cfg": 1.0, "audio_cfg": 1.0}},
+        "32": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "33": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}},
+        "34": {"class_type": "ManualSigmas", "inputs": {"sigmas": LTX25_STAGE2_SIGMAS}},
+        "35": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["32", 0], "guider": ["31", 0], "sampler": ["33", 0], "sigmas": ["34", 0],
+            "latent_image": ["30", 0]}},
+        "36": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["35", 0]}},
+        "37": {"class_type": "VAEDecodeTiled", "inputs": {
+            "samples": ["36", 0], "vae": ["2", 0], "tile_size": 512, "overlap": 64,
+            "temporal_size": 64, "temporal_overlap": 16}},
+        "38": {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["36", 1], "audio_vae": ["3", 0]}},
+        "39": {"class_type": "CreateVideo", "inputs": {
+            "images": ["37", 0], "fps": float(LTX25_FPS), "audio": ["38", 0], "bit_depth": 8}},
+        "40": {"class_type": "SaveVideo", "inputs": {
+            "video": ["39", 0], "filename_prefix": filename_prefix, "format": "auto", "codec": "auto"}},
+    })
+    return g
+
+
+def build_ltx25_text_to_video(*, prompt, seed=0, width=LTX25_DEFAULT_WIDTH, height=LTX25_DEFAULT_HEIGHT,
+                              duration=5.0, filename_prefix="wrapper/ltx25_t2v",
+                              unet_name=LTX25_UNET, clip_name=LTX25_CLIP):
+    """LTX-2.5 text-to-video: prompt -> joint audio+video MP4."""
+    return _ltx25_graph(prompt, width, height, ltx25_length(duration), seed, filename_prefix,
+                        unet_name=unet_name, clip_name=clip_name)
+
+
+def build_ltx25_image_to_video(*, prompt, seed=0, width=LTX25_DEFAULT_WIDTH, height=LTX25_DEFAULT_HEIGHT,
+                               duration=5.0, filename_prefix="wrapper/ltx25_i2v", first_frame=None,
+                               unet_name=LTX25_UNET, clip_name=LTX25_CLIP):
+    """LTX-2.5 image-to-video: a first frame + prompt -> joint audio+video MP4."""
+    return _ltx25_graph(prompt, width, height, ltx25_length(duration), seed, filename_prefix,
+                        first_frame=first_frame, unet_name=unet_name, clip_name=clip_name)
+
+
+LTX25_FORM_EXTRA = {
+    "width": {"type": "integer", "minimum": 64, "maximum": 4096, "default": LTX25_DEFAULT_WIDTH,
+              "description": "Output width, rounded to a multiple of 64 (the two stages work on a half-size "
+                             f"canvas on a 32 px latent grid). Capped at {LTX25_MAX_PIXELS} pixels; a larger "
+                             "request is scaled down keeping its aspect ratio."},
+    "height": {"type": "integer", "minimum": 64, "maximum": 4096, "default": LTX25_DEFAULT_HEIGHT,
+               "description": "Output height, rounded to a multiple of 64. 720 becomes 704."},
+    "duration": {"type": "number", "minimum": 0.4, "maximum": LTX25_MAX_DURATION, "default": 5.0,
+                 "description": "Video length in seconds at 24 fps, snapped up to the model's 8k+1 frame grid. "
+                                f"The maximum ({LTX25_MAX_FRAMES} frames) is set by COMFY_LTX25_MAX_FRAMES."},
+}
+
+
 WORKFLOWS = {
     "flux2klein9b": {
         "title": "FLUX.2 [klein] 9B image edit",
@@ -2074,6 +2236,30 @@ WORKFLOWS = {
                     "from the side, <Audio 1> with the sound of wheels rolling on asphalt, "
                     "cinematic 24fps handheld shot."),
                 "build": build_minimax_h3_reference_to_video,
+            },
+        },
+    },
+    "ltx25": {
+        "title": "LTX-2.5 video (audio + video, two-stage distilled)",
+        "output_type": "video",
+        "tasks": {
+            "text": {
+                "title": "Text to video",
+                "requires_image": False,
+                "uses": ["prompt", "seed"],
+                "form": ["prompt", "seed", "width", "height", "duration"],
+                "extra_form_properties": LTX25_FORM_EXTRA,
+                "build": build_ltx25_text_to_video,
+            },
+            "image": {
+                "title": "Image to video",
+                "requires_image": True,
+                "uploads": {"image": {"ext": "image", "max": 1}},
+                "upload_params": {"image": "first_frame"},
+                "uses": ["prompt", "seed"],
+                "form": ["prompt", "image", "seed", "width", "height", "duration"],
+                "extra_form_properties": LTX25_FORM_EXTRA,
+                "build": build_ltx25_image_to_video,
             },
         },
     },
