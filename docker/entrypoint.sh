@@ -676,9 +676,13 @@ start_sequence_parallel "$@"
 # on the first request that needs it (~5 s) and stops it once the queue has been
 # empty and nothing has asked for COMFYUI_IDLE_STOP_SECONDS. The healthcheck and
 # voxmin-backend's worker probes (/queue, /api/wrapper/workflows) are answered
-# without starting it; /ws answers 503 until something real starts it.
+# without starting it; /ws answers 503 until something real starts it. Those
+# answers are honest: after a failed start, or while docker/cuda_check.py says
+# the driver has lost the GPU, they are 503s, so voxmin-backend marks the worker
+# UNHEALTHY and sends renders to another GPU.
 #   COMFYUI_IDLE_STOP_SECONDS   0 / unset (default): ComfyUI runs all the time
 #   COMFYUI_IDLE_GATE_PORT      ComfyUI's own port behind the gate (COMFYUI_PORT+1)
+#   COMFYUI_IDLE_GPU_CHECK      0: skip the GPU check (a box without CUDA)
 # Not with sequence parallelism: its followers hold the other GPUs either way.
 start_idle_gate() {
 	local idle="${COMFYUI_IDLE_STOP_SECONDS:-0}"
@@ -691,6 +695,8 @@ start_idle_gate() {
 	local inner="${COMFYUI_IDLE_GATE_PORT:-$((port + 1))}"
 	local queue='{"queue_running": [], "queue_pending": []}'
 	local stats='{"system": {"comfyui_running": false}, "devices": []}'
+	local check=(--down-check "python $COMFY_ROOT/docker/cuda_check.py")
+	[[ "${COMFYUI_IDLE_GPU_CHECK:-1}" != "0" ]] || check=()
 	log "idle stop: ComfyUI starts on first use and stops after ${idle}s without use (gate on $port, ComfyUI on $inner)"
 	# ComfyUI's own --listen/--port go last, so they win over any in COMFYUI_ARGS.
 	exec python "$COMFY_ROOT/docker/idle_gate.py" \
@@ -701,6 +707,7 @@ start_idle_gate() {
 		--stub "GET /system_stats 200 $stats" --stub "GET /api/system_stats 200 $stats" \
 		--stub "GET /ws 503" --stub "GET /api/ws 503" \
 		--cache "GET /api/wrapper/workflows" --cache "GET /wrapper/workflows" \
+		${check[@]+"${check[@]}"} \
 		-- python main.py "${args[@]}" "${extra[@]}" "$@" --listen 127.0.0.1 --port "$inner"
 }
 start_idle_gate "$@"

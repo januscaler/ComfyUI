@@ -8,6 +8,7 @@ process groups, signals) is exercised as it runs in the image.
 import http.client
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -27,7 +28,10 @@ FAKE_SERVER = textwrap.dedent(
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     port, starts, busy = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-    if os.environ.get("FAKE_FAIL"):
+    with open(starts + ".attempts", "a") as f:
+        f.write("1\\n")
+    if os.environ.get("FAKE_FAIL") or os.path.exists(busy + ".fail"):
+        # As ComfyUI did on a GPU the driver had lost: "No CUDA GPUs are available".
         sys.exit(3)
     started = time.monotonic()
     warmup = float(os.environ.get("FAKE_WARMUP", "0"))
@@ -177,6 +181,27 @@ class IdleGateTest(unittest.TestCase):
         return (f"POST /api/wrapper/qwenimage21/generate HTTP/1.1\r\nHost: x\r\n"
                 f"Content-Type: application/octet-stream\r\nContent-Length: {length}\r\n\r\n").encode()
 
+    def attempts(self):
+        path = self.starts + ".attempts"
+        if not os.path.exists(path):
+            return 0
+        with open(path) as f:
+            return sum(1 for line in f if line.strip())
+
+    def failing(self, on):
+        """Make every later start of the stand-in fail (or work again)."""
+        flag = self.busy + ".fail"
+        if on:
+            open(flag, "w").close()
+        elif os.path.exists(flag):
+            os.remove(flag)
+
+    def down_check(self, flag, runs):
+        """A --down-check that fails while *flag* exists and counts its runs in *runs*."""
+        code = (f"import os, sys; open({runs!r}, 'a').write('1\\n'); "
+                f"os.path.exists({flag!r}) and (print('GPU check: cuInit failed: CUDA error 100'), sys.exit(1))")
+        return shlex.join([sys.executable, "-c", code])
+
     def server_stopped(self):
         pids = self.pids()
         return bool(pids) and not alive(pids[-1])
@@ -281,6 +306,82 @@ class IdleGateTest(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("exited with status 3", json.loads(body)["error"])
         self.assertEqual(headers.get("Retry-After"), "5")
+
+    def test_after_a_failed_start_health_reads_unhealthy_until_a_start_works(self):
+        # 2026-11-11: the rig's GPU hung in the driver, every start died at once, and
+        # the stubbed and cached health still said the worker was fine, so voxmin-backend
+        # kept sending every render to it.
+        self.start_gate("--stub", "GET /health 200 {}", "--cache", "GET /api/wrapper/workflows",
+                        "--start-backoff", "1.5")
+        self.assertEqual(self.get("/api/wrapper/workflows")[0], 200)
+        self.assertTrue(wait_for(self.server_stopped))
+        self.assertEqual(self.get("/health")[0], 200, "a stopped server that starts fine is healthy")
+        self.failing(True)
+        status, _, body = self.get("/work")
+        self.assertEqual(status, 503)
+        self.assertIn("exited with status 3", json.loads(body)["error"])
+        attempts = self.attempts()
+        for path in ("/health", "/api/wrapper/workflows"):
+            status, headers, body = self.get(path)
+            self.assertEqual(status, 503, f"{path} must not read healthy after a failed start")
+            self.assertEqual(headers.get("X-Idle-Gate"), "answered")
+            self.assertIn("could not be started: the server exited with status 3", json.loads(body)["error"])
+            self.assertIn(headers.get("Retry-After"), ("1", "2"))
+        self.assertEqual(self.attempts(), attempts, "health probes inside the backoff do not start it")
+        self.failing(False)
+        time.sleep(1.6)
+        status, headers, body = self.get("/health")
+        self.assertEqual(status, 200, "after the backoff a probe tries a start, which works")
+        self.assertIsNone(headers.get("X-Idle-Gate"), "the server itself answered")
+        self.assertEqual(json.loads(body)["path"], "/health")
+        self.assertEqual(self.attempts(), attempts + 1)
+        self.assertTrue(wait_for(self.server_stopped), "a probe's start is not use: it stops again")
+        status, headers, _ = self.get("/health")
+        self.assertEqual((status, headers.get("X-Idle-Gate")), (200, "answered"), "healthy and stubbed again")
+
+    def test_failed_tries_back_off(self):
+        self.start_gate("--stub", "GET /health 200 {}", "--start-backoff", "0.6")
+        self.failing(True)
+        self.assertEqual(self.get("/work")[0], 503)
+        self.assertEqual(self.attempts(), 1)
+        time.sleep(0.7)
+        self.assertEqual(self.get("/health")[0], 503, "the try after the backoff failed too")
+        self.assertEqual(self.attempts(), 2)
+        time.sleep(0.7)
+        self.assertEqual(self.get("/health")[0], 503)
+        self.assertEqual(self.attempts(), 2, "the second backoff is twice as long")
+        time.sleep(0.7)
+        self.assertEqual(self.get("/health")[0], 503)
+        self.assertEqual(self.attempts(), 3)
+
+    def test_a_failing_down_check_reads_unhealthy_without_starting_the_server(self):
+        flag, runs = os.path.join(tempfile.mkdtemp(), "gpu-lost"), os.path.join(tempfile.mkdtemp(), "runs")
+        self.start_gate("--stub", "GET /health 200 {}", "--down-check", self.down_check(flag, runs),
+                        "--down-check-seconds", "0")
+        self.assertEqual(self.get("/health")[0], 200)
+        open(flag, "w").close()
+        status, headers, body = self.get("/health")
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("X-Idle-Gate"), "answered")
+        self.assertEqual(json.loads(body)["error"], "the server cannot run here: GPU check: cuInit failed: CUDA error 100")
+        self.assertEqual(self.attempts(), 0, "the check alone decides; nothing was started")
+        os.remove(flag)
+        self.assertEqual(self.get("/health")[0], 200, "healthy again once the check passes")
+
+    def test_the_down_check_runs_once_per_window_and_not_while_the_server_is_up(self):
+        flag, runs = os.path.join(tempfile.mkdtemp(), "gpu-lost"), os.path.join(tempfile.mkdtemp(), "runs")
+        self.start_gate("--stub", "GET /health 200 {}",
+                        "--down-check", self.down_check(flag, runs), "--down-check-seconds", "60", idle="600")
+        for _ in range(3):
+            self.assertEqual(self.get("/health")[0], 200)
+        with open(runs) as f:
+            self.assertEqual(len(f.read().split()), 1, "one run serves the whole window")
+        open(flag, "w").close()
+        self.assertEqual(self.get("/health")[0], 200, "inside the window the last result stands")
+        self.get("/work")
+        os.remove(runs)
+        self.assertEqual(self.get("/health")[0], 200, "an up server answers for itself")
+        self.assertFalse(os.path.exists(runs), "no check while the server is up")
 
     def test_idle_seconds_zero_starts_on_demand_and_never_stops(self):
         self.start_gate(idle="0")
