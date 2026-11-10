@@ -12,6 +12,17 @@ configured as quiet: they never count as use, and while the server is down the
 gate answers them itself, either with a fixed answer (--stub) or with the
 server's last answer (--cache). A quiet request with neither starts the server.
 
+Those answers are health, so they must not say "fine" for a server that cannot
+run. After a start fails, the gate answers them with a 503 carrying the
+failure instead, until a later start succeeds. It tries again on the first
+quiet request after --start-backoff seconds (doubled after each failed try, up
+to 10 minutes), so a probe that keeps asking finds out when the server is back.
+With --down-check, the gate also runs that command (a cheap check that the GPU
+answers, say) before answering for a stopped server, at most once every
+--down-check-seconds; a failed check is answered with a 503 too. On 2026-11-11
+the rig's GPU hung in the driver: every start died at once, and the stub still
+read healthy, so every render was sent to it and failed.
+
 The server is told about one connection per request (the gate asks it to close
 each one), so every request passes through the gate's accounting; WebSockets
 are forwarded as they are. X-Forwarded-For is set to the real client, replacing
@@ -29,7 +40,9 @@ import asyncio
 import hmac
 import http
 import json
+import math
 import os
+import shlex
 import signal
 import sys
 import time
@@ -39,6 +52,9 @@ HEAD_TIMEOUT = 30.0
 CACHE_LIMIT = 1024 * 1024
 PROBE_TIMEOUT = 10.0
 START_FAILURE_HOLD = 10.0
+START_BACKOFF_MAX = 600.0
+# Below the 10 s that health probes (voxmin-backend, the compose healthcheck) wait.
+DOWN_CHECK_TIMEOUT = 8.0
 CHUNK = 64 * 1024
 # Hop-by-hop or client-asserted headers the gate replaces rather than passes on.
 DROPPED_HEADERS = {"connection", "keep-alive", "proxy-connection", "x-forwarded-for", "x-forwarded-proto"}
@@ -135,8 +151,9 @@ def response(status: int, body: bytes = b"", *, head_only: bool = False, extra: 
     return head.encode("latin-1") + (b"" if head_only else body)
 
 
-def error(status: int, message: str) -> bytes:
-    return response(status, json.dumps({"error": message}).encode(), extra="Retry-After: 5\r\n")
+def error(status: int, message: str, *, head_only: bool = False, retry_after: int = 5) -> bytes:
+    return response(status, json.dumps({"error": message}).encode(), head_only=head_only,
+                    extra=f"Retry-After: {max(1, retry_after)}\r\n")
 
 
 def dechunk(body: bytes) -> bytes:
@@ -175,6 +192,15 @@ class Gate:
         self.last_used = time.monotonic()
         self.busy_probe_failing = False
         self.start_failure: tuple[float, str] | None = None
+        # Starts that failed since the last one that worked, and when the gate tries again.
+        self.start_backoff: float = args.start_backoff
+        self.failed_starts = 0
+        self.retry_at = 0.0
+        self.down_check: list[str] = shlex.split(args.down_check) if args.down_check else []
+        self.down_check_seconds: float = args.down_check_seconds
+        self.down_check_result: tuple[float, str | None] | None = None
+        self.down_check_task: asyncio.Future | None = None
+        self.down_check_stuck: asyncio.subprocess.Process | None = None
 
     # -- the server process -------------------------------------------------
 
@@ -183,8 +209,9 @@ class Gate:
             if self.up:
                 return
             # Requests queued behind a start that just failed fail with it, rather
-            # than each paying for another start.
-            if self.start_failure and time.monotonic() - self.start_failure[0] < START_FAILURE_HOLD:
+            # than each paying for another start (no longer than its backoff, which
+            # is when a health probe tries again).
+            if self.start_failure and time.monotonic() < min(self.start_failure[0] + START_FAILURE_HOLD, self.retry_at):
                 raise RuntimeError(self.start_failure[1])
             started = time.monotonic()
             log(f"starting the server for {reason}")
@@ -195,10 +222,19 @@ class Gate:
                 await self._wait_ready(proc)
             except BaseException as exc:
                 self.start_failure = (time.monotonic(), str(exc))
+                self.failed_starts += 1
+                backoff = min(START_BACKOFF_MAX, self.start_backoff * 2 ** (self.failed_starts - 1))
+                self.retry_at = time.monotonic() + backoff
+                log(f"the start failed ({self.failed_starts} in a row); health reads unhealthy, "
+                    f"next try in {backoff:g}s at the earliest")
                 await self._terminate(proc)
                 self.proc = None
                 raise
+            if self.failed_starts:
+                log(f"the server started after {self.failed_starts} failed starts; health reads healthy again")
             self.start_failure = None
+            self.failed_starts = 0
+            self.down_check_result = None
             self.up = True
             self.last_used = time.monotonic()
             self.watcher = asyncio.ensure_future(self._watch(proc))
@@ -330,14 +366,76 @@ class Gate:
             return True
         return hmac.compare_digest(header(headers, "authorization").encode(), f"Bearer {self.token}".encode())
 
-    def _answer_while_down(self, route: tuple[str, str], head_only: bool) -> bytes | None:
+    async def _answer_while_down(self, route: tuple[str, str], head_only: bool) -> bytes | None:
+        """The gate's own answer to a quiet request while the server is down, or
+        None to hand the request to the server (starting it)."""
+        cached = self.cache.get(route) if not head_only else None
+        if route not in self.stubs and cached is None:
+            return None
+        if self.failed_starts:
+            wait = self.retry_at - time.monotonic()
+            if wait > 0:
+                reason = self.start_failure[1] if self.start_failure else "it failed to start"
+                return error(503, f"the server could not be started: {reason}", head_only=head_only,
+                             retry_after=math.ceil(wait))
+        problem = await self._run_down_check()
+        if problem:
+            return error(503, f"the server cannot run here: {problem}", head_only=head_only)
+        if self.failed_starts:
+            return None  # its backoff is over and the check passes: this request tries a start
         if route in self.stubs:
             status, body = self.stubs[route]
             return response(status, body, head_only=head_only)
-        cached = self.cache.get(route)
-        if cached is not None and not head_only:
-            return cached
-        return None
+        return cached
+
+    async def _run_down_check(self) -> str | None:
+        """None when --down-check passes (or there is none), else why it failed.
+        One run at a time; its result is reused for --down-check-seconds."""
+        if not self.down_check:
+            return None
+        result = self.down_check_result
+        if result and time.monotonic() - result[0] < self.down_check_seconds:
+            return result[1]
+        if self.down_check_task is None or self.down_check_task.done():
+            self.down_check_task = asyncio.ensure_future(self._down_check_once())
+        # Shielded: a client that goes does not cancel the check others wait on.
+        return await asyncio.shield(self.down_check_task)
+
+    async def _down_check_once(self) -> str | None:
+        what = os.path.basename(self.down_check[0])
+        stuck = self.down_check_stuck
+        if stuck is not None and stuck.returncode is None:
+            # A check hung in a wedged driver may not even die when killed: do not pile up more.
+            problem = f"an earlier {what} (pid {stuck.pid}) has still not exited"
+        else:
+            self.down_check_stuck = None
+            problem = await self._spawn_down_check(what)
+        previous = self.down_check_result
+        if problem and (previous is None or previous[1] is None):
+            log(f"the down check failed: {problem}")
+        elif not problem and previous is not None and previous[1]:
+            log("the down check passes again")
+        self.down_check_result = (time.monotonic(), problem)
+        return problem
+
+    async def _spawn_down_check(self, what: str) -> str | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.down_check, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            return f"could not run {what}: {exc}"
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), DOWN_CHECK_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._signal_group(proc, signal.SIGKILL)
+            self.down_check_stuck = proc
+            asyncio.ensure_future(proc.wait())  # reaped whenever it does exit
+            return f"{what} did not finish within {DOWN_CHECK_TIMEOUT:g}s"
+        if proc.returncode == 0:
+            return None
+        lines = [line.strip() for line in out.decode("utf-8", "replace").splitlines() if line.strip()]
+        return lines[-1][:300] if lines else f"{what} exited with status {proc.returncode}"
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -365,7 +463,7 @@ class Gate:
         quiet = route in self.quiet
 
         if quiet and not self.up and self._authorized(headers):
-            answer = self._answer_while_down(route, head_only)
+            answer = await self._answer_while_down(route, head_only)
             if answer is not None:
                 writer.write(answer)
                 await writer.drain()
@@ -540,6 +638,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bearer-env", metavar="NAME",
                         help="env var with the server's bearer token: sent on the gate's own requests, and "
                              "required before the gate answers for the server")
+    parser.add_argument("--start-backoff", type=float, default=30.0, metavar="SECONDS",
+                        help="after a failed start, quiet requests answer 503 for this long, then one tries a "
+                             "start again; doubled after each failed try, up to 600s")
+    parser.add_argument("--down-check", metavar="'COMMAND [ARGS]'",
+                        help="run before answering for a stopped server; a non-zero exit answers 503 with its "
+                             "last line of output (a GPU check, say)")
+    parser.add_argument("--down-check-seconds", type=float, default=30.0,
+                        help="reuse a --down-check result for this long")
     args = parser.parse_args(argv[:split])
     args.command = argv[split + 1 :]
     if not args.command:
@@ -548,6 +654,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--idle-seconds cannot be negative")
     if args.forward_idle_seconds < 0:
         parser.error("--forward-idle-seconds cannot be negative")
+    if args.start_backoff < 0 or args.down_check_seconds < 0:
+        parser.error("--start-backoff and --down-check-seconds cannot be negative")
+    if args.down_check is not None and not shlex.split(args.down_check):
+        parser.error("--down-check needs a command")
     return args
 
 

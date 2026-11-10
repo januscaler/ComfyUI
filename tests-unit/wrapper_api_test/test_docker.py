@@ -911,6 +911,14 @@ class TestIdleGateEntrypoint(unittest.TestCase):
         self.assertIn(("GET", "/api/wrapper/workflows"), args.cache, "voxmin-backend's 10 s probe must not start it")
         self.assertEqual(args.busy, (("GET", "/queue"), ["queue_running", "queue_pending"]))
         self.assertEqual(args.bearer_env, "WRAPPER_AUTH_TOKEN")
+        self.assertEqual(args.down_check, "python /opt/ComfyUI/docker/cuda_check.py",
+                         "a GPU the driver lost must read unhealthy while ComfyUI is stopped")
+
+    def test_the_gpu_check_can_be_turned_off(self):
+        argv, _, _ = self.run_function({"COMFYUI_IDLE_STOP_SECONDS": "90", "COMFYUI_IDLE_GPU_CHECK": "0"})
+        self.assertNotIn("--down-check", argv)
+        self.assertIn("--cache", argv)
+        self.assertEqual(argv[argv.index("--") + 1:][:2], ["python", "main.py"])
 
     def test_not_with_sequence_parallelism(self):
         argv, out, err = self.run_function({"COMFYUI_IDLE_STOP_SECONDS": "90", "COMFY_SP_WORLD": "2"})
