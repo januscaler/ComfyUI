@@ -17,6 +17,12 @@ run. After a start fails, the gate answers them with a 503 carrying the
 failure instead, until a later start succeeds. It tries again on the first
 quiet request after --start-backoff seconds (doubled after each failed try, up
 to 10 minutes), so a probe that keeps asking finds out when the server is back.
+That probe, and every probe while that start runs, is answered at once with a
+503 that says "starting" ("loading": true): probes give up after 10 s, and a
+model can take minutes to load. A start fails as soon as the server's
+--ready-path answer says it did (a JSON "failed" with "loading" not true), not
+after --boot-timeout: Maya's server stays up after its model load runs out of
+GPU memory, and on 2026-11-19 that held every voice line for 20 minutes.
 With --down-check, the gate also runs that command (a cheap check that the GPU
 answers, say) before answering for a stopped server, at most once every
 --down-check-seconds; a failed check is answered with a 503 too. On 2026-11-11
@@ -156,6 +162,28 @@ def error(status: int, message: str, *, head_only: bool = False, retry_after: in
                     extra=f"Retry-After: {max(1, retry_after)}\r\n")
 
 
+def starting(*, head_only: bool = False) -> bytes:
+    """The 503 a stubbed or cached route gets while a start is under way. No
+    "running": false, so VoxMin's Maya health reads it as loading, not failed."""
+    body = json.dumps({"status": "starting", "loading": True}).encode()
+    return response(503, body, head_only=head_only, extra="Retry-After: 5\r\n")
+
+
+def reported_failure(body: bytes) -> str | None:
+    """Why a starting server says it cannot start, if its ready answer says so:
+    a JSON object with "failed" set and "loading" not true. Maya's server keeps
+    running after its model load fails (out of memory, say) and answers that way
+    for good; waiting out --boot-timeout on it held every request for 20 minutes."""
+    try:
+        state = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or not state.get("failed") or state.get("loading") is True:
+        return None
+    failed = state["failed"]
+    return (failed if isinstance(failed, str) else json.dumps(failed))[:300]
+
+
 def dechunk(body: bytes) -> bytes:
     out = bytearray()
     while body:
@@ -185,6 +213,8 @@ class Gate:
         self.cache: dict[tuple[str, str], bytes] = {}
         self.proc: asyncio.subprocess.Process | None = None
         self.watcher: asyncio.Future | None = None
+        # A start a health probe asked for after the backoff, run without the probe waiting on it.
+        self.start_task: asyncio.Future | None = None
         self.up = False
         self.stopping = False
         self.lock = asyncio.Lock()
@@ -240,6 +270,18 @@ class Gate:
             self.watcher = asyncio.ensure_future(self._watch(proc))
             log(f"server ready in {time.monotonic() - started:.1f}s (pid {proc.pid})")
 
+    def _start_under_way(self) -> bool:
+        return self.lock.locked() or (self.start_task is not None and not self.start_task.done())
+
+    def _start_in_background(self, reason: str) -> None:
+        async def start() -> None:
+            try:
+                await self.ensure_up(reason)
+            except Exception as exc:
+                log(f"could not start the server: {exc}")
+
+        self.start_task = asyncio.ensure_future(start())
+
     async def _wait_ready(self, proc: asyncio.subprocess.Process) -> None:
         deadline = time.monotonic() + self.boot_timeout
         while time.monotonic() < deadline:
@@ -248,11 +290,15 @@ class Gate:
             try:
                 # Some servers listen before they can serve and say so with a
                 # 503; any answer below 500 (a 401 too) means they route.
-                status, _ = await self._get(self.ready_path)
+                status, body = await self._get(self.ready_path)
                 if 0 < status < 500:
                     return
             except (OSError, asyncio.TimeoutError, ValueError):
                 pass
+            else:
+                failure = reported_failure(body)
+                if failure:
+                    raise RuntimeError(f"the server failed to start: {failure}")
             await asyncio.sleep(0.25)
         raise RuntimeError(f"the server was not ready after {self.boot_timeout:.0f}s")
 
@@ -382,7 +428,11 @@ class Gate:
         if problem:
             return error(503, f"the server cannot run here: {problem}", head_only=head_only)
         if self.failed_starts:
-            return None  # its backoff is over and the check passes: this request tries a start
+            # Its backoff is over and the check passes: try a start, but do not hold
+            # the probe on it (they wait 10 s; a model can take minutes to load).
+            if not self._start_under_way():
+                self._start_in_background(f"a {route[0]} {route[1]} after the backoff")
+            return starting(head_only=head_only)
         if route in self.stubs:
             status, body = self.stubs[route]
             return response(status, body, head_only=head_only)
