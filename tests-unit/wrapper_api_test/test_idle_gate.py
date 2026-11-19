@@ -35,6 +35,7 @@ FAKE_SERVER = textwrap.dedent(
         sys.exit(3)
     started = time.monotonic()
     warmup = float(os.environ.get("FAKE_WARMUP", "0"))
+    load_failed = os.path.exists(busy + ".loadfail")
     with open(starts, "a") as f:
         f.write(f"{os.getpid()}\\n")
 
@@ -50,14 +51,25 @@ FAKE_SERVER = textwrap.dedent(
             self.end_headers()
             self.wfile.write(body)
 
+        def unavailable(self, payload=None):
+            body = json.dumps(payload).encode() if payload is not None else b""
+            self.send_response(503)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             path = self.path.split("?")[0]
             warming = time.monotonic() - started < warmup
-            if warming:
-                # Listening, but not serving yet: every route says so.
-                self.send_response(503)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+            if load_failed:
+                # As Maya's server does after its model load ran out of GPU memory:
+                # it stays up and says so on every route, for good.
+                self.unavailable({"ready": False, "loading": False,
+                                  "failed": "OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB"})
+            elif warming:
+                # Listening, but not serving yet: every route says so (Maya with a body
+                # that says it is loading, OmniVoice with none).
+                self.unavailable(json.loads(os.environ["FAKE_WARMUP_BODY"]) if os.environ.get("FAKE_WARMUP_BODY") else None)
             elif path == "/ws":
                 self.send_response(101)
                 self.send_header("Upgrade", "websocket")
@@ -191,6 +203,14 @@ class IdleGateTest(unittest.TestCase):
     def failing(self, on):
         """Make every later start of the stand-in fail (or work again)."""
         flag = self.busy + ".fail"
+        if on:
+            open(flag, "w").close()
+        elif os.path.exists(flag):
+            os.remove(flag)
+
+    def load_failing(self, on):
+        """Make every later start of the stand-in stay up but report a failed model load."""
+        flag = self.busy + ".loadfail"
         if on:
             open(flag, "w").close()
         elif os.path.exists(flag):
@@ -331,9 +351,9 @@ class IdleGateTest(unittest.TestCase):
         self.failing(False)
         time.sleep(1.6)
         status, headers, body = self.get("/health")
-        self.assertEqual(status, 200, "after the backoff a probe tries a start, which works")
-        self.assertIsNone(headers.get("X-Idle-Gate"), "the server itself answered")
-        self.assertEqual(json.loads(body)["path"], "/health")
+        self.assertEqual(status, 503, "after the backoff a probe asks for a start and is told it is starting")
+        self.assertEqual(json.loads(body), {"status": "starting", "loading": True})
+        self.assertTrue(wait_for(lambda: self.get("/health")[0] == 200), "the start works")
         self.assertEqual(self.attempts(), attempts + 1)
         self.assertTrue(wait_for(self.server_stopped), "a probe's start is not use: it stops again")
         status, headers, _ = self.get("/health")
@@ -346,13 +366,53 @@ class IdleGateTest(unittest.TestCase):
         self.assertEqual(self.attempts(), 1)
         time.sleep(0.7)
         self.assertEqual(self.get("/health")[0], 503, "the try after the backoff failed too")
-        self.assertEqual(self.attempts(), 2)
+        self.assertTrue(wait_for(lambda: self.attempts() == 2))
         time.sleep(0.7)
         self.assertEqual(self.get("/health")[0], 503)
         self.assertEqual(self.attempts(), 2, "the second backoff is twice as long")
         time.sleep(0.7)
         self.assertEqual(self.get("/health")[0], 503)
-        self.assertEqual(self.attempts(), 3)
+        self.assertTrue(wait_for(lambda: self.attempts() == 3))
+
+    def test_a_server_that_reports_a_failed_load_fails_the_start_at_once(self):
+        # 2026-11-19: Maya's model load ran out of GPU memory under ComfyUI renders.
+        # Its server stayed up answering 503 {"loading": false, "failed": ...}, and
+        # the gate waited out --boot-timeout (1200 s) on it while every voice line hung.
+        self.start_gate("--stub", "GET /health 200 {}", "--boot-timeout", "60", "--start-backoff", "60")
+        self.load_failing(True)
+        started = time.monotonic()
+        status, _, body = self.get("/work")
+        self.assertLess(time.monotonic() - started, 5, "the gate waited on a server that said it had failed")
+        self.assertEqual(status, 503)
+        self.assertIn("the server failed to start: OutOfMemoryError: CUDA out of memory", json.loads(body)["error"])
+        self.assertTrue(wait_for(lambda: not alive(self.pids()[-1])), "the failed server still holds the card")
+        status, _, body = self.get("/health")
+        self.assertEqual(status, 503)
+        self.assertIn("OutOfMemoryError", json.loads(body)["error"])
+
+    def test_a_server_that_says_it_is_loading_is_still_waited_for(self):
+        self.start_gate(env={"FAKE_WARMUP": "1.5", "FAKE_WARMUP_BODY": '{"ready": false, "loading": true, "failed": null}'})
+        status, _, body = self.get("/work")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["path"], "/work")
+
+    def test_probes_do_not_wait_on_a_start_after_the_backoff(self):
+        # The same night the compose healthcheck (10 s) and voxmin-backend's probes
+        # timed out: after the backoff a probe started the server and waited on it,
+        # and every probe after it queued behind that start.
+        self.start_gate("--stub", "GET /health 200 {}", "--start-backoff", "0.5", env={"FAKE_WARMUP": "3"})
+        self.failing(True)
+        self.assertEqual(self.get("/work")[0], 503)
+        self.failing(False)
+        time.sleep(0.6)
+        for _ in range(3):
+            started = time.monotonic()
+            status, headers, body = self.get("/health")
+            self.assertLess(time.monotonic() - started, 1, "a probe waited on the start")
+            self.assertEqual((status, headers.get("X-Idle-Gate")), (503, "answered"))
+            self.assertEqual(json.loads(body), {"status": "starting", "loading": True})
+        self.assertTrue(wait_for(lambda: self.get("/health")[0] == 200), "the start works")
+        self.assertEqual(self.attempts(), 2, "one start, however many probes asked")
 
     def test_a_failing_down_check_reads_unhealthy_without_starting_the_server(self):
         flag, runs = os.path.join(tempfile.mkdtemp(), "gpu-lost"), os.path.join(tempfile.mkdtemp(), "runs")
