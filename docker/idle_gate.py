@@ -23,9 +23,11 @@ model can take minutes to load. A start fails as soon as the server's
 --ready-path answer says it did (a JSON "failed" with "loading" not true), not
 after --boot-timeout: Maya's server stays up after its model load runs out of
 GPU memory, and on 2026-11-19 that held every voice line for 20 minutes.
-With --down-check, the gate also runs that command (a cheap check that the GPU
-answers, say) before answering for a stopped server, at most once every
---down-check-seconds; a failed check is answered with a 503 too. On 2026-11-11
+(--fail-health-seconds, VoxMin's first take on this, is an older name for
+--start-backoff.) With --down-check, the gate also runs that command (a cheap
+check that the GPU answers, say) before answering for a stopped server, at most
+once every --down-check-seconds; a failed check is answered with a 503 too. The
+503 also says "running": false, as the stubs do. On 2026-11-11
 the rig's GPU hung in the driver: every start died at once, and the stub still
 read healthy, so every render was sent to it and failed.
 
@@ -160,6 +162,14 @@ def response(status: int, body: bytes = b"", *, head_only: bool = False, extra: 
 def error(status: int, message: str, *, head_only: bool = False, retry_after: int = 5) -> bytes:
     return response(status, json.dumps({"error": message}).encode(), head_only=head_only,
                     extra=f"Retry-After: {max(1, retry_after)}\r\n")
+
+
+def unhealthy(message: str, *, head_only: bool = False, retry_after: int = 5) -> bytes:
+    """The 503 a stubbed or cached route gets for a server that cannot run. Besides
+    the error it says the server is not running, as the stubs do: VoxMin's Maya
+    health reads that to tell "failed" from "loading"."""
+    body = json.dumps({"status": "error", "running": False, "error": message}).encode()
+    return response(503, body, head_only=head_only, extra=f"Retry-After: {max(1, retry_after)}\r\n")
 
 
 def starting(*, head_only: bool = False) -> bytes:
@@ -422,11 +432,11 @@ class Gate:
             wait = self.retry_at - time.monotonic()
             if wait > 0:
                 reason = self.start_failure[1] if self.start_failure else "it failed to start"
-                return error(503, f"the server could not be started: {reason}", head_only=head_only,
-                             retry_after=math.ceil(wait))
+                return unhealthy(f"the server could not be started: {reason}", head_only=head_only,
+                                 retry_after=math.ceil(wait))
         problem = await self._run_down_check()
         if problem:
-            return error(503, f"the server cannot run here: {problem}", head_only=head_only)
+            return unhealthy(f"the server cannot run here: {problem}", head_only=head_only)
         if self.failed_starts:
             # Its backoff is over and the check passes: try a start, but do not hold
             # the probe on it (they wait 10 s; a model can take minutes to load).
@@ -688,9 +698,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bearer-env", metavar="NAME",
                         help="env var with the server's bearer token: sent on the gate's own requests, and "
                              "required before the gate answers for the server")
-    parser.add_argument("--start-backoff", type=float, default=30.0, metavar="SECONDS",
+    parser.add_argument("--start-backoff", type=float, metavar="SECONDS",
                         help="after a failed start, quiet requests answer 503 for this long, then one tries a "
-                             "start again; doubled after each failed try, up to 600s")
+                             "start again; doubled after each failed try, up to 600s (default 30)")
+    parser.add_argument("--fail-health-seconds", type=float, default=0.0, metavar="SECONDS",
+                        help="the older name of --start-backoff, which wins when both are given; 0: the default")
     parser.add_argument("--down-check", metavar="'COMMAND [ARGS]'",
                         help="run before answering for a stopped server; a non-zero exit answers 503 with its "
                              "last line of output (a GPU check, say)")
@@ -704,8 +716,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--idle-seconds cannot be negative")
     if args.forward_idle_seconds < 0:
         parser.error("--forward-idle-seconds cannot be negative")
-    if args.start_backoff < 0 or args.down_check_seconds < 0:
-        parser.error("--start-backoff and --down-check-seconds cannot be negative")
+    if (args.start_backoff or 0) < 0 or args.fail_health_seconds < 0 or args.down_check_seconds < 0:
+        parser.error("--start-backoff, --fail-health-seconds and --down-check-seconds cannot be negative")
+    if args.start_backoff is None:
+        args.start_backoff = args.fail_health_seconds or 30.0
     if args.down_check is not None and not shlex.split(args.down_check):
         parser.error("--down-check needs a command")
     return args

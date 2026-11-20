@@ -327,6 +327,29 @@ class IdleGateTest(unittest.TestCase):
         self.assertIn("exited with status 3", json.loads(body)["error"])
         self.assertEqual(headers.get("Retry-After"), "5")
 
+    def test_fail_health_seconds_is_the_older_name_of_start_backoff(self):
+        # VoxMin's compose files pass it to the OmniVoice and Maya sidecars. OmniVoice
+        # that refuses to boot (a blank admin key) looked healthy: the stub kept
+        # answering 200 while every real request got a 503.
+        self.start_gate("--stub", 'GET /health 200 {"status": "ok"}', "--fail-health-seconds", "1",
+                        env={"FAKE_FAIL": "1"})
+        self.assertEqual(self.get("/health")[0], 200, "nothing has failed yet")
+        self.assertEqual(self.get("/work")[0], 503)
+        status, headers, body = self.get("/health")
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("X-Idle-Gate"), "answered")
+        answer = json.loads(body)
+        self.assertIn("could not be started: the server exited with status 3", answer["error"])
+        # voxmin.maya.health reads "running": false on a 503 as a failed engine, not a loading one.
+        self.assertEqual((answer["status"], answer["running"]), ("error", False))
+        self.assertEqual(self.attempts(), 1)
+        time.sleep(1.2)
+        self.assertEqual(self.get("/health")[0], 503, "the window passed: a probe tried again, and it failed again")
+        self.assertTrue(wait_for(lambda: self.attempts() == 2))
+        self.assertTrue(wait_for(lambda: "could not be started" in self.get("/health")[2].decode()),
+                        "and reads unhealthy for the next, doubled window")
+        self.assertEqual(self.attempts(), 2)
+
     def test_after_a_failed_start_health_reads_unhealthy_until_a_start_works(self):
         # 2026-11-11: the rig's GPU hung in the driver, every start died at once, and
         # the stubbed and cached health still said the worker was fine, so voxmin-backend
@@ -497,12 +520,50 @@ class IdleGateTest(unittest.TestCase):
         self.start_gate("--forward-idle-seconds", "1.5")
         self.assertEqual(self.get("/slow?s=0.5")[0], 200)
 
+    def test_forward_idle_seconds_zero_never_drops_a_silent_answer(self):
+        # VoxMin's API burns a karaoke video inside the request and says nothing
+        # until it is done (up to 3 h), so its entrypoint turns the limit off.
+        self.start_gate("--forward-idle-seconds", "0")
+        self.assertEqual(self.get("/slow?s=1.5")[0], 200)
+
     def test_a_malformed_request_is_refused(self):
         self.start_gate()
         with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
             s.sendall(b"nonsense\r\n\r\n")
             self.assertTrue(s.recv(1024).startswith(b"HTTP/1.1 400"))
         self.assertEqual(self.pids(), [])
+
+
+class StartBackoffArgsTest(unittest.TestCase):
+    """--start-backoff and its older name, --fail-health-seconds."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("idle_gate", GATE)
+        cls.gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.gate)
+
+    def backoff(self, *flags):
+        base = ["--listen", "127.0.0.1:1", "--upstream", "127.0.0.1:2"]
+        return self.gate.parse_args([*base, *flags, "--", "true"]).start_backoff
+
+    def test_the_default_is_30_seconds(self):
+        self.assertEqual(self.backoff(), 30.0)
+        self.assertEqual(self.backoff("--fail-health-seconds", "0"), 30.0, "0 used to mean off; now the default")
+
+    def test_the_older_name_sets_it(self):
+        self.assertEqual(self.backoff("--fail-health-seconds", "300"), 300.0)
+
+    def test_start_backoff_wins_over_the_older_name(self):
+        self.assertEqual(self.backoff("--fail-health-seconds", "300", "--start-backoff", "5"), 5.0)
+        self.assertEqual(self.backoff("--start-backoff", "0"), 0.0)
+
+    def test_negative_values_are_refused(self):
+        for flag in ("--start-backoff", "--fail-health-seconds", "--down-check-seconds"):
+            with self.assertRaises(SystemExit, msg=flag):
+                self.backoff(flag, "-1")
 
 
 if __name__ == "__main__":
