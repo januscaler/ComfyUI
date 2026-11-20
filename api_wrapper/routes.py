@@ -39,6 +39,7 @@ from comfy_execution.progress import get_progress_state
 
 from api_wrapper import cleanup as wrapper_cleanup
 from api_wrapper import describe as wrapper_describe
+from api_wrapper import gpu_handback
 from api_wrapper import progress as wrapper_progress
 from api_wrapper import prompt_rewriter
 from api_wrapper import results as wrapper_results
@@ -1321,6 +1322,11 @@ def register_wrapper_routes(routes, prompt_server):
                 return _error_response("Invalid vram", "vram must be one of: auto, low, normal, high.")
             previous_vram_state = model_management.vram_state
             model_management.vram_state = vram_state_map[vram_requested]
+
+        if gpu_handback.wanted(workflow_name):
+            # A video render needs the whole card: the voice engines that sit warm beside it hand
+            # their VRAM back first (bounded; an engine that does not answer never fails the render).
+            await gpu_handback.release_all()
 
         try:
             _queue_number += 1

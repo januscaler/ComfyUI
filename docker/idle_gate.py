@@ -36,6 +36,28 @@ each one), so every request passes through the gate's accounting; WebSockets
 are forwarded as they are. X-Forwarded-For is set to the real client, replacing
 whatever the client sent.
 
+Two ways to stay warm longer than --idle-seconds, both off unless asked for, so that a
+first request after a quiet spell does not pay a cold start (Maya's takes 22-32 s):
+
+* A lease (refused, like start=1, while --warm-while fails: only while nothing else wants the
+  GPU). Whoever knows work is queued for this server (a voice-over job, a lane's
+  dispatcher) asks POST /__idle-gate/keep-warm?seconds=N: the gate does not stop the
+  server before N seconds are up (at most --lease-max-seconds, 0 turns the route off),
+  and with start=1 it also starts a stopped server in the background, so the model is
+  loaded by the time the work arrives. DELETE drops the lease. The route is never
+  forwarded and never counts as use; with --bearer-env it needs the token.
+* A wider window while nobody else wants the GPU. With --warm-idle-seconds above
+  --idle-seconds and --warm-while COMMAND, a server idle for --idle-seconds is kept
+  until --warm-idle-seconds as long as COMMAND exits 0 (docker/gpu_used_check.py: the
+  card's used memory is below a ceiling, i.e. no render or other engine is on it). The
+  moment it fails the server stops as it always did. Re-checked every
+  --warm-check-seconds.
+
+Handing the GPU back is synchronous: POST /__idle-gate/release?block=N&wait=M (what a caller
+does before a render that needs the card) drops the lease, waits up to M seconds for requests
+in flight to end, stops the server and answers only once it is down; for N seconds no lease,
+start=1 or wide window applies. 409 when requests were still running after M seconds.
+
 Standard library only, so it runs in any image with Python 3.9+. A copy lives
 in each repository whose image runs it (ComfyUI docker/, VoxMin docker/); keep
 them identical.
@@ -64,6 +86,8 @@ START_BACKOFF_MAX = 600.0
 # Below the 10 s that health probes (voxmin-backend, the compose healthcheck) wait.
 DOWN_CHECK_TIMEOUT = 8.0
 CHUNK = 64 * 1024
+LEASE_ROUTE = "/__idle-gate/keep-warm"
+RELEASE_ROUTE = "/__idle-gate/release"
 # Hop-by-hop or client-asserted headers the gate replaces rather than passes on.
 DROPPED_HEADERS = {"connection", "keep-alive", "proxy-connection", "x-forwarded-for", "x-forwarded-proto"}
 
@@ -241,6 +265,15 @@ class Gate:
         self.down_check_result: tuple[float, str | None] | None = None
         self.down_check_task: asyncio.Future | None = None
         self.down_check_stuck: asyncio.subprocess.Process | None = None
+        # Staying warm: a lease somebody took, and the wider window while the GPU is free.
+        self.lease_max: float = args.lease_max_seconds
+        self.lease_until = 0.0
+        self.warm_idle: float = args.warm_idle_seconds
+        self.warm_while: list[str] = shlex.split(args.warm_while) if args.warm_while else []
+        self.warm_check_seconds: float = args.warm_check_seconds
+        self.warm_result: tuple[float, bool] | None = None
+        # After a release: no lease, start=1 or wide window until then.
+        self.blocked_until = 0.0
 
     # -- the server process -------------------------------------------------
 
@@ -356,17 +389,119 @@ class Gate:
 
     async def idle_loop(self) -> None:
         tick = max(0.1, min(5.0, self.idle_seconds / 4))
+        if self.warm_idle > self.idle_seconds and self.warm_while:
+            tick = min(tick, 1.0)       # a render that wants the card is noticed within a second
         while True:
             await asyncio.sleep(tick)
             if not self.up or self.active:
                 continue
+            if time.monotonic() < self.lease_until and await self._gpu_free():
+                continue
             if time.monotonic() - self.last_used < self.idle_seconds:
+                continue
+            if time.monotonic() - self.last_used < await self._idle_limit():
                 continue
             if await self._is_busy():
                 # The idle window starts when the work ends, not when it was asked for.
                 self.last_used = time.monotonic()
                 continue
             await self.stop(f"{self.idle_seconds:g}s without use")
+
+    async def _gpu_free(self) -> bool:
+        """Whether nothing else wants the GPU (--warm-while passes, and no release is in force).
+        True when no --warm-while is set: the lease then works as it always has."""
+        if time.monotonic() < self.blocked_until:
+            return False
+        if not self.warm_while:
+            return True
+        now = time.monotonic()
+        result = self.warm_result
+        if result is None or now - result[0] >= self.warm_check_seconds:
+            env = {**os.environ, "IDLE_GATE_SERVER_UP": "1" if self.up else "0"}
+            problem = await self._spawn_check(self.warm_while, os.path.basename(self.warm_while[0]), env)
+            if problem and (result is None or result[1]):
+                log(f"not staying warm: {problem}")
+            elif not problem and result is not None and not result[1]:
+                log("staying warm again: the GPU is free")
+            result = (now, problem is None)
+            self.warm_result = result
+        return result[1]
+
+    async def _idle_limit(self) -> float:
+        """Seconds without use after which the server stops: --idle-seconds, or the wider
+        --warm-idle-seconds while the GPU is free (--warm-while passes)."""
+        if self.warm_idle <= self.idle_seconds or not self.warm_while:
+            return self.idle_seconds
+        return self.warm_idle if await self._gpu_free() else self.idle_seconds
+
+    def keep_warm(self, seconds: float) -> float:
+        """Do not stop the server for ``seconds`` (at most --lease-max-seconds); the seconds
+        granted. A lease only ever grows: a shorter ask never cuts a longer one short."""
+        granted = max(0.0, min(seconds, self.lease_max))
+        self.lease_until = max(self.lease_until, time.monotonic() + granted)
+        return granted
+
+    def drop_lease(self) -> None:
+        self.lease_until = 0.0
+        self.last_used = time.monotonic()
+
+    async def _lease(self, method: str, target: str, headers, writer) -> None:
+        """The gate's own route for staying warm (never forwarded, never use)."""
+        if not self._authorized(headers):
+            writer.write(error(401, "a bearer token is required"))
+            return
+        query = dict(part.partition("=")[::2] for part in target.partition("?")[2].split("&") if part)
+        if method == "DELETE":
+            self.drop_lease()
+        elif method == "POST":
+            try:
+                seconds = float(query.get("seconds", "0"))
+            except ValueError:
+                writer.write(error(400, "seconds must be a number"))
+                return
+            if not await self._gpu_free():
+                # A lease or a start would load or hold the engine beside a render: refused.
+                writer.write(response(409, json.dumps({
+                    "keep_warm_seconds": 0.0, "running": self.up,
+                    "error": "the GPU is wanted by something else"}).encode()))
+                await writer.drain()
+                return
+            self.keep_warm(seconds)
+            if query.get("start") in ("1", "true") and not self.up and not self._start_under_way() \
+                    and not self.failed_starts:
+                self._start_in_background("a keep-warm request")
+        else:
+            writer.write(error(405, "POST or DELETE"))
+            return
+        left = max(0.0, self.lease_until - time.monotonic())
+        writer.write(response(200, json.dumps({"keep_warm_seconds": round(left, 1),
+                                               "running": self.up}).encode()))
+        await writer.drain()
+
+    async def _release(self, target: str, headers, writer) -> None:
+        """POST /__idle-gate/release?block=N&wait=M: hand the GPU back before a render. Drops the
+        lease, waits (up to M s) for requests in flight, stops the server, and answers once it is
+        down; for N s nothing keeps it or starts it warm. 409 when requests outlasted M."""
+        if not self._authorized(headers):
+            writer.write(error(401, "a bearer token is required"))
+            return
+        query = dict(part.partition("=")[::2] for part in target.partition("?")[2].split("&") if part)
+        try:
+            block, wait = float(query.get("block", "300")), float(query.get("wait", "30"))
+        except ValueError:
+            writer.write(error(400, "block and wait must be numbers"))
+            return
+        self.blocked_until = max(self.blocked_until, time.monotonic() + max(0.0, block))
+        self.lease_until = 0.0
+        deadline = time.monotonic() + max(0.0, wait)
+        while self.active and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        if self.active:
+            writer.write(response(409, json.dumps({"running": self.up, "error": "requests are still running"}).encode()))
+            return
+        await self.stop("released for a render")
+        writer.write(response(200, json.dumps({"running": self.up, "blocked_seconds": round(max(0.0, self.blocked_until - time.monotonic()), 1)}).encode()))
+        await writer.drain()
 
     async def _is_busy(self) -> bool:
         if not self.busy:
@@ -479,9 +614,13 @@ class Gate:
         return problem
 
     async def _spawn_down_check(self, what: str) -> str | None:
+        return await self._spawn_check(self.down_check, what)
+
+    async def _spawn_check(self, command: list[str], what: str, env: dict | None = None) -> str | None:
+        """Run ``command`` (a cheap check): None when it exits 0, else why not."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                *self.down_check, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                *command, env=env, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT, start_new_session=True)
         except OSError as exc:
             return f"could not run {what}: {exc}"
@@ -522,6 +661,12 @@ class Gate:
         route = ("GET" if head_only else method, path)
         quiet = route in self.quiet
 
+        if path == RELEASE_ROUTE and method == "POST":
+            await self._release(target, headers, writer)
+            return
+        if path == LEASE_ROUTE and self.lease_max > 0:
+            await self._lease(method, target, headers, writer)
+            return
         if quiet and not self.up and self._authorized(headers):
             answer = await self._answer_while_down(route, head_only)
             if answer is not None:
@@ -703,6 +848,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                              "start again; doubled after each failed try, up to 600s (default 30)")
     parser.add_argument("--fail-health-seconds", type=float, default=0.0, metavar="SECONDS",
                         help="the older name of --start-backoff, which wins when both are given; 0: the default")
+    parser.add_argument("--lease-max-seconds", type=float, default=600.0, metavar="SECONDS",
+                        help="the longest POST /__idle-gate/keep-warm may keep the server up past its idle "
+                             "window; 0: no such route")
+    parser.add_argument("--warm-idle-seconds", type=float, default=0.0, metavar="SECONDS",
+                        help="stop after this long without use instead of --idle-seconds while --warm-while "
+                             "passes; 0 or below --idle-seconds: off")
+    parser.add_argument("--warm-while", metavar="'COMMAND [ARGS]'",
+                        help="exit 0 while the wider --warm-idle-seconds window may apply (nothing else "
+                             "wants the GPU)")
+    parser.add_argument("--warm-check-seconds", type=float, default=2.0,
+                        help="reuse a --warm-while result for this long")
     parser.add_argument("--down-check", metavar="'COMMAND [ARGS]'",
                         help="run before answering for a stopped server; a non-zero exit answers 503 with its "
                              "last line of output (a GPU check, say)")
@@ -720,6 +876,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--start-backoff, --fail-health-seconds and --down-check-seconds cannot be negative")
     if args.start_backoff is None:
         args.start_backoff = args.fail_health_seconds or 30.0
+    if args.lease_max_seconds < 0 or args.warm_idle_seconds < 0 or args.warm_check_seconds < 0:
+        parser.error("--lease-max-seconds, --warm-idle-seconds and --warm-check-seconds cannot be negative")
+    if args.warm_while is not None and not shlex.split(args.warm_while):
+        parser.error("--warm-while needs a command")
     if args.down_check is not None and not shlex.split(args.down_check):
         parser.error("--down-check needs a command")
     return args
