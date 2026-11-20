@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import time
 import unittest
@@ -532,6 +533,140 @@ class IdleGateTest(unittest.TestCase):
             s.sendall(b"nonsense\r\n\r\n")
             self.assertTrue(s.recv(1024).startswith(b"HTTP/1.1 400"))
         self.assertEqual(self.pids(), [])
+
+
+class StayWarmTest(IdleGateTest):
+    """A server stays loaded past its idle window when told work is coming, or while the
+    GPU is free — and not otherwise (the defaults change nothing)."""
+
+    def call(self, method, path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            conn.request(method, path, headers=headers or {})
+            res = conn.getresponse()
+            return res.status, json.loads(res.read() or b"{}")
+        finally:
+            conn.close()
+
+    def exits(self, code, flag=None):
+        """A --warm-while command: exit 0 until *flag* exists."""
+        body = (f"import os, sys; sys.exit(1 if os.path.exists({flag!r}) else 0)" if flag
+                else f"import sys; sys.exit({code})")
+        return shlex.join([sys.executable, "-c", body])
+
+    def test_a_lease_keeps_the_server_up_past_its_idle_window_and_then_lets_it_go(self):
+        self.start_gate(idle="0.6")
+        self.get("/work")
+        status, answer = self.call("POST", "/__idle-gate/keep-warm?seconds=2.5")
+        self.assertEqual(status, 200)
+        self.assertTrue(answer["running"] and 0 < answer["keep_warm_seconds"] <= 2.5)
+        time.sleep(1.5)                                     # well past the 0.6 s window
+        self.assertFalse(self.server_stopped(), "a lease must hold the server")
+        self.assertTrue(wait_for(self.server_stopped, timeout=8), "the lease ran out; it must stop")
+
+    def test_a_shorter_lease_never_cuts_a_longer_one_short(self):
+        self.start_gate(idle="0.5")
+        self.get("/work")
+        self.call("POST", "/__idle-gate/keep-warm?seconds=3")
+        status, answer = self.call("POST", "/__idle-gate/keep-warm?seconds=0.1")
+        self.assertGreater(answer["keep_warm_seconds"], 2.0)
+
+    def test_dropping_the_lease_gives_a_fresh_idle_window(self):
+        self.start_gate(idle="0.5")
+        self.get("/work")
+        self.call("POST", "/__idle-gate/keep-warm?seconds=60")
+        status, answer = self.call("DELETE", "/__idle-gate/keep-warm")
+        self.assertEqual((status, answer["keep_warm_seconds"]), (200, 0.0))
+        self.assertTrue(wait_for(self.server_stopped, timeout=8))
+
+    def test_a_lease_is_capped_and_the_route_is_never_use_nor_forwarded(self):
+        self.start_gate(idle="0.5", *("--lease-max-seconds", "1"))
+        _, answer = self.call("POST", "/__idle-gate/keep-warm?seconds=500")
+        self.assertLessEqual(answer["keep_warm_seconds"], 1.0)
+        self.assertEqual(self.pids(), [], "a lease without start=1 does not start the server")
+
+    def test_start_asks_for_the_server_to_be_loaded_before_the_work_arrives(self):
+        self.start_gate(idle="30")
+        self.call("POST", "/__idle-gate/keep-warm?seconds=5&start=1")
+        self.assertTrue(wait_for(lambda: len(self.pids()) == 1), "start=1 must start it")
+
+    def test_a_wider_window_applies_only_while_the_check_passes(self):
+        self.start_gate("--warm-idle-seconds", "30", "--warm-check-seconds", "0.1",
+                        "--warm-while", self.exits(0))
+        self.get("/work")
+        time.sleep(2.0)                                     # far past the 1 s idle window
+        self.assertFalse(self.server_stopped(), "the GPU is free: the server stays")
+
+    def test_the_server_stops_on_its_short_window_when_the_check_fails(self):
+        self.start_gate("--warm-idle-seconds", "30", "--warm-check-seconds", "0.1",
+                        "--warm-while", self.exits(1))
+        self.get("/work")
+        self.assertTrue(wait_for(self.server_stopped, timeout=8), "someone wants the GPU: stop")
+
+    def test_the_wide_window_ends_the_moment_the_gpu_is_wanted(self):
+        flag = os.path.join(tempfile.mkdtemp(), "wanted")
+        self.start_gate("--warm-idle-seconds", "60", "--warm-check-seconds", "0.1",
+                        "--warm-while", self.exits(0, flag))
+        self.get("/work")
+        time.sleep(1.5)
+        self.assertFalse(self.server_stopped())
+        open(flag, "w").close()                             # a render takes the card
+        self.assertTrue(wait_for(self.server_stopped, timeout=8))
+
+    def test_a_lease_and_start_are_refused_while_the_gpu_is_wanted(self):
+        flag = os.path.join(tempfile.mkdtemp(), "wanted")
+        open(flag, "w").close()
+        self.start_gate("--warm-idle-seconds", "30", "--warm-check-seconds", "0.1",
+                        "--warm-while", self.exits(0, flag))
+        status, answer = self.call("POST", "/__idle-gate/keep-warm?seconds=5&start=1")
+        self.assertEqual(status, 409)
+        time.sleep(0.5)
+        self.assertEqual(self.pids(), [], "start=1 must not load the engine beside a render")
+        os.remove(flag)
+        time.sleep(0.2)
+        self.assertEqual(self.call("POST", "/__idle-gate/keep-warm?seconds=5&start=1")[0], 200)
+        self.assertTrue(wait_for(lambda: len(self.pids()) == 1))
+
+    def test_a_lease_stops_holding_the_server_once_the_gpu_is_wanted(self):
+        flag = os.path.join(tempfile.mkdtemp(), "wanted")
+        self.start_gate("--warm-idle-seconds", "60", "--warm-check-seconds", "0.1",
+                        "--warm-while", self.exits(0, flag), idle="0.6")
+        self.get("/work")
+        self.call("POST", "/__idle-gate/keep-warm?seconds=60")
+        time.sleep(1.5)
+        self.assertFalse(self.server_stopped())
+        open(flag, "w").close()                             # a render wants the card
+        self.assertTrue(wait_for(self.server_stopped, timeout=8), "a lease must not outlive the GPU being free")
+
+    def test_release_hands_the_gpu_back_before_it_answers_and_blocks_staying_warm(self):
+        self.start_gate("--warm-idle-seconds", "60", "--warm-check-seconds", "0.1",
+                        "--warm-while", self.exits(0), idle="0.6")
+        self.get("/work")
+        self.call("POST", "/__idle-gate/keep-warm?seconds=60")
+        status, answer = self.call("POST", "/__idle-gate/release?block=3&wait=5")
+        self.assertEqual((status, answer["running"]), (200, False))
+        self.assertTrue(self.server_stopped(), "down by the time the answer arrives, not 15 s later")
+        self.assertEqual(self.call("POST", "/__idle-gate/keep-warm?seconds=5&start=1")[0], 409)
+        self.assertEqual(len(self.pids()), 1, "no start while the release holds")
+
+    def test_release_waits_for_requests_in_flight_and_refuses_to_cut_them(self):
+        self.start_gate(idle="30")
+        slow = threading.Thread(target=lambda: self.get("/slow?s=2"))
+        slow.start()
+        self.assertTrue(wait_for(lambda: len(self.pids()) == 1))
+        time.sleep(0.3)
+        status, _ = self.call("POST", "/__idle-gate/release?wait=0.3")
+        self.assertEqual(status, 409)
+        self.assertFalse(self.server_stopped(), "a line being spoken is never cut")
+        slow.join()
+        status, _ = self.call("POST", "/__idle-gate/release?wait=5")
+        self.assertEqual(status, 200)
+        self.assertTrue(self.server_stopped())
+
+    def test_without_the_flags_nothing_changes(self):
+        self.start_gate(idle="0.5")
+        self.get("/work")
+        self.assertTrue(wait_for(self.server_stopped, timeout=8))
 
 
 class StartBackoffArgsTest(unittest.TestCase):
